@@ -11,6 +11,7 @@ import json
 import pickle
 import networkx as nx
 import matplotlib.pyplot as plt
+from collections import defaultdict
 from time import time
 import traceback
 
@@ -47,6 +48,8 @@ class SequencePlanner:
         self.t_start = None
         self.n_eval = None
         self.stop_msg = None
+        self._timing = defaultdict(float)
+        self._timing_counts = defaultdict(int)
 
     def seed(self, seed):
         random.seed(seed)
@@ -55,12 +58,18 @@ class SequencePlanner:
 
     def _simulate(self, part_move, parts_rest, parts_removed, pose, max_grippers, timeout=None, grasp_planner=None, optimizer='L-BFGS-B', debug=0, render=False):
         assert len(parts_rest) > 0
-        action, path = check_assemblable(self.asset_folder, self.assembly_dir, parts_rest, part_move, pose=pose, save_sdf=self.save_sdf, 
+        _t0 = time()
+        action, path = check_assemblable(self.asset_folder, self.assembly_dir, parts_rest, part_move, pose=pose, save_sdf=self.save_sdf,
             return_path=True, debug=debug, render=render)
+        self._timing['path_finding'] += time() - _t0
+        self._timing_counts['path_finding'] += 1
 
         if action is not None:
             max_fix = max_grippers - 1 if max_grippers is not None else None
+            _t0 = time()
             parts_fix_list = get_stable_plan_1pose_serial(self.asset_folder, self.assembly_dir, parts_rest, self.base_part, pose=pose, max_fix=max_fix, save_sdf=self.save_sdf, timeout=timeout, debug=debug, render=render)
+            self._timing['stability_check'] += time() - _t0
+            self._timing_counts['stability_check'] += 1
             if parts_fix_list is not None: parts_fix_list = [parts_fix_list]
         else:
             parts_fix_list = None
@@ -75,7 +84,10 @@ class SequencePlanner:
         feasible = action is not None and parts_fix is not None
 
         if feasible and grasp_planner is not None:
+            _t0 = time()
             grasps = grasp_planner.plan(part_move, parts_rest, parts_removed, pose, path, optimizer)
+            self._timing['grasp_planning'] += time() - _t0
+            self._timing_counts['grasp_planning'] += 1
             if len(grasps) == 0:
                 grasps = None
                 feasible = False
@@ -151,6 +163,8 @@ class SequencePlanner:
         self.t_start = time()
         solution_found = False
         self.stop_msg = None
+        self._timing = defaultdict(float)
+        self._timing_counts = defaultdict(int)
         assert budget is not None or timeout is not None
 
         self._reset()
@@ -195,7 +209,10 @@ class SequencePlanner:
                 else:
                     poses = tree.nodes[tuple(G)]['poses'][:pose_reuse]
                     G_mesh = get_combined_mesh(self.assembly_dir, G)
+                    _t0 = time()
                     poses.extend(get_stable_poses(G_mesh, max_num=max_poses - pose_reuse))
+                    self._timing['stable_pose'] += time() - _t0
+                    self._timing_counts['stable_pose'] += 1
                     if len(poses) == 0:
                         poses = [None]
 
@@ -225,7 +242,8 @@ class SequencePlanner:
                         print(f'[planner.base.plan] add edge: ({G}, {G_prime}), feasible: {sim_info["feasible"]}')
                         print(f'[planner.base.plan] progress: {self.n_eval}/{budget} evaluations')
 
-                    # self.plot_tree(tree)
+                    if debug > 1:
+                        self.plot_tree(tree)
                     break
 
                 if log_dir is not None:
@@ -233,7 +251,7 @@ class SequencePlanner:
                     self.log(tree, stats, log_dir)
             
             self._expand_leaf(tree, max_poses, pose_reuse, grasp_planner, optimizer, debug, render)
-            # self.plot_tree(tree)
+            self.plot_tree(tree)
 
         except (Exception, KeyboardInterrupt) as e:
             if type(e) == KeyboardInterrupt:
@@ -246,6 +264,18 @@ class SequencePlanner:
         assert self.stop_msg is not None, '[planner.base.plan] bug: unexpectedly stopped'
         if debug > 0:
             print(f'[planner.base.plan] stopped: {self.stop_msg}')
+            t_total = time() - self.t_start
+            accounted = sum(self._timing.values())
+            other = t_total - accounted
+            print(f'[planner.base.plan] timing summary (total: {t_total:.1f}s):')
+            order = ['path_finding', 'stability_check', 'stable_pose', 'grasp_planning']
+            for key in order + [k for k in self._timing if k not in order]:
+                if key not in self._timing:
+                    continue
+                t = self._timing[key]
+                n = self._timing_counts[key]
+                print(f'  {key:<20} {t:6.2f}s  {100*t/t_total:5.1f}%  ({n} calls, avg {1000*t/n:.1f}ms)')
+            print(f'  {"other":<20} {other:6.2f}s  {100*other/t_total:5.1f}%')
 
         return tree
 
