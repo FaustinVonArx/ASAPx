@@ -6,6 +6,9 @@ sys.path.append(project_base_dir)
 
 import json
 import numpy as np
+import distinctipy
+import settings
+import itertools
 from scipy.spatial.transform import Rotation
 
 from assets.load import load_config, load_pos_quat_dict, load_part_ids
@@ -31,6 +34,49 @@ def _get_color(index, alpha=1.0):
     colors = np.array(colors) / 255.0
     return colors[int(index) % 5]
 
+def _get_colors(part_ids, normalize=True, scheme='default'):
+    color_map = {}
+
+    if scheme=="original" or (scheme=="default" and len(part_ids) <= 5):
+        if len(part_ids) <= 2:
+            colors = np.array([
+                [107, 166, 161, 255],
+                [209, 184, 148, 255],
+            ], dtype=int)
+        else:
+            colors = np.array([
+                [210, 87, 89, 255],
+                [237, 204, 73, 255],
+                [60, 167, 221, 255],
+                [190, 126, 208, 255],
+                [108, 192, 90, 255],
+            ], dtype=int)
+        if normalize: colors = colors.astype(float) / 255.0
+    
+    elif scheme=="distinctipy" or scheme=="default": # Based on CAM02-UCS, which maximizes distinguishability for the human eye
+        raw_colors = distinctipy.get_colors(len(part_ids))
+
+        colors = np.zeros((len(part_ids), 4))
+        for i, (r, g, b) in enumerate(raw_colors):
+            colors[i] = [r, g, b, settings.alpha]
+        colors[:, 3] *= settings.brightness
+
+        if not normalize:
+            colors = (raw_colors * 255).astype(int)
+
+        colors = np.array(colors)
+
+    elif scheme=="max_contrast": # Maximize mathematical contrast, might be better for VLM
+        values = [0, 128, 255]
+    
+        rgb_combinations = list(itertools.product(values, repeat=3))
+        filtered_rgb = [rgb for rgb in rgb_combinations if rgb not in [(0, 0, 0), (255, 255, 255)]] # remove black and white
+        sorted_rgb = sorted(filtered_rgb, key=lambda x: x.count(128)) # Have most extreme colors (like 255 0 0) be at the top
+        colors = [[r, g, b, int(settings.opacity * 255)] for r, g, b in sorted_rgb]
+
+    for i, part_id in enumerate(part_ids):
+        color_map[part_id] = colors[i % len(colors)]
+    return color_map
 
 def _get_fixed_color():
     return np.array([120, 120, 120, 255]) / 255.0
@@ -96,13 +142,14 @@ def get_contact_sim_string(assembly_dir, parts=None, save_sdf=False, mat_dict=No
     sdf_args = 'load_sdf="true" save_sdf="true"' if save_sdf else ''
     string = _get_basic_sim_substring()
     if parts is None: parts = load_part_ids(assembly_dir)
+    colors = _get_colors(parts)
     for part_id in parts:
         joint_type = 'fixed'
         string += f'''
 <robot>
     <link name="part{part_id}">
         <joint name="part{part_id}" type="{joint_type}" axis="0. 0. 0." pos="{_arr_to_str(pos_dict[part_id])}" quat="{_arr_to_str(quat_dict[part_id])}" frame="WORLD" damping="0"/>
-        <body name="part{part_id}" type="SDF" filename="{assembly_dir}/{part_id}.obj" {sdf_args} pos="0 0 0" quat="1 0 0 0" scale="1 1 1" transform_type="OBJ_TO_JOINT" density="1" dx="0.05" res="20" mu="0" rgba="{_arr_to_str(_get_color(part_id))}"/>
+        <body name="part{part_id}" type="SDF" filename="{assembly_dir}/{part_id}.obj" {sdf_args} pos="0 0 0" quat="1 0 0 0" scale="1 1 1" transform_type="OBJ_TO_JOINT" density="1" dx="0.05" res="20" mu="0" rgba="{_arr_to_str(colors[part_id])}"/>
     </link>
 </robot>
 '''
@@ -131,6 +178,7 @@ def get_path_sim_string(assembly_dir, parts_fix, part_move, parts_removed=[], sa
 
     sdf_args = 'load_sdf="true" save_sdf="true"' if save_sdf else ''
     string = _get_path_sim_substring()
+    colors = _get_colors([part_move, *parts_fix, *parts_removed])
     for part_id in [part_move, *parts_fix, *parts_removed]:
 
         if part_id in parts_removed:
@@ -139,11 +187,13 @@ def get_path_sim_string(assembly_dir, parts_fix, part_move, parts_removed=[], sa
 
         if part_id == part_move:
             joint_type = 'free3d-exp'
-            color = _get_color(part_id)
+            # color = _get_color(part_id)
+            color = colors[part_id]
         else:
             joint_type = 'fixed'
             # color = _get_fixed_color()
-            color = _get_color(part_id)
+            # color = _get_color(part_id)
+            color = colors[part_id]
 
         matrix = pos_quat_to_mat(pos_dict[part_id], quat_dict[part_id])
         matrix = pose @ matrix
@@ -200,13 +250,15 @@ def get_stability_sim_string(assembly_dir, parts_fix, parts_move, gravity=True, 
     sdf_args = 'load_sdf="true" save_sdf="true"' if save_sdf else ''
     string = _get_stablility_sim_substring(gravity=gravity)
 
+    colors = _get_colors([*parts_fix, *parts_move])
     for part_id in [*parts_fix, *parts_move]:
         if part_id in parts_fix:
             joint_type = 'fixed'
             color = _get_fixed_color()
         else:
             joint_type = 'free3d-exp'
-            color = _get_color(part_id)
+            # color = _get_color(part_id)
+            color = colors[part_id]
 
         if mat_dict is None: # ground init
             matrix = pos_quat_to_mat(pos_dict[part_id], quat_dict[part_id])
