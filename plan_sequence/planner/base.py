@@ -31,6 +31,35 @@ class NumpyEncoder(json.JSONEncoder):
         return json.JSONEncoder.default(self, obj)
 
 
+def _simulate_standalone(asset_folder, assembly_dir, save_sdf, base_part,
+                          part_move, parts_rest, parts_removed, pose,
+                          max_grippers, timeout, optimizer, debug, render):
+    """Module-level wrapper around _simulate logic, picklable for use with parallel_execute."""
+    action, _ = check_assemblable(
+        asset_folder, assembly_dir, parts_rest, part_move,
+        pose=pose, save_sdf=save_sdf, return_path=True, debug=debug, render=render,
+    )
+    if action is not None:
+        max_fix = max_grippers - 1 if max_grippers is not None else None
+        parts_fix = get_stable_plan_1pose_serial(
+            asset_folder, assembly_dir, parts_rest, base_part,
+            pose=pose, max_fix=max_fix, save_sdf=save_sdf,
+            timeout=timeout, debug=debug, render=render,
+        )
+    else:
+        parts_fix = None
+
+    return {
+        'feasible': action is not None and parts_fix is not None,
+        'action': action,
+        'base_part': base_part,
+        'parts_fix': parts_fix,
+        'part_move': part_move,
+        'pose': pose,
+        'grasp': None,
+    }
+
+
 class SequencePlanner:
     '''
     Disassembly sequence planning (without ground, 1 direction gravity, 1 part at a time)
@@ -61,15 +90,21 @@ class SequencePlanner:
         _t0 = time()
         action, path = check_assemblable(self.asset_folder, self.assembly_dir, parts_rest, part_move, pose=pose, save_sdf=self.save_sdf,
             return_path=True, debug=debug, render=render)
-        self._timing['path_finding'] += time() - _t0
+        _dt_path = time() - _t0
+        self._timing['path_finding'] += _dt_path
         self._timing_counts['path_finding'] += 1
+        if debug > 0:
+            print(f'[planner._simulate] path_finding: {_dt_path:.3f}s  found={action is not None}')
 
         if action is not None:
             max_fix = max_grippers - 1 if max_grippers is not None else None
             _t0 = time()
             parts_fix_list = get_stable_plan_1pose_serial(self.asset_folder, self.assembly_dir, parts_rest, self.base_part, pose=pose, max_fix=max_fix, save_sdf=self.save_sdf, timeout=timeout, debug=debug, render=render)
-            self._timing['stability_check'] += time() - _t0
+            _dt_stab = time() - _t0
+            self._timing['stability_check'] += _dt_stab
             self._timing_counts['stability_check'] += 1
+            if debug > 0:
+                print(f'[planner._simulate] stability_check: {_dt_stab:.3f}s  stable={parts_fix_list is not None}')
             if parts_fix_list is not None: parts_fix_list = [parts_fix_list]
         else:
             parts_fix_list = None
@@ -86,8 +121,11 @@ class SequencePlanner:
         if feasible and grasp_planner is not None:
             _t0 = time()
             grasps = grasp_planner.plan(part_move, parts_rest, parts_removed, pose, path, optimizer)
-            self._timing['grasp_planning'] += time() - _t0
+            _dt_grasp = time() - _t0
+            self._timing['grasp_planning'] += _dt_grasp
             self._timing_counts['grasp_planning'] += 1
+            if debug > 0:
+                print(f'[planner._simulate] grasp_planning: {_dt_grasp:.3f}s')
             if len(grasps) == 0:
                 grasps = None
                 feasible = False
@@ -211,8 +249,11 @@ class SequencePlanner:
                     G_mesh = get_combined_mesh(self.assembly_dir, G)
                     _t0 = time()
                     poses.extend(get_stable_poses(G_mesh, max_num=max_poses - pose_reuse))
-                    self._timing['stable_pose'] += time() - _t0
+                    _dt_pose = time() - _t0
+                    self._timing['stable_pose'] += _dt_pose
                     self._timing_counts['stable_pose'] += 1
+                    if debug > 1:
+                        print(f'[planner.base.plan] stable_pose: {_dt_pose:.3f}s  n_poses={len(poses)}')
                     if len(poses) == 0:
                         poses = [None]
 
@@ -241,6 +282,14 @@ class SequencePlanner:
                     if debug > 0:
                         print(f'[planner.base.plan] add edge: ({G}, {G_prime}), feasible: {sim_info["feasible"]}')
                         print(f'[planner.base.plan] progress: {self.n_eval}/{budget} evaluations')
+                    if debug > 1:
+                        t_elapsed = time() - self.t_start
+                        _timing_str = '  '.join(
+                            f'{k}: {self._timing[k]:.1f}s ({100*self._timing[k]/t_elapsed:.0f}%)'
+                            for k in ['path_finding', 'stability_check', 'stable_pose', 'grasp_planning']
+                            if k in self._timing
+                        )
+                        print(f'[planner.base.plan] elapsed: {t_elapsed:.1f}s  [{_timing_str}]')
 
                     if debug > 1:
                         self.plot_tree(tree)
@@ -264,20 +313,23 @@ class SequencePlanner:
         assert self.stop_msg is not None, '[planner.base.plan] bug: unexpectedly stopped'
         if debug > 0:
             print(f'[planner.base.plan] stopped: {self.stop_msg}')
-            t_total = time() - self.t_start
-            accounted = sum(self._timing.values())
-            other = t_total - accounted
-            print(f'[planner.base.plan] timing summary (total: {t_total:.1f}s):')
-            order = ['path_finding', 'stability_check', 'stable_pose', 'grasp_planning']
-            for key in order + [k for k in self._timing if k not in order]:
-                if key not in self._timing:
-                    continue
-                t = self._timing[key]
-                n = self._timing_counts[key]
-                print(f'  {key:<20} {t:6.2f}s  {100*t/t_total:5.1f}%  ({n} calls, avg {1000*t/n:.1f}ms)')
-            print(f'  {"other":<20} {other:6.2f}s  {100*other/t_total:5.1f}%')
+            self._print_timing_summary()
 
         return tree
+
+    def _print_timing_summary(self):
+        t_total = time() - self.t_start
+        accounted = sum(self._timing.values())
+        other = t_total - accounted
+        print(f'  timing summary (total: {t_total:.1f}s):')
+        order = ['path_finding', 'stability_check', 'stable_pose', 'grasp_planning']
+        for key in order + [k for k in self._timing if k not in order]:
+            if key not in self._timing:
+                continue
+            t = self._timing[key]
+            n = self._timing_counts[key]
+            print(f'  {key:<20} {t:6.2f}s  {100*t/t_total:5.1f}%  ({n} calls, avg {1000*t/n:.1f}ms)')
+        print(f'  {"other":<20} {other:6.2f}s  {100*other/t_total:5.1f}%')
 
     def _reset(self):
         pass
