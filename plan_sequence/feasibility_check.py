@@ -10,7 +10,11 @@ from time import time
 
 from utils.renderer import SimRenderer
 from utils.parallel import parallel_execute
-from plan_sequence.physics_planner import MultiPartPathPlanner, MultiPartStabilityPlanner, MultiPartNoForceStabilityPlanner, get_contact_graph, CONTACT_EPS
+from plan_sequence.physics_planner import (
+    MultiPartPathPlanner, MultiPartStabilityPlanner, MultiPartNoForceStabilityPlanner,
+    get_contact_graph, CONTACT_EPS,
+    check_tool as _check_tool_physics,
+)
 
 
 def get_R3_actions():
@@ -24,12 +28,41 @@ def get_R3_actions():
     ]
     return actions
 
+def check_tool(asset_folder, assembly_dir, parts_fix, part_move, tools,
+               asset_folder_bfs=None, output_dir=None, show=False, debug=0):
+    '''
+    Tool-feasibility wrapper used by sequence planning: check whether any of the
+    candidate `tools` can geometrically remove `part_move` from the sub-assembly
+    formed by `parts_fix + [part_move]`. Delegates to physics_planner.check_tool.
 
-def check_assemblable(asset_folder, assembly_dir, parts_fix, part_move, pose=None, save_sdf=False, debug=0, render=False, return_path=False, optimize_path=False, min_sep=None):
+    Returns:
+        dict {'tool_id', 'tool_mesh', 'inverted'} on success, or None on failure.
+    '''
+    result = _check_tool_physics(
+        asset_folder=asset_folder,
+        assembly_dir=assembly_dir,
+        parts_fix=parts_fix,
+        part_move=part_move,
+        tools=tools,
+        asset_folder_bfs=asset_folder_bfs,
+        output_dir=output_dir,
+        show=show,
+        verbose=debug > 0,
+    )
+    if debug > 0:
+        if result is None:
+            print(f'[check_tool] no feasible tool for part_move={part_move}, parts_fix={parts_fix}')
+        else:
+            print(f'[check_tool] feasible tool={result["tool_id"]} (inverted={result["inverted"]}) for part_move={part_move}')
+    return result
+
+def check_assemblable(asset_folder, assembly_dir, parts_fix, part_move, pose=None, save_sdf=False, debug=0, render=False, return_path=False, optimize_path=False, min_sep=None, get_dof=False):
     '''
     Check if certain parts are disassemblable
     '''
     planner = MultiPartPathPlanner(asset_folder, assembly_dir, parts_fix, part_move, pose=pose, save_sdf=save_sdf)
+
+    dof = planner.compute_dof() if get_dof else None
 
     actions = get_R3_actions()
     best_action = None
@@ -67,8 +100,12 @@ def check_assemblable(asset_folder, assembly_dir, parts_fix, part_move, pose=Non
                 assert success
         best_path = np.array(best_path)
 
-    if return_path:
+    if return_path and get_dof:
+        return best_action, best_path, dof
+    elif return_path:
         return best_action, best_path
+    elif get_dof:
+        return best_action, dof
     else:
         return best_action
 

@@ -1,5 +1,8 @@
 import os
+import shutil
 import sys
+import tempfile
+from pathlib import Path
 
 project_base_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 sys.path.append(project_base_dir)
@@ -34,6 +37,9 @@ COL_TH_STABLE = 0.00
 MIN_SEP = 0.5
 DEBUG_SIM = False
 
+DOF_NUM_STEPS = 50
+DOF_RETURN_EPS = 1e-3
+
 
 class State:
 
@@ -59,11 +65,13 @@ class MultiPartPathPlanner:
         sim = redmax.Simulation(model_string, asset_folder)
         col_th_dict = self._compute_col_th_dict(sim, parts_fix + parts_removed, part_move)
 
-        model_string = get_path_sim_string(assembly_dir, parts_fix, part_move, parts_removed=parts_removed, 
+        model_string = get_path_sim_string(assembly_dir, parts_fix, part_move, parts_removed=parts_removed,
             save_sdf=save_sdf, pose=pose, col_th=col_th_dict)
         self.sim = redmax.Simulation(model_string, asset_folder)
         if camera_pos is not None: self.sim.viewer_options.camera_pos = camera_pos
         if camera_lookat is not None: self.sim.viewer_options.camera_lookat = camera_lookat
+        self.asset_folder = asset_folder
+        self.assembly_dir = assembly_dir
         self.parts_fix = parts_fix
         self.part_move = part_move
         self.parts_removed = parts_removed
@@ -156,13 +164,90 @@ class MultiPartPathPlanner:
         else:
             return True
 
-    def plan_path(self, action, rotation=False):
+    def compute_dof(self, num_steps=DOF_NUM_STEPS, return_eps=DOF_RETURN_EPS):
+        '''
+        Probe each of 6 axis-aligned directions to estimate translational DoFs.
+        For each direction, apply a constant force in that direction for up to
+        num_steps single forward steps, stopping early when qdotdot drops below
+        0.01 * force_mag. DoF[i] = 1 if the trajectory never returned within
+        return_eps of an earlier visited position; else 0.
+        Returns a length-6 numpy int array in order [+Z, -Z, +X, -X, +Y, -Y].
+        '''
+        t_start = time()
+        directions = [
+            np.array([0, 0, 1]),
+            np.array([0, 0, -1]),
+            np.array([1, 0, 0]),
+            np.array([-1, 0, 0]),
+            np.array([0, 1, 0]),
+            np.array([0, -1, 0]),
+        ]
+        dof = np.zeros(6, dtype=int)
+        for i, direction in enumerate(directions):
+            self.sim.reset()
+            self.apply_action(direction)
+            init_state = self.get_state()
+            positions = [init_state.q[:3].copy()]
+            prev_qdot = init_state.qdot[:3].copy()
+            for _ in range(num_steps):
+                self.sim.forward(1, verbose=False)
+                new_state = self.get_state()
+                positions.append(new_state.q[:3].copy())
+                cur_qdot = new_state.qdot[:3].copy()
+                qdotdot = (cur_qdot - prev_qdot) / self.sim.options.h
+                prev_qdot = cur_qdot
+                if np.linalg.norm(qdotdot) < 0.01 * self.force_mag:
+                    break
+            final_pos = positions[-1]
+            returned = any(
+                np.linalg.norm(final_pos - prev_pos) < return_eps
+                for prev_pos in positions[:-1]
+            )
+            dof[i] = 0 if returned else 1
+        self.sim.reset()
+        elapsed = time() - t_start
+        print(f'[compute_dof] elapsed: {elapsed:.3f}s  dof: {dof.tolist()}')
+        return dof
+
+    def check_tool(self, tools, asset_folder_bfs=None, output_dir=None, show=False, verbose=False):
+        """Tool-based feasibility check for the current (parts_fix + part_move) sub-assembly.
+
+        Tries each tool in `tools` (a list of `Tool` instances with cached
+        `direction`/`contact_point`) to determine whether any of them can be
+        geometrically applied to `self.part_move` and whether the resulting
+        tool — and the tool+part union — can be path-planned out of the
+        assembly. No VLM/LLM calls are made.
+
+        Args:
+            tools: list of `Tool` instances (already scaled to the assembly).
+            asset_folder_bfs: redmax asset folder used by the BFS path planner
+                invoked inside the pipeline. Defaults to `<repo>/ATA/assets`.
+            output_dir: optional directory for tool-placement screenshots.
+            show, verbose: forwarded.
+
+        Returns:
+            dict {'tool_id', 'tool_mesh', 'inverted'} on success, or None when
+            no tool in `tools` is feasible.
+        """
+        return check_tool(
+            asset_folder=self.asset_folder,
+            assembly_dir=self.assembly_dir,
+            parts_fix=self.parts_fix,
+            part_move=self.part_move,
+            tools=tools,
+            asset_folder_bfs=asset_folder_bfs,
+            output_dir=output_dir,
+            show=show,
+            verbose=verbose,
+        )
+
+    def plan_path(self, action, rotation=False, connect_path=False):
         success, path = self.check_success(action, return_path=True)
-        # if success:
-        #     connect_path = self.connect_path_planner.plan(self.part_move, self.parts_fix, self.parts_removed, 
-        #         rotation=rotation, final_state=path[-1])
-        #     if connect_path is not None:
-        #         path += connect_path
+        if success and connect_path:
+            cp = self.connect_path_planner.plan(self.part_move, self.parts_fix, self.parts_removed,
+                rotation=rotation, final_state=path[-1])
+            if cp is not None:
+                path += cp
         return success, path
 
     def render(self, path=None, reverse=False, record_path=None, make_video=False):
@@ -179,6 +264,73 @@ class MultiPartPathPlanner:
         SimRenderer.replay(self.sim, record=record_path is not None, record_path=record_path, make_video=make_video)
         self.sim.set_state_his(q_his, qdot_his)
         return self.sim.export_replay_matrices()
+
+    def render_with_tool(self, tool_mesh, path=None, reverse=False, record_path=None,
+                         make_video=False, tool_color=None, camera_pos=None, camera_lookat=None,
+                         body_color_dict=None):
+        '''
+        Like ``render`` but with ``tool_mesh`` rigidly attached to the moving part so it
+        rides along the planned trajectory. ``tool_mesh`` must already be positioned in
+        the moving part's OBJ frame (e.g. the output of
+        ``ToolAnalyzer._apply_tool_geometric`` is exactly this).
+
+        Internally builds a fresh redmax sim using ``get_path_sim_string(tool_attach=...)``,
+        which nests the tool as a fixed child-link of the moving part. The path's joint
+        states are copied over so the visual matches a regular ``render`` call.
+        '''
+        tmp_dir = Path(tempfile.mkdtemp(prefix='tool_render_'))
+        tmp_obj = tmp_dir / 'tool.obj'
+        tool_mesh.export(str(tmp_obj))
+
+        try:
+            # Recompute collision thresholds the same way __init__ does (the contact sim
+            # is cheap and stateless, so it's fine to spin a fresh one).
+            contact_string = get_contact_sim_string(
+                self.assembly_dir,
+                self.parts_fix + [self.part_move] + self.parts_removed,
+            )
+            contact_sim = redmax.Simulation(contact_string, self.asset_folder)
+            col_th_dict = self._compute_col_th_dict(
+                contact_sim, self.parts_fix + self.parts_removed, self.part_move,
+            )
+
+            tool_attach = {
+                'filename': str(tmp_obj),
+                'color': tool_color or '0.9 0.45 0.1 1.0',
+            }
+            model_string = get_path_sim_string(
+                self.assembly_dir, self.parts_fix, self.part_move,
+                parts_removed=self.parts_removed, pose=self.pose, col_th=col_th_dict,
+                tool_attach=tool_attach,
+            )
+            render_sim = redmax.Simulation(model_string, self.asset_folder)
+
+            # Match camera framing with the original sim (or any override).
+            cam_pos = camera_pos if camera_pos is not None else self.sim.viewer_options.camera_pos
+            cam_look = camera_lookat if camera_lookat is not None else self.sim.viewer_options.camera_lookat
+            render_sim.viewer_options.camera_pos = cam_pos
+            render_sim.viewer_options.camera_lookat = cam_look
+            if body_color_dict is not None:
+                render_sim.set_body_color_map(body_color_dict)
+
+            if path is not None:
+                path_q = [render_sim.get_joint_q_from_qm(f'part{self.part_move}', qm) for qm in path]
+            else:
+                path_q = list(self.sim.get_q_his())
+
+            if reverse:
+                path_q = path_q[::-1]
+            render_sim.set_state_his(path_q, [np.zeros(6) for _ in range(len(path_q))])
+
+            SimRenderer.replay(
+                render_sim,
+                record=record_path is not None,
+                record_path=record_path,
+                make_video=make_video,
+            )
+            return render_sim.export_replay_matrices()
+        finally:
+            shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
 
 class StabilityChecker:
@@ -535,3 +687,54 @@ def get_body_mass(asset_folder, assembly_dir, parts=None, save_sdf=False):
         mass_dict[part] = sim.get_body_mass(f'part{part}')
 
     return mass_dict
+
+
+# Project root used to import the top-level tool_analyzer module from this nested ASAPx
+# location. tool_analyzer lives at <repo>/tool_analyzer.py.
+_ASSEMBLY_EVAL_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
+)
+
+
+def check_tool(asset_folder, assembly_dir, parts_fix, part_move, tools,
+               asset_folder_bfs=None, output_dir=None, show=False, verbose=False):
+    '''
+    Generic tool-feasibility check for a sub-assembly during sequence planning.
+
+    Given the set of parts currently in the assembly (`parts_fix + [part_move]`) and a
+    list of candidate tools, attempt to find any tool that can be geometrically applied
+    to `part_move` and whose tool / tool+part union can be path-planned out. No VLM/LLM
+    calls are made — tools are tried in order and the first feasible one is returned.
+
+    Args:
+        asset_folder: redmax asset root (only used to align the planner with the rest
+            of the call site; not directly consumed by the tool pipeline).
+        assembly_dir: directory containing the active parts' .obj files (matched by id).
+        parts_fix: list of part IDs that must remain in place during removal.
+        part_move: ID of the part the tool needs to remove.
+        tools: list of `Tool` instances (already scaled to the assembly).
+        asset_folder_bfs: redmax asset folder used by the BFSPlanner invoked inside the
+            pipeline. Defaults to <repo>/ATA/assets.
+        output_dir, show, verbose: forwarded.
+
+    Returns:
+        dict {'tool_id', 'tool_mesh', 'inverted'} on success, or None when no tool works.
+    '''
+    if _ASSEMBLY_EVAL_ROOT not in sys.path:
+        sys.path.insert(0, _ASSEMBLY_EVAL_ROOT)
+    from tool_analyzer import ToolAnalyzer
+
+    if asset_folder_bfs is None:
+        asset_folder_bfs = os.path.join(_ASSEMBLY_EVAL_ROOT, 'ATA', 'assets')
+
+    parts_active = list(parts_fix) + [part_move]
+    return ToolAnalyzer.check_tool_pipeline(
+        asset_folder=asset_folder_bfs,
+        assembly_dir=assembly_dir,
+        parts=parts_active,
+        part_move=part_move,
+        tools=tools,
+        output_dir=output_dir,
+        show=show,
+        verbose=verbose,
+    )

@@ -84,9 +84,10 @@ def _get_fixed_color():
 
 def get_body_color_dict(parts_fix, parts_free): # parts_free = parts_rest - parts_fix + [part_move]
     body_color_dict = {}
+    colors = _get_colors([*parts_fix, *parts_free])
     for part_id in [*parts_fix, *parts_free]:
         if part_id in parts_free:
-            color = _get_color(part_id)[:3]
+            color = colors[part_id][:3]
         else:
             color = _get_fixed_color()[:3]
         body_color_dict[f'part{part_id}'] = color
@@ -159,9 +160,13 @@ def get_contact_sim_string(assembly_dir, parts=None, save_sdf=False, mat_dict=No
     return string
 
 
-def get_path_sim_string(assembly_dir, parts_fix, part_move, parts_removed=[], save_sdf=False, pose=None, mat_dict=None, col_th=0.01, arm_string=None):
+def get_path_sim_string(assembly_dir, parts_fix, part_move, parts_removed=[], save_sdf=False, pose=None, mat_dict=None, col_th=0.01, arm_string=None, tool_attach=None):
     '''
-    Simulation string for checking path assemblability
+    Simulation string for checking path assemblability.
+
+    tool_attach: optional dict {"filename": <.obj path>, "color": "r g b a"}. When set,
+    a child <link> is nested inside the moving part's link with a fixed joint at the
+    parent body's origin, so the tool rides along the part's free3d-exp motion.
     '''
     if pose is None: pose = np.eye(4)
 
@@ -208,11 +213,20 @@ def get_path_sim_string(assembly_dir, parts_fix, part_move, parts_removed=[], sa
         else:
             col_th_i = col_th
 
+        tool_inner = ""
+        if part_id == part_move and tool_attach is not None:
+            tool_color = tool_attach.get("color", "0.9 0.45 0.1 1.0")
+            tool_inner = f'''
+        <link name="tool">
+            <joint name="tool" type="fixed" pos="0 0 0" quat="1 0 0 0"/>
+            <body name="tool" type="mesh" filename="{tool_attach["filename"]}" pos="0 0 0" quat="1 0 0 0" scale="1 1 1" transform_type="OBJ_TO_JOINT" rgba="{tool_color}"/>
+        </link>'''
+
         string += f'''
 <robot>
     <link name="part{part_id}">
         <joint name="part{part_id}" type="{joint_type}" axis="0. 0. 0." pos="{_arr_to_str(pos)}" quat="{_arr_to_str(quat)}" frame="WORLD" damping="0"/>
-        <body name="part{part_id}" type="SDF" filename="{assembly_dir}/{part_id}.obj" {sdf_args} pos="0 0 0" quat="1 0 0 0" scale="1 1 1" transform_type="OBJ_TO_JOINT" density="1" dx="0.05" res="20" col_th="{col_th_i}" mu="0" rgba="{_arr_to_str(color)}"/>
+        <body name="part{part_id}" type="SDF" filename="{assembly_dir}/{part_id}.obj" {sdf_args} pos="0 0 0" quat="1 0 0 0" scale="1 1 1" transform_type="OBJ_TO_JOINT" density="1" dx="0.05" res="20" col_th="{col_th_i}" mu="0" rgba="{_arr_to_str(color)}"/>{tool_inner}
     </link>
 </robot>
 '''

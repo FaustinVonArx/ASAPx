@@ -25,6 +25,44 @@ from assets.save import clear_saved_sdfs, save_path_all_objects
 from assets.load import load_part_ids
 
 
+def _fit_camera_to_path(path_planner, path, camera_pos, camera_lookat):
+    """Reposition the sim camera to frame the start and end of the path.
+
+    Uses only path[0] (assembled position) and path[-1] (ground resting position)
+    to define the scene extent — ignoring intermediate disassembly positions that
+    may fly far off-screen.  The original viewing direction is preserved; only the
+    lookat and distance are adjusted.
+    """
+    if len(path) < 2:
+        return
+
+    start = np.array(path[0][:3])
+    end   = np.array(path[-1][:3])
+
+    center = (start + end) / 2
+    span   = float(np.linalg.norm(end - start))
+    if span < 1e-6:
+        return
+
+    if camera_pos is not None and camera_lookat is not None:
+        cam_dir = np.array(camera_pos) - np.array(camera_lookat)
+        norm = np.linalg.norm(cam_dir)
+        cam_dir = cam_dir / norm if norm > 1e-6 else np.array([1., -1., 1.]) / np.sqrt(3)
+    else:
+        cam_dir = np.array([1., -1., 1.]) / np.sqrt(3)
+
+    # Keep the same camera-to-lookat distance as the original, scaled by how much
+    # further the ground position is from the assembly centre.
+    if camera_pos is not None and camera_lookat is not None:
+        orig_dist = float(np.linalg.norm(np.array(camera_pos) - np.array(camera_lookat)))
+    else:
+        orig_dist = span
+    dist = max(orig_dist, span * 0.8)
+
+    path_planner.sim.viewer_options.camera_lookat = list(center)
+    path_planner.sim.viewer_options.camera_pos    = list(center + cam_dir * dist)
+
+
 def interpolate_path(states):
     interpolated_path = []
 
@@ -53,8 +91,17 @@ def interpolate_path(states):
     return interpolated_path
 
 
-def play_logged_plan(asset_folder, assembly_dir, sequence, tree, result_dir, save_mesh, save_pose, save_part, save_path, save_record, save_all, 
-    reverse=False, show_fix=False, show_grasp=False, show_arm=False, gripper_type=None, gripper_scale=None, optimizer='L-BFGS-B', save_sdf=False, clear_sdf=False, make_video=False, budget=None, camera_pos=None, camera_lookat=None):
+def play_logged_plan(asset_folder, assembly_dir, sequence, tree, result_dir, save_mesh, save_pose, save_part, save_path, save_record, save_all,
+    reverse=False, show_fix=False, show_grasp=False, show_arm=False, gripper_type=None, gripper_scale=None, optimizer='L-BFGS-B', save_sdf=False, clear_sdf=False, make_video=False, budget=None, camera_pos=None, camera_lookat=None, connect_path=False,
+    extra_views=None, tool_meshes_per_step=None):
+    # extra_views: list of (record_dir, camera_pos, camera_lookat) — each entry
+    # re-renders the already-simulated path from a different camera, writing
+    # GIFs/MP4s into its record_dir. No additional physics simulation is run.
+    #
+    # tool_meshes_per_step: optional dict {part_id: trimesh.Trimesh}. When an entry exists
+    # for the step's moving part, the tool mesh (already positioned in the part's OBJ frame,
+    # e.g. via ToolAnalyzer._apply_tool_geometric) is attached as a fixed child of the
+    # moving part and replayed alongside the part trajectory.
 
     parts_assembled = sorted(load_part_ids(assembly_dir))
 
@@ -105,6 +152,10 @@ def play_logged_plan(asset_folder, assembly_dir, sequence, tree, result_dir, sav
         record_dir = None
         record_dir_grasp = None
 
+    extra_views = extra_views or []
+    for view_record_dir, _, _ in extra_views:
+        os.makedirs(view_record_dir, exist_ok=True)
+
     try:
         parts_removed = []
 
@@ -140,7 +191,7 @@ def play_logged_plan(asset_folder, assembly_dir, sequence, tree, result_dir, sav
                 path_planner = MultiPartPathPlanner(asset_folder, assembly_dir, parts_rest, part_move, parts_removed=parts_removed, pose=pose, save_sdf=save_sdf,
                     camera_pos=camera_pos, camera_lookat=camera_lookat)
                 # success, path = path_planner.check_success(action, return_path=True)
-                success, path = path_planner.plan_path(action, rotation=True)
+                success, path = path_planner.plan_path(action, rotation=True, connect_path=connect_path)
                 assert success, f'[play_logged_plan] path planner: part_move {part_move} with action {action} is not successful'
 
                 min_path_len = 300
@@ -167,13 +218,42 @@ def play_logged_plan(asset_folder, assembly_dir, sequence, tree, result_dir, sav
                             path_i_dir = os.path.join(path_dir, f'{i}_{part_move}_g{idx}')
                             save_path_all_objects(path_i_dir, body_matrices, n_frame=300)
                             
+                if connect_path:
+                    _fit_camera_to_path(path_planner, path, camera_pos, camera_lookat)
+
                 path_planner.sim.set_body_color_map(body_color_dict)
+                tool_mesh = (tool_meshes_per_step or {}).get(part_move)
                 if record_path is not None:
-                    body_matrices = path_planner.render(path=path, reverse=reverse, record_path=record_path, make_video=make_video)
+                    if tool_mesh is not None:
+                        body_matrices = path_planner.render_with_tool(
+                            tool_mesh, path=path, reverse=reverse,
+                            record_path=record_path, make_video=make_video,
+                            body_color_dict=body_color_dict,
+                        )
+                    else:
+                        body_matrices = path_planner.render(path=path, reverse=reverse, record_path=record_path, make_video=make_video)
 
                     if path_dir is not None:
                         path_i_dir = os.path.join(path_dir, f'{i}_{part_move}')
                         save_path_all_objects(path_i_dir, body_matrices, n_frame=300)
+
+                for view_record_dir, view_camera_pos, view_camera_lookat in extra_views:
+                    view_record_path = os.path.join(view_record_dir,
+                        f'{i}_{part_move}.mp4' if make_video else f'{i}_{part_move}.gif')
+                    if tool_mesh is not None:
+                        path_planner.render_with_tool(
+                            tool_mesh, path=path, reverse=reverse,
+                            record_path=view_record_path, make_video=make_video,
+                            camera_pos=list(view_camera_pos), camera_lookat=list(view_camera_lookat),
+                            body_color_dict=body_color_dict,
+                        )
+                    else:
+                        if connect_path:
+                            _fit_camera_to_path(path_planner, path, view_camera_pos, view_camera_lookat)
+                        else:
+                            path_planner.sim.viewer_options.camera_pos = list(view_camera_pos)
+                            path_planner.sim.viewer_options.camera_lookat = list(view_camera_lookat)
+                        path_planner.render(path=path, reverse=reverse, record_path=view_record_path, make_video=make_video)
 
             if pose_dir is not None:
                 pose_path = os.path.join(pose_dir, f'{i}_{part_move}.npy')
