@@ -31,27 +31,54 @@ class NumpyEncoder(json.JSONEncoder):
         return json.JSONEncoder.default(self, obj)
 
 
+def _below_ground_after_disassembly(assembly_dir, part_move, pose, path):
+    """Return True if the moving part's COG ends up at z<0 after the disassembly
+    path, i.e. the action drove it through the resting plane. Assumes pure
+    translation along the path (no body rotation), which is a reasonable
+    approximation for short disassembly motions."""
+    if path is None or len(path) == 0:
+        return False
+    part_mesh = get_combined_mesh(assembly_dir, [part_move])
+    cog_local = np.asarray(part_mesh.center_mass, dtype=float)
+    if pose is not None:
+        cog_world_init = pose[:3, :3] @ cog_local + pose[:3, 3]
+    else:
+        cog_world_init = cog_local
+    displacement = np.asarray(path[-1][:3], dtype=float) - np.asarray(path[0][:3], dtype=float)
+    return float(cog_world_init[2] + displacement[2]) < 0.0
+
+
 def _simulate_standalone(asset_folder, assembly_dir, save_sdf, base_part,
                           part_move, parts_rest, parts_removed, pose,
                           max_grippers, timeout, optimizer, debug, render,
-                          allow_gap=False, get_dof=False, tools=None):
+                          allow_gap=False, get_dof=False, tools=None,
+                          skip_stability=False):
     """Module-level wrapper around _simulate logic, picklable for use with parallel_execute."""
     _t0 = time()
     if get_dof:
-        action, _, dof = check_assemblable(
+        action, path, dof = check_assemblable(
             asset_folder, assembly_dir, parts_rest, part_move,
             pose=pose, save_sdf=save_sdf, return_path=True, debug=debug, render=render, get_dof=True,
         )
     else:
-        action, _ = check_assemblable(
+        action, path = check_assemblable(
             asset_folder, assembly_dir, parts_rest, part_move,
             pose=pose, save_sdf=save_sdf, return_path=True, debug=debug, render=render,
         )
         dof = None
     dt_path = time() - _t0
 
+    if action is not None and _below_ground_after_disassembly(assembly_dir, part_move, pose, path):
+        action = None
+
     dt_stab = None
-    if action is not None:
+    if action is None:
+        parts_fix = None
+    elif skip_stability:
+        # Caller opted out of the multi-part stability check — treat the
+        # subassembly as if no extra fixes are needed.
+        parts_fix = []
+    else:
         max_fix = max_grippers - 1 if max_grippers is not None else None
         _t0 = time()
         parts_fix = get_stable_plan_1pose_serial(
@@ -60,8 +87,6 @@ def _simulate_standalone(asset_folder, assembly_dir, save_sdf, base_part,
             timeout=timeout, allow_gap=allow_gap, debug=debug, render=render,
         )
         dt_stab = time() - _t0
-    else:
-        parts_fix = None
 
     tool_result = None
     dt_tool = None
@@ -101,11 +126,22 @@ def _simulate_standalone(asset_folder, assembly_dir, save_sdf, base_part,
     }
 
 
+def _simulate_standalone_tagged(*args):
+    """Variant of `_simulate_standalone` whose last positional arg is a parent_idx
+    tag. The tag is stripped before the real call and re-attached on the returned
+    sim_info dict as `_parent_idx`. Used by the multi-frontier DFA loop so the
+    termination callback (which only sees sim_info) can track per-parent quotas."""
+    parent_idx = args[-1]
+    sim_info = _simulate_standalone(*args[:-1])
+    sim_info['_parent_idx'] = parent_idx
+    return sim_info
+
+
 class SequencePlanner:
     '''
     Disassembly sequence planning (without ground, 1 direction gravity, 1 part at a time)
     '''
-    def __init__(self, seq_generator, num_proc=1, save_sdf=False, allow_gap=False, get_dof=False, tools=None):
+    def __init__(self, seq_generator, num_proc=1, save_sdf=False, allow_gap=False, get_dof=False, tools=None, skip_stability=False):
         self.seq_generator = seq_generator
         self.asset_folder = seq_generator.asset_folder
         self.assembly_dir = seq_generator.assembly_dir
@@ -117,6 +153,7 @@ class SequencePlanner:
         self.allow_gap = allow_gap
         self.get_dof = get_dof
         self.tools = tools
+        self.skip_stability = skip_stability
         self.part_mass = get_body_mass(self.asset_folder, self.assembly_dir, self.parts, save_sdf=self.save_sdf)
         self.t_start = None
         self.n_eval = None
@@ -145,7 +182,15 @@ class SequencePlanner:
         if debug > 0:
             print(f'[planner._simulate] path_finding: {_dt_path:.3f}s  found={action is not None}')
 
-        if action is not None:
+        if action is not None and _below_ground_after_disassembly(self.assembly_dir, part_move, pose, path):
+            action = None
+
+        if action is None:
+            parts_fix_list = None
+        elif self.skip_stability:
+            # Caller opted out of the multi-part stability check.
+            parts_fix_list = [[]]
+        else:
             max_fix = max_grippers - 1 if max_grippers is not None else None
             _t0 = time()
             parts_fix_list = get_stable_plan_1pose_serial(self.asset_folder, self.assembly_dir, parts_rest, self.base_part, pose=pose, max_fix=max_fix, save_sdf=self.save_sdf, timeout=timeout, debug=debug, render=render)
@@ -155,8 +200,6 @@ class SequencePlanner:
             if debug > 0:
                 print(f'[planner._simulate] stability_check: {_dt_stab:.3f}s  stable={parts_fix_list is not None}')
             if parts_fix_list is not None: parts_fix_list = [parts_fix_list]
-        else:
-            parts_fix_list = None
 
         if parts_fix_list is None:
             parts_fix = None
