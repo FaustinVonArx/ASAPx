@@ -17,19 +17,19 @@ from assets.save import clear_saved_sdfs
 
 
 def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc, seed, budget, max_gripper, max_pose, pose_reuse, early_term, timeout, base_part,
-    save_sdf, clear_sdf, plan_grasp, plan_arm, gripper_type, gripper_scale, optimizer, debug, render, record_dir, log_dir, allow_gap=False, n_success_term=1, connect_path=False, get_dof=False):
+    save_sdf, clear_sdf, plan_grasp, plan_arm, gripper_type, gripper_scale, optimizer, debug, render, record_dir, log_dir, allow_gap=False, n_success_term=1, connect_path=False, get_dof=False, tools=None, n_children=3):
 
     try:
         generator_cls = generators[generator_name]
         generator = generator_cls(asset_folder, assembly_dir, base_part=base_part, save_sdf=save_sdf)
         planner_cls = planners[planner_name]
-        planner = planner_cls(generator, num_proc, save_sdf=save_sdf, allow_gap=allow_gap, get_dof=get_dof)
+        planner = planner_cls(generator, num_proc, save_sdf=save_sdf, allow_gap=allow_gap, get_dof=get_dof, tools=tools)
         planner.seed(seed)
 
         setup = {
             'budget': budget, 'max_grippers': max_gripper, 'max_poses': max_pose, 'pose_reuse': pose_reuse, 'early_term': early_term, 'timeout': timeout,
             'plan_grasp': plan_grasp, 'plan_arm': plan_arm, 'gripper_type': gripper_type, 'gripper_scale': gripper_scale, 'optimizer': optimizer, 'n_success_term': n_success_term,
-            'connect_path': connect_path,
+            'connect_path': connect_path, 'n_children': n_children,
         }
         tree = planner.plan(**setup, debug=debug - 1, render=False, log_dir=log_dir)
 

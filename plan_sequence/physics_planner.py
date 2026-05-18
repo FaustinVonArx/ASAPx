@@ -60,13 +60,13 @@ class MultiPartPathPlanner:
     min_sep = MIN_SEP
 
     def __init__(self, asset_folder, assembly_dir, parts_fix, part_move, parts_removed=[], pose=None, force_mag=FORCE_MAG, save_sdf=False,
-        camera_pos=None, camera_lookat=None):
+        camera_pos=None, camera_lookat=None, floor=False):
         model_string = get_contact_sim_string(assembly_dir, parts_fix + [part_move] + parts_removed, save_sdf=save_sdf)
         sim = redmax.Simulation(model_string, asset_folder)
         col_th_dict = self._compute_col_th_dict(sim, parts_fix + parts_removed, part_move)
 
         model_string = get_path_sim_string(assembly_dir, parts_fix, part_move, parts_removed=parts_removed,
-            save_sdf=save_sdf, pose=pose, col_th=col_th_dict)
+            save_sdf=save_sdf, pose=pose, col_th=col_th_dict, floor=floor)
         self.sim = redmax.Simulation(model_string, asset_folder)
         if camera_pos is not None: self.sim.viewer_options.camera_pos = camera_pos
         if camera_lookat is not None: self.sim.viewer_options.camera_lookat = camera_lookat
@@ -166,15 +166,18 @@ class MultiPartPathPlanner:
 
     def compute_dof(self, num_steps=DOF_NUM_STEPS, return_eps=DOF_RETURN_EPS):
         '''
-        Probe each of 6 axis-aligned directions to estimate translational DoFs.
-        For each direction, apply a constant force in that direction for up to
-        num_steps single forward steps, stopping early when qdotdot drops below
-        0.01 * force_mag. DoF[i] = 1 if the trajectory never returned within
-        return_eps of an earlier visited position; else 0.
-        Returns a length-6 numpy int array in order [+Z, -Z, +X, -X, +Y, -Y].
+        Probe each of 6 assembly-local axis-aligned directions to estimate
+        translational DoFs. Local directions are rotated by self.pose[:3,:3]
+        before being applied, so the returned 6-vector is pose-invariant.
+        For each direction, apply a constant force for up to num_steps single
+        forward steps, stopping early when qdotdot drops below 0.01 * force_mag.
+        DoF[i] = 1 if the trajectory never returned within return_eps of an
+        earlier visited position; else 0.
+        Returns a length-6 numpy int array in local-frame order
+        [+Z, -Z, +X, -X, +Y, -Y].
         '''
         t_start = time()
-        directions = [
+        local_directions = [
             np.array([0, 0, 1]),
             np.array([0, 0, -1]),
             np.array([1, 0, 0]),
@@ -182,6 +185,8 @@ class MultiPartPathPlanner:
             np.array([0, 1, 0]),
             np.array([0, -1, 0]),
         ]
+        R = self.pose[:3, :3] if self.pose is not None else np.eye(3)
+        directions = [R @ d for d in local_directions]
         dof = np.zeros(6, dtype=int)
         for i, direction in enumerate(directions):
             self.sim.reset()
@@ -457,7 +462,7 @@ class MultiPartStabilityPlanner:
         self.parts_move = parts_move.copy()
         self.allow_gap = allow_gap
 
-    def check_success(self, max_step=MAX_STEP, timeout=None):
+    def check_success(self, max_step=MAX_STEP, timeout=None, progress=False, progress_desc='stability'):
 
         t_start = time()
 
@@ -472,7 +477,10 @@ class MultiPartStabilityPlanner:
             return False, parts_disconnected
 
         # iterate until max step
-        iterator = tqdm(range(max_step)) if DEBUG_SIM else range(max_step)
+        if DEBUG_SIM or progress:
+            iterator = tqdm(range(max_step), desc=progress_desc, leave=False)
+        else:
+            iterator = range(max_step)
         for i in iterator:
 
             # simulate and update status
@@ -641,6 +649,74 @@ def plot_stability_curve(pos_list_map):
     plt.show()
 
 
+def find_stable_initial_poses(asset_folder, assembly_dir, parts, max_poses=3,
+                              save_sdf=False, allow_gap=False,
+                              max_step=MAX_STEP, timeout=None, progress=True):
+    '''
+    Pre-flight check for the full assembly. Compute trimesh stable poses for
+    the combined mesh and keep only those for which the assembly stands
+    self-supported under gravity (no parts need fixing).
+
+    Returns the subset of `get_stable_poses` outputs (in original order) that
+    pass MultiPartStabilityPlanner with parts_fix=[] and parts_move=parts.
+
+    When `progress` is True (default), prints per-pose timing breakdowns
+    (mesh, candidate enumeration, sim build, sim run) and shows a tqdm bar
+    over the inner stability-check forward steps.
+    '''
+    from plan_sequence.stable_pose import get_combined_mesh, get_stable_poses
+
+    t0 = time()
+    if progress:
+        print(f'[find_stable_initial_poses] start: {len(parts)} parts, max_poses={max_poses}, max_step={max_step}')
+
+    t_mesh = time()
+    mesh = get_combined_mesh(assembly_dir, parts)
+    dt_mesh = time() - t_mesh
+
+    t_poses = time()
+    candidate_poses = get_stable_poses(mesh, max_num=max_poses)
+    dt_poses = time() - t_poses
+
+    if progress:
+        print(f'[find_stable_initial_poses] mesh: {dt_mesh:.2f}s  '
+              f'trimesh stable poses ({len(candidate_poses)}): {dt_poses:.2f}s')
+
+    valid_poses = []
+    for i, pose in enumerate(candidate_poses):
+        t_build = time()
+        planner = MultiPartStabilityPlanner(
+            asset_folder, assembly_dir,
+            parts_fix=[], parts_move=list(parts),
+            pose=pose, save_sdf=save_sdf, allow_gap=allow_gap,
+        )
+        dt_build = time() - t_build
+
+        if progress:
+            print(f'[find_stable_initial_poses] pose {i + 1}/{len(candidate_poses)}: '
+                  f'sim build {dt_build:.2f}s, running {max_step} steps...')
+
+        t_run = time()
+        success, fallen = planner.check_success(
+            max_step=max_step, timeout=timeout,
+            progress=progress, progress_desc=f'pose {i + 1}/{len(candidate_poses)}',
+        )
+        dt_run = time() - t_run
+
+        if progress:
+            outcome = 'STABLE' if success else f'unstable (fallen={fallen})'
+            print(f'[find_stable_initial_poses] pose {i + 1}/{len(candidate_poses)}: '
+                  f'run {dt_run:.2f}s  → {outcome}')
+
+        if success:
+            valid_poses.append(pose)
+
+    if progress:
+        print(f'[find_stable_initial_poses] done in {time() - t0:.2f}s  '
+              f'kept {len(valid_poses)}/{len(candidate_poses)} pose(s)')
+    return valid_poses
+
+
 def get_contact_graph(asset_folder, assembly_dir, parts=None, contact_eps=CONTACT_EPS, save_sdf=False):
     '''
     Get contact graph for assembly
@@ -687,6 +763,82 @@ def get_body_mass(asset_folder, assembly_dir, parts=None, save_sdf=False):
         mass_dict[part] = sim.get_body_mass(f'part{part}')
 
     return mass_dict
+
+
+_VERIFY_DIRECTIONS = [
+    np.array([1, 0, 0]), np.array([-1, 0, 0]),
+    np.array([0, 1, 0]), np.array([0, -1, 0]),
+    np.array([0, 0, 1]), np.array([0, 0, -1]),
+]
+
+
+def verify_separation(asset_folder, assembly_dir, parts_S, parts_R,
+                      save_sdf=False, max_time=30, force_mag=FORCE_MAG):
+    '''
+    Verify that the union of parts_R can be physically separated from the union
+    of parts_S. The two part lists are fused into a single combined mesh each
+    (in their world-frame final pose), written to a temp dir, and then run
+    through MultiPartPathPlanner.check_success along each of the 6 world-frame
+    axis-aligned directions. Returns True iff any direction yields full
+    disassembly.
+
+    Pose is identity; gravity / stability are not considered.
+    '''
+    import shutil
+    import tempfile
+
+    from plan_sequence.stable_pose import get_combined_mesh
+
+    if not parts_S or not parts_R:
+        return False
+
+    tmp_dir = tempfile.mkdtemp(prefix='verify_sep_')
+    try:
+        mesh_S = get_combined_mesh(assembly_dir, list(parts_S))
+        mesh_R = get_combined_mesh(assembly_dir, list(parts_R))
+        mesh_S.export(os.path.join(tmp_dir, 'S.obj'))
+        mesh_R.export(os.path.join(tmp_dir, 'R.obj'))
+
+        planner = MultiPartPathPlanner(
+            asset_folder=asset_folder,
+            assembly_dir=tmp_dir,
+            parts_fix=['S'],
+            part_move='R',
+            pose=None,
+            force_mag=force_mag,
+            save_sdf=save_sdf,
+        )
+        planner.max_time = max_time
+
+        for direction in _VERIFY_DIRECTIONS:
+            if planner.check_success(direction):
+                return True
+        return False
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _verify_standalone(asset_folder, assembly_dir, parts_S, parts_R,
+                       save_sdf, max_time, force_mag):
+    '''
+    Multiprocessing worker for verify_separation. Catches and silences
+    exceptions so a failing partition just returns verified=False.
+    '''
+    try:
+        ok = verify_separation(
+            asset_folder=asset_folder,
+            assembly_dir=assembly_dir,
+            parts_S=parts_S,
+            parts_R=parts_R,
+            save_sdf=save_sdf,
+            max_time=max_time,
+            force_mag=force_mag,
+        )
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        ok = False
+    return {'verified': ok}
 
 
 # Project root used to import the top-level tool_analyzer module from this nested ASAPx

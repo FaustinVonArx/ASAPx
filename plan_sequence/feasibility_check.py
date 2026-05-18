@@ -64,7 +64,13 @@ def check_assemblable(asset_folder, assembly_dir, parts_fix, part_move, pose=Non
 
     dof = planner.compute_dof() if get_dof else None
 
-    actions = get_R3_actions()
+    # Probe along assembly-local axes: rotate the world-frame 6 unit actions by pose.
+    R = pose[:3, :3] if pose is not None else np.eye(3)
+    actions = [R @ a for a in get_R3_actions()]
+    # Try actions whose world-z component is most positive first; ground-directed
+    # actions (negative world-z) are tried last so a floor-blocked sim stalls only
+    # after other directions have already had a chance.
+    actions.sort(key=lambda a: -float(a[2]))
     best_action = None
     best_path = None
     best_path_len = np.inf

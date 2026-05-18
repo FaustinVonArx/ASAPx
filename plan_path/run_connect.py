@@ -73,7 +73,8 @@ class ConnectPathPlanner:
                 return np.linalg.norm(q1 - q2)
 
         def collision_fn(q):
-            mat = get_transform_matrix(q) @ np.linalg.inv(get_transform_matrix(self.assembly[move_id]['final_state']))
+            _final = self.assembly[move_id].get('final_state') or np.zeros(6)
+            mat = get_transform_matrix(q) @ np.linalg.inv(get_transform_matrix(_final))
             d_m = compute_move_mesh_distance_from_mat(phys_mesh_move, phys_meshes_still + phys_meshes_removed, mat)
             d_g = compute_ground_distance_from_mat(phys_mesh_move, mat)
             return d_m <= self.min_sep or d_g <= -self.sdf_dx
@@ -103,12 +104,67 @@ class ConnectPathPlanner:
 
         return distance_fn, sample_fn, extend_fn, collision_fn
 
+    def _compute_ground_placement(self, move_id, still_ids, removed_ids):
+        """Compute a default resting position for move_id on the ground next to the assembly.
+
+        Parts are laid out in a grid (columns along Y, rows along X) to the +X side
+        of the full assembly bounding box.  Gap and cell size are both normalised to
+        the assembly's own bounding-box width so the layout stays compact regardless
+        of scale.
+        """
+        # Use the full assembly (all parts) as a stable bbox reference so the
+        # anchor doesn't drift as parts are removed.
+        all_verts = [pdata['mesh_final'].vertices
+                     for pdata in self.assembly.values()
+                     if pdata.get('mesh_final') is not None]
+        if all_verts:
+            stacked    = np.vstack(all_verts)
+            asm_min    = stacked.min(axis=0)
+            asm_max    = stacked.max(axis=0)
+            asm_size   = asm_max - asm_min
+        else:
+            asm_min = asm_max = np.zeros(3)
+            asm_size = np.ones(3)
+
+        # Largest per-part bounding box — sets uniform cell size so parts never overlap
+        part_sizes = [
+            pdata['mesh_final'].vertices.max(axis=0) - pdata['mesh_final'].vertices.min(axis=0)
+            for pdata in self.assembly.values()
+            if pdata.get('mesh_final') is not None
+        ]
+        max_part = np.max(part_sizes, axis=0) if part_sizes else np.ones(3)
+
+        n_cols   = max(1, int(np.ceil(np.sqrt(len(self.assembly)))))
+        grid_idx = len(removed_ids)
+        col      = grid_idx % n_cols
+        row      = grid_idx // n_cols
+
+        # Gap and cell both normalised to assembly width: compact but readable
+        gap    = asm_size[0] * 0.15          # clearance from assembly edge
+        cell_w = max_part[0] * 1.1           # column pitch (x, away from assembly)
+        cell_d = max_part[1] * 1.1           # row pitch (y, along assembly side)
+
+        x_new = float(asm_max[0]) + gap + (row + 0.5) * cell_w
+        y_new = float((asm_min[1] + asm_max[1]) / 2) + (col - (n_cols - 1) / 2.0) * cell_d
+
+        # Z: keep assembled orientation, shift so the part's lowest point is at z = 0
+        assembled_state = self.assembly[move_id].get('final_state') or np.zeros(6)
+        part_mesh = self.assembly[move_id].get('mesh_final')
+        if part_mesh is not None:
+            z_new = float(assembled_state[2]) - float(part_mesh.vertices[:, 2].min())
+        else:
+            z_new = 0.0
+
+        rx, ry, rz = assembled_state[3], assembled_state[4], assembled_state[5]
+        return np.array([x_new, y_new, z_new, float(rx), float(ry), float(rz)])
+
     def plan(self, move_id, still_ids, removed_ids, rotation=False, initial_state=None, final_state=None, max_time=120, smooth=True, verbose=False):
 
-        if initial_state is None: 
-            if 'initial_state' in self.assembly[move_id]:
+        if initial_state is None:
+            if 'initial_state' in self.assembly[move_id] and self.assembly[move_id]['initial_state'] is not None:
                 initial_state = self.assembly[move_id]['initial_state']
-        if initial_state is None: return None
+            else:
+                initial_state = self._compute_ground_placement(move_id, still_ids, removed_ids)
         if final_state is None: 
             if 'final_state' in self.assembly[move_id]:
                 final_state = self.assembly[move_id]['final_state']

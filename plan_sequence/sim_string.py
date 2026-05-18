@@ -160,13 +160,17 @@ def get_contact_sim_string(assembly_dir, parts=None, save_sdf=False, mat_dict=No
     return string
 
 
-def get_path_sim_string(assembly_dir, parts_fix, part_move, parts_removed=[], save_sdf=False, pose=None, mat_dict=None, col_th=0.01, arm_string=None, tool_attach=None):
+def get_path_sim_string(assembly_dir, parts_fix, part_move, parts_removed=[], save_sdf=False, pose=None, mat_dict=None, col_th=0.01, arm_string=None, tool_attach=None, floor=True):
     '''
     Simulation string for checking path assemblability.
 
     tool_attach: optional dict {"filename": <.obj path>, "color": "r g b a"}. When set,
     a child <link> is nested inside the moving part's link with a fixed joint at the
     parent body's origin, so the tool rides along the part's free3d-exp motion.
+
+    floor: when False, omit the ground-contact binding on part_move so the floor no
+    longer blocks world -Z motion. The <ground> element itself is kept for visual /
+    sim-structure consistency.
     '''
     if pose is None: pose = np.eye(4)
 
@@ -235,7 +239,8 @@ def get_path_sim_string(assembly_dir, parts_fix, part_move, parts_removed=[], sa
     string += f'''
 <contact>
 '''
-    string += f'''
+    if floor:
+        string += f'''
     <ground_contact body="part{part_move}"/>
 '''
     for part_id in parts_fix:

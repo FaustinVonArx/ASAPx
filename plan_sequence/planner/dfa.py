@@ -15,30 +15,74 @@ class DFASequencePlanner(SequencePlanner):
 
     G_path = None
 
+    # Edge / node colors keyed by simulation outcome. Failure reasons are split
+    # so the tree shows *why* an edge is infeasible (assembly vs. stability vs.
+    # tool) rather than a single red.
+    _OUTCOME_COLORS = {
+        'feasible':   '#2ca02c',  # green
+        'unfinished': '#ffd700',  # gold
+        'assembly':   '#d62728',  # red
+        'stability':  '#1f77b4',  # blue
+        'tool':       '#ff7f0e',  # orange
+    }
+
+    @staticmethod
+    def _classify_sim_info(sim_info):
+        if sim_info.get('unfinished', False):
+            return 'unfinished'
+        if sim_info.get('feasible', False):
+            return 'feasible'
+        reason = sim_info.get('fail_reason')
+        if reason in DFASequencePlanner._OUTCOME_COLORS:
+            return reason
+        # Fallback for sim_info dicts written before fail_reason existed.
+        if sim_info.get('action') is None:
+            return 'assembly'
+        if sim_info.get('parts_fix') is None:
+            return 'stability'
+        return 'assembly'
+
     @staticmethod
     def plot_tree(tree, save_path=None):
         import tempfile
+        from collections import Counter
+        from matplotlib.patches import Patch
         from networkx.drawing.nx_agraph import graphviz_layout
 
-        def _node_color(node):
+        colors = DFASequencePlanner._OUTCOME_COLORS
+        classify = DFASequencePlanner._classify_sim_info
+
+        def _edge_kind(edge):
+            return classify(tree.edges[edge]['sim_info'])
+
+        def _node_kind(node):
             if tree.nodes[node]['n_gripper'] is not None:
-                return 'g'
+                return 'feasible'
             incoming = list(tree.in_edges(node))
-            if incoming and all(tree.edges[e]['sim_info'].get('unfinished', False) for e in incoming):
-                return 'gold'
-            return 'r'
+            if not incoming:
+                return 'feasible'  # root
+            kinds = [_edge_kind(e) for e in incoming]
+            if all(k == 'unfinished' for k in kinds):
+                return 'unfinished'
+            fail_kinds = [k for k in kinds if k not in ('feasible', 'unfinished')]
+            if not fail_kinds:
+                return 'assembly'
+            return Counter(fail_kinds).most_common(1)[0][0]
 
-        def _edge_color(edge):
-            info = tree.edges[edge]['sim_info']
-            if info.get('unfinished', False):
-                return 'gold'
-            return 'g' if info['feasible'] else 'r'
-
-        node_colors = [_node_color(node) for node in tree.nodes]
-        edge_colors = [_edge_color(edge) for edge in tree.edges]
+        node_colors = [colors[_node_kind(n)] for n in tree.nodes]
+        edge_colors = [colors[_edge_kind(e)] for e in tree.edges]
         pos = graphviz_layout(tree, prog='dot')
         fig, ax = plt.subplots(figsize=(16, 10))
-        nx.draw(tree, pos, ax=ax, node_color=node_colors, edge_color=edge_colors, with_labels=False, node_size=40, arrowsize=6)
+        nx.draw(tree, pos, ax=ax, node_color=node_colors, edge_color=edge_colors,
+                with_labels=False, node_size=40, arrowsize=6)
+        legend = [
+            Patch(facecolor=colors['feasible'],   label='feasible'),
+            Patch(facecolor=colors['unfinished'], label='unfinished'),
+            Patch(facecolor=colors['assembly'],   label='assembly fail (A)'),
+            Patch(facecolor=colors['stability'],  label='stability fail (S)'),
+            Patch(facecolor=colors['tool'],       label='tool fail (T)'),
+        ]
+        ax.legend(handles=legend, loc='upper right', fontsize=9, framealpha=0.9)
         out = save_path or tempfile.mktemp(suffix='.png', prefix='dfa_tree_')
         fig.savefig(out, dpi=120, bbox_inches='tight')
         plt.close(fig)
@@ -68,8 +112,8 @@ class DFASequencePlanner(SequencePlanner):
     def plan(self, budget, max_grippers, max_poses=3, pose_reuse=0, early_term=False,
              timeout=None, plan_grasp=False, plan_arm=False, gripper_type=None,
              gripper_scale=None, optimizer='L-BFGS-B', debug=0, render=False, log_dir=None,
-             n_success_term=1, connect_path=False):
-        print(f'[DFA.plan] start planning with budget={budget}, num_proc={self.num_proc}, max_grippers={max_grippers}, max_poses={max_poses}, pose_reuse={pose_reuse}, early_term={early_term}, timeout={timeout}, plan_grasp={plan_grasp}, plan_arm={plan_arm}, gripper_type={gripper_type}, gripper_scale={gripper_scale}, optimizer={optimizer}, debug={debug}, render={render}, log_dir={log_dir}, n_success_term={n_success_term}, connect_path={connect_path}, get_dof={self.get_dof}')
+             n_success_term=1, connect_path=False, n_children=3):
+        print(f'[DFA.plan] start planning with budget={budget}, num_proc={self.num_proc}, max_grippers={max_grippers}, max_poses={max_poses}, pose_reuse={pose_reuse}, early_term={early_term}, timeout={timeout}, plan_grasp={plan_grasp}, plan_arm={plan_arm}, gripper_type={gripper_type}, gripper_scale={gripper_scale}, optimizer={optimizer}, debug={debug}, render={render}, log_dir={log_dir}, n_success_term={n_success_term}, connect_path={connect_path}, n_children={n_children}, get_dof={self.get_dof}')
         if self.num_proc == 1:
             return super().plan(
                 budget, max_grippers, max_poses, pose_reuse, early_term,
@@ -95,6 +139,7 @@ class DFASequencePlanner(SequencePlanner):
         self._n_stability_success = 0
         G0 = self.parts.copy()
         tree = nx.DiGraph()
+        #NOTE call inital stable pose here 
         tree.add_node(tuple(G0), n_eval=0, n_gripper=1, poses=[])
 
         if debug > 0:
@@ -142,13 +187,23 @@ class DFASequencePlanner(SequencePlanner):
                 # Edges marked 'unfinished' (cut short by a previous early-termination batch)
                 # are eligible for retry.
                 sim_tasks = []  # (part, G_prime, pose)
-                for p in self.seq_generator.generate_candidate_part(G):
+                if n_success_term is None:
+                    # No early termination: every candidate will be tried, so skip
+                    # the (potentially expensive) generator and iterate over G directly.
+                    candidate_parts = [p for p in G if p != self.base_part] if self.base_part is not None else list(G)
+                else:
+                    candidate_parts = self.seq_generator.generate_candidate_part(G)
+                n_queued = 0
+                for p in candidate_parts:
                     G_prime = G.copy()
                     G_prime.remove(p)
                     if tree.has_edge(tuple(G), tuple(G_prime)):
                         prev = tree.edges[tuple(G), tuple(G_prime)]['sim_info']
                         if not prev.get('unfinished', False):
                             continue
+                    if n_children is not None and n_queued >= n_children:
+                        break
+                    n_queued += 1
                     for pose in poses:
                         sim_tasks.append((p, G_prime.copy(), pose))
 
@@ -159,12 +214,13 @@ class DFASequencePlanner(SequencePlanner):
                 # arg layout: [0]=asset_folder [1]=assembly_dir [2]=save_sdf [3]=base_part
                 #              [4]=part_move   [5]=G_prime      [6]=parts_removed [7]=pose
                 #              [8]=max_grippers [9]=timeout [10]=optimizer [11]=debug [12]=render
-                #              [13]=allow_gap
+                #              [13]=allow_gap  [14]=get_dof    [15]=tools
                 remaining_timeout = (None if timeout is None else timeout - (time() - self.t_start))
                 worker_args = [
                     (self.asset_folder, self.assembly_dir, self.save_sdf, self.base_part,
                      p, G_prime, parts_removed, pose, max_grippers,
-                     remaining_timeout, optimizer, max(debug - 2, 0), render, self.allow_gap, self.get_dof)
+                     remaining_timeout, optimizer, max(debug - 2, 0), render, self.allow_gap, self.get_dof,
+                     self.tools)
                     for p, G_prime, pose in sim_tasks
                 ]
 
@@ -193,14 +249,28 @@ class DFASequencePlanner(SequencePlanner):
                 # Count only tasks that actually ran (early termination may have skipped some).
                 self.n_eval += len(received)
 
-                # Accumulate per-check success/failure counts.
+                # Accumulate per-check success/failure counts. Also pull per-call
+                # timings recorded by _simulate_standalone in the worker — they
+                # aren't tracked anywhere else in parallel mode.
                 for sim_info, _ in received:
                     self._n_assembly_checks += 1
+                    dt_path = sim_info.pop('_dt_path', None)
+                    if dt_path is not None:
+                        self._timing['path_finding'] += dt_path
+                        self._timing_counts['path_finding'] += 1
+                    dt_stab = sim_info.pop('_dt_stab', None)
+                    dt_tool = sim_info.pop('_dt_tool', None)
                     if sim_info['action'] is not None:
                         self._n_assembly_success += 1
                         self._n_stability_checks += 1
-                        if sim_info['feasible']:
+                        if dt_stab is not None:
+                            self._timing['stability_check'] += dt_stab
+                            self._timing_counts['stability_check'] += 1
+                        if sim_info['parts_fix'] is not None:
                             self._n_stability_success += 1
+                    if dt_tool is not None:
+                        self._timing['tool_check'] += dt_tool
+                        self._timing_counts['tool_check'] += 1
 
                 # Group by G_prime; for each part keep only the first feasible pose result
                 # (or any infeasible result if no pose worked).
@@ -225,11 +295,16 @@ class DFASequencePlanner(SequencePlanner):
                         print(f'[DFA.plan] add edge ({G} → {G_prime}), feasible: {chosen_sim_info["feasible"]}')
 
                 if self.get_dof:
+                    import numpy as np
                     node_dof = tree.nodes[tuple(G)].setdefault('dof_info', {})
                     for sim_info, arg in received:
                         part = arg[4]
-                        if sim_info.get('dof') is not None and part not in node_dof:
-                            node_dof[part] = sim_info['dof']
+                        dof = sim_info.get('dof')
+                        if dof is None:
+                            continue
+                        dof = np.asarray(dof, dtype=int)
+                        prev = node_dof.get(part)
+                        node_dof[part] = dof if prev is None else (np.asarray(prev, dtype=int) | dof)
 
                 # Mark candidates that were submitted but never returned (killed by early
                 # termination) so they show up yellow in the tree and can be retried later.

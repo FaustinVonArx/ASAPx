@@ -17,8 +17,8 @@ import traceback
 
 from assets.load import load_part_ids
 from plan_sequence.sim_string import get_body_color_dict
-from plan_sequence.physics_planner import MultiPartPathPlanner, get_body_mass
-from plan_sequence.feasibility_check import check_assemblable, get_stable_plan_1pose_parallel, get_stable_plan_1pose_serial
+from plan_sequence.physics_planner import MultiPartPathPlanner, get_body_mass, find_stable_initial_poses
+from plan_sequence.feasibility_check import check_assemblable, get_stable_plan_1pose_parallel, get_stable_plan_1pose_serial, check_tool
 from plan_sequence.stable_pose import get_combined_mesh, get_stable_poses
 from plan_robot.run_grasp_plan import GraspPlanner
 from plan_robot.run_grasp_arm_plan import GraspArmPlanner
@@ -33,30 +33,71 @@ class NumpyEncoder(json.JSONEncoder):
 
 def _simulate_standalone(asset_folder, assembly_dir, save_sdf, base_part,
                           part_move, parts_rest, parts_removed, pose,
-                          max_grippers, timeout, optimizer, debug, render):
+                          max_grippers, timeout, optimizer, debug, render,
+                          allow_gap=False, get_dof=False, tools=None):
     """Module-level wrapper around _simulate logic, picklable for use with parallel_execute."""
-    action, _ = check_assemblable(
-        asset_folder, assembly_dir, parts_rest, part_move,
-        pose=pose, save_sdf=save_sdf, return_path=True, debug=debug, render=render,
-    )
+    _t0 = time()
+    if get_dof:
+        action, _, dof = check_assemblable(
+            asset_folder, assembly_dir, parts_rest, part_move,
+            pose=pose, save_sdf=save_sdf, return_path=True, debug=debug, render=render, get_dof=True,
+        )
+    else:
+        action, _ = check_assemblable(
+            asset_folder, assembly_dir, parts_rest, part_move,
+            pose=pose, save_sdf=save_sdf, return_path=True, debug=debug, render=render,
+        )
+        dof = None
+    dt_path = time() - _t0
+
+    dt_stab = None
     if action is not None:
         max_fix = max_grippers - 1 if max_grippers is not None else None
+        _t0 = time()
         parts_fix = get_stable_plan_1pose_serial(
             asset_folder, assembly_dir, parts_rest, base_part,
             pose=pose, max_fix=max_fix, save_sdf=save_sdf,
-            timeout=timeout, debug=debug, render=render,
+            timeout=timeout, allow_gap=allow_gap, debug=debug, render=render,
         )
+        dt_stab = time() - _t0
     else:
         parts_fix = None
 
+    tool_result = None
+    dt_tool = None
+    if tools and action is not None and parts_fix is not None:
+        _t0 = time()
+        tool_result = check_tool(
+            asset_folder=asset_folder, assembly_dir=assembly_dir,
+            parts_fix=parts_rest, part_move=part_move, tools=tools, debug=debug,
+        )
+        dt_tool = time() - _t0
+
+    tool_required = tools is not None and len(tools) > 0
+    feasible = action is not None and parts_fix is not None and (not tool_required or tool_result is not None)
+    if feasible:
+        fail_reason = None
+    elif action is None:
+        fail_reason = 'assembly'
+    elif parts_fix is None:
+        fail_reason = 'stability'
+    else:
+        fail_reason = 'tool'
+
     return {
-        'feasible': action is not None and parts_fix is not None,
+        'feasible': feasible,
+        'fail_reason': fail_reason,
         'action': action,
         'base_part': base_part,
         'parts_fix': parts_fix,
         'part_move': part_move,
         'pose': pose,
         'grasp': None,
+        'dof': dof,
+        'tool': None if tool_result is None else {'tool_id': tool_result['tool_id'], 'inverted': tool_result['inverted']},
+        '_dt_path': dt_path,
+        '_dt_stab': dt_stab,
+        '_dt_tool': dt_tool,
     }
 
 
@@ -64,7 +105,7 @@ class SequencePlanner:
     '''
     Disassembly sequence planning (without ground, 1 direction gravity, 1 part at a time)
     '''
-    def __init__(self, seq_generator, num_proc=1, save_sdf=False):
+    def __init__(self, seq_generator, num_proc=1, save_sdf=False, allow_gap=False, get_dof=False, tools=None):
         self.seq_generator = seq_generator
         self.asset_folder = seq_generator.asset_folder
         self.assembly_dir = seq_generator.assembly_dir
@@ -73,6 +114,9 @@ class SequencePlanner:
         assert len(self.parts) >= 2
         self.num_proc = num_proc
         self.save_sdf = save_sdf
+        self.allow_gap = allow_gap
+        self.get_dof = get_dof
+        self.tools = tools
         self.part_mass = get_body_mass(self.asset_folder, self.assembly_dir, self.parts, save_sdf=self.save_sdf)
         self.t_start = None
         self.n_eval = None
@@ -88,8 +132,13 @@ class SequencePlanner:
     def _simulate(self, part_move, parts_rest, parts_removed, pose, max_grippers, timeout=None, grasp_planner=None, optimizer='L-BFGS-B', debug=0, render=False):
         assert len(parts_rest) > 0
         _t0 = time()
-        action, path = check_assemblable(self.asset_folder, self.assembly_dir, parts_rest, part_move, pose=pose, save_sdf=self.save_sdf,
-            return_path=True, debug=debug, render=render)
+        if self.get_dof:
+            action, path, dof = check_assemblable(self.asset_folder, self.assembly_dir, parts_rest, part_move, pose=pose, save_sdf=self.save_sdf,
+                return_path=True, debug=debug, render=render, get_dof=True)
+        else:
+            action, path = check_assemblable(self.asset_folder, self.assembly_dir, parts_rest, part_move, pose=pose, save_sdf=self.save_sdf,
+                return_path=True, debug=debug, render=render)
+            dof = None
         _dt_path = time() - _t0
         self._timing['path_finding'] += _dt_path
         self._timing_counts['path_finding'] += 1
@@ -132,14 +181,40 @@ class SequencePlanner:
         else:
             grasps = None
 
+        tool_result = None
+        if feasible and self.tools:
+            _t0 = time()
+            tool_result = check_tool(
+                asset_folder=self.asset_folder, assembly_dir=self.assembly_dir,
+                parts_fix=parts_rest, part_move=part_move, tools=self.tools, debug=debug,
+            )
+            self._timing['tool_check'] += time() - _t0
+            self._timing_counts['tool_check'] += 1
+            if tool_result is None:
+                feasible = False
+
+        if feasible:
+            fail_reason = None
+        elif action is None:
+            fail_reason = 'assembly'
+        elif parts_fix is None:
+            fail_reason = 'stability'
+        elif self.tools and tool_result is None:
+            fail_reason = 'tool'
+        else:
+            fail_reason = 'grasp'
+
         sim_info = {
             'feasible': feasible,
+            'fail_reason': fail_reason,
             'action': action,
             'base_part': self.base_part,
             'parts_fix': parts_fix,
             'part_move': part_move,
             'pose': pose,
             'grasp': grasps,
+            'dof': dof,
+            'tool': None if tool_result is None else {'tool_id': tool_result['tool_id'], 'inverted': tool_result['inverted']},
         }
         return sim_info
 
@@ -189,7 +264,7 @@ class SequencePlanner:
                 return False # no such child
         return True
 
-    def plan(self, budget, max_grippers, max_poses=3, pose_reuse=0, early_term=False, timeout=None, plan_grasp=False, plan_arm=False, gripper_type=None, gripper_scale=None, optimizer='L-BFGS-B', debug=0, render=False, log_dir=None):
+    def plan(self, budget, max_grippers, max_poses=3, pose_reuse=0, early_term=False, timeout=None, plan_grasp=False, plan_arm=False, gripper_type=None, gripper_scale=None, optimizer='L-BFGS-B', debug=0, render=False, log_dir=None, connect_path=False):
         '''
         Main planning function
         Input:
@@ -199,6 +274,7 @@ class SequencePlanner:
             tree: disassembly tree including all disassembly attempts
         '''
         self.t_start = time()
+        self.connect_path = connect_path
         solution_found = False
         self.stop_msg = None
         self._timing = defaultdict(float)
@@ -210,7 +286,8 @@ class SequencePlanner:
         self.n_eval = 0
         G0 = self.parts.copy()
         tree = nx.DiGraph()
-        tree.add_node(tuple(G0), n_eval=0, n_gripper=1, poses=[])
+        initial_poses = self._initial_stable_poses(G0, max_poses)
+        tree.add_node(tuple(G0), n_eval=0, n_gripper=1, poses=initial_poses)
 
         if plan_arm:
             grasp_planner = GraspArmPlanner(self.asset_folder, self.assembly_dir, gripper_type, gripper_scale)
@@ -319,22 +396,39 @@ class SequencePlanner:
 
     def _print_timing_summary(self):
         t_total = time() - self.t_start
-        accounted = sum(self._timing.values())
-        other = t_total - accounted
-        print(f'  timing summary (total: {t_total:.1f}s):')
+        print(f'  timing summary (wall-clock total: {t_total:.1f}s):')
         order = ['path_finding', 'stability_check', 'stable_pose', 'grasp_planning']
         for key in order + [k for k in self._timing if k not in order]:
             if key not in self._timing:
                 continue
             t = self._timing[key]
             n = self._timing_counts[key]
-            print(f'  {key:<20} {t:6.2f}s  {100*t/t_total:5.1f}%  ({n} calls, avg {1000*t/n:.1f}ms)')
-        print(f'  {"other":<20} {other:6.2f}s  {100*other/t_total:5.1f}%')
+            avg_ms = 1000 * t / n if n > 0 else 0.0
+            print(f'  {key:<20} avg {avg_ms:8.1f}ms  ({n} calls)')
 
     def _reset(self):
         pass
 
-    def _select_node(self, tree):
+    def _initial_stable_poses(self, parts, max_poses):
+        '''
+        Pre-flight pose seed for the full assembly. When base_part is set the
+        sim pose is always identity, so this is a no-op. Otherwise compute
+        trimesh stable poses and keep only those for which the assembly is
+        self-supporting under gravity (no parts would need fixing).
+        '''
+        if self.base_part is not None:
+            return []
+        poses = find_stable_initial_poses(
+            self.asset_folder, self.assembly_dir, parts,
+            max_poses=max_poses, save_sdf=self.save_sdf, allow_gap=self.allow_gap,
+        )
+        if not poses:
+            print('[planner] WARNING: no self-stable initial pose found for full assembly — parts would fall without fixing; continuing without seeded pose')
+        else:
+            print(f'[planner] precheck: seeded {len(poses)} self-stable initial pose(s) on root node')
+        return poses
+
+    def wh_select_node(self, tree):
         raise NotImplementedError
 
     def _expand_leaf(self, tree, max_poses, pose_reuse, grasp_planner, optimizer, debug, render):
@@ -349,6 +443,12 @@ class SequencePlanner:
 
         G0 = self.parts.copy()
 
+        # Use a monotonic counter past any existing n_eval. Parallel DFA shares
+        # n_eval across a whole batch of siblings, so multiple 2-part leaves can
+        # carry identical n_eval; when several of them expand to the same 1-part
+        # child the strict `<` assertion in _update_tree would otherwise fail.
+        next_n_eval = max((tree.nodes[n]['n_eval'] for n in tree.nodes), default=0) + 1
+
         for node in node_expand_list:
             part_a, part_b = node
             mass_a, mass_b = self.part_mass[part_a], self.part_mass[part_b]
@@ -361,8 +461,8 @@ class SequencePlanner:
             for pose in poses:
                 sim_info = self._simulate(part_move, [part_fix], parts_removed, pose=pose, max_grippers=2, grasp_planner=grasp_planner, optimizer=optimizer, debug=debug - 1, render=render)
                 if sim_info['feasible']:
-                    node_info = tree.nodes[node]
-                    SequencePlanner._update_tree(self, tree, list(node), [part_fix], node_info['n_eval'], sim_info)
+                    SequencePlanner._update_tree(self, tree, list(node), [part_fix], next_n_eval, sim_info)
+                    next_n_eval += 1
                     break
 
     @staticmethod
@@ -515,7 +615,7 @@ class SequencePlanner:
 
             path_planner = MultiPartPathPlanner(self.asset_folder, self.assembly_dir, parts_rest, part_move, parts_removed=parts_removed, pose=pose, save_sdf=self.save_sdf)
             # path_planner.check_success(action)
-            success, path = path_planner.plan_path(action, rotation=True)
+            success, path = path_planner.plan_path(action, rotation=True, connect_path=getattr(self, 'connect_path', False))
 
             body_color_dict = get_body_color_dict(parts_fix, parts_free) # visualize fixes
             path_planner.sim.set_body_color_map(body_color_dict)
