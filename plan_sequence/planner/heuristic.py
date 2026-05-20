@@ -98,12 +98,48 @@ class HeuristicDFASequencePlanner(DFASequencePlanner):
             + weights['z_alignment'] * m3
         )
 
+    def plan(self, *args, **kwargs):
+        # Fresh path-score table per plan() call. Root (full assembly) has
+        # cumulative score 0; each child's cumulative = parent's + edge score.
+        self._cum_score = {tuple(self.parts): 0.0}
+        return super().plan(*args, **kwargs)
+
     def _select_next_frontier(self, tree, feasible_children, max_frontier):
+        """Beam-search selection by *cumulative path score*.
+
+        Each candidate's score is the parent path's cumulative score plus the
+        single-edge `_score_child`. Ties between two parents leading to the
+        same G_prime are broken by max (the better-scoring path "owns" that
+        node). Top `max_frontier` cumulative scores survive.
+        """
         if not feasible_children:
             return []
         weights = self._load_weights()
-        scored = sorted(
-            feasible_children,
-            key=lambda triple: -self._score_child(weights, *triple),
-        )
-        return [G_prime for G_prime, _, _ in scored[:max_frontier]]
+
+        # Lazy init guard if plan() wasn't entered through our override
+        # (e.g. tests calling _select_next_frontier directly).
+        if not hasattr(self, '_cum_score'):
+            self._cum_score = {tuple(self.parts): 0.0}
+
+        # Score each candidate cumulatively; dedupe by G_prime, keeping the
+        # best (max) cumulative score and remembering which (sim_info, parent)
+        # produced it so the returned ordering is reproducible.
+        best_for_child: dict[tuple, tuple[float, tuple]] = {}
+        for triple in feasible_children:
+            G_prime, sim_info, parent_G = triple
+            parent_cum = self._cum_score.get(tuple(parent_G), 0.0)
+            edge = self._score_child(weights, G_prime, sim_info, parent_G)
+            cand_cum = parent_cum + edge
+            key = tuple(G_prime)
+            prev = best_for_child.get(key)
+            if prev is None or cand_cum > prev[0]:
+                best_for_child[key] = (cand_cum, triple)
+
+        # Persist the chosen cumulative score for downstream layers.
+        for key, (cum, _) in best_for_child.items():
+            existing = self._cum_score.get(key)
+            if existing is None or cum > existing:
+                self._cum_score[key] = cum
+
+        ranked = sorted(best_for_child.values(), key=lambda x: -x[0])
+        return [triple[0] for _, triple in ranked[:max_frontier]]

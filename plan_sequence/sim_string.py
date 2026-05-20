@@ -17,10 +17,10 @@ from assets.transform import mat_dict_to_pos_quat_dict, pos_quat_to_mat
 
 GROUND_Z = 0
 
-KN = 1e3
+KN = 1e6
 KT = 1e3
 MU = 0.5
-DAMPING = 1e3
+DAMPING = 1e2
 
 
 def _get_color(index, alpha=1.0):
@@ -34,54 +34,76 @@ def _get_color(index, alpha=1.0):
     colors = np.array(colors) / 255.0
     return colors[int(index) % 5]
 
-def _get_colors(part_ids, parts_moving=None, normalize=True, scheme='default', emphasize_moving=True):
-    color_map = {}
+# Per-run cache so the same part_id keeps the same base color across calls.
+# Keyed by (scheme, normalize); value is dict[part_id -> base RGBA color] holding
+# the pre-emphasis color (emphasis is reapplied per call since the moving set varies).
+_BASE_COLOR_CACHE = {}
 
-    if scheme=="original" or (scheme=="default" and len(part_ids) <= 5):
-        if len(part_ids) <= 2:
-            colors = np.array([
-                [107, 166, 161, 255],
-                [209, 184, 148, 255],
-            ], dtype=int)
-        else:
-            colors = np.array([
-                [210, 87, 89, 255],
-                [237, 204, 73, 255],
-                [60, 167, 221, 255],
-                [190, 126, 208, 255],
-                [108, 192, 90, 255],
-            ], dtype=int)
-        if normalize: colors = colors.astype(float) / 255.0
-    
-    elif scheme=="distinctipy" or scheme=="default": # Based on CAM02-UCS, which maximizes distinguishability for the human eye
-        raw_colors = distinctipy.get_colors(len(part_ids))
 
-        colors = np.zeros((len(part_ids), 4))
-        for i, (r, g, b) in enumerate(raw_colors):
-            colors[i] = [r, g, b, settings.alpha]
-        colors[:, 3] *= settings.brightness
+def _generate_base_color(scheme, normalize, existing_colors):
+    """Produce one new base RGBA color that hasn't been handed out yet for this
+    (scheme, normalize) cache bucket. `existing_colors` is the list of already-
+    assigned base colors (same normalization)."""
+    index = len(existing_colors)
 
-        if not normalize:
-            colors = (raw_colors * 255).astype(int)
+    if scheme == "original" or scheme == "default":
+        palette = np.array([
+            [210, 87, 89, 255],
+            [237, 204, 73, 255],
+            [60, 167, 221, 255],
+            [190, 126, 208, 255],
+            [108, 192, 90, 255],
+        ], dtype=float)
+        if normalize:
+            palette = palette / 255.0
+        return palette[index % len(palette)].copy()
 
-        colors = np.array(colors)
+    if scheme == "distinctipy":
+        exclude = [tuple(np.array(c[:3], dtype=float) / (1.0 if normalize else 255.0)) for c in existing_colors]
+        # deterministic seed so repeated runs give the same sequence
+        rng = index + 1
+        raw = distinctipy.get_colors(1, exclude_colors=exclude, rng=rng)[0]
+        r, g, b = raw
+        a = settings.alpha * settings.brightness
+        if normalize:
+            return np.array([r, g, b, a], dtype=float)
+        return np.array([int(r * 255), int(g * 255), int(b * 255), int(a * 255)], dtype=float)
 
-    elif scheme=="max_contrast": # Maximize mathematical contrast, might be better for VLM
+    if scheme == "max_contrast":
         values = [0, 128, 255]
-    
         rgb_combinations = list(itertools.product(values, repeat=3))
-        filtered_rgb = [rgb for rgb in rgb_combinations if rgb not in [(0, 0, 0), (255, 255, 255)]] # remove black and white
-        sorted_rgb = sorted(filtered_rgb, key=lambda x: x.count(128)) # Have most extreme colors (like 255 0 0) be at the top
-        colors = [[r, g, b, int(settings.opacity * 255)] for r, g, b in sorted_rgb]
+        filtered = [rgb for rgb in rgb_combinations if rgb not in [(0, 0, 0), (255, 255, 255)]]
+        sorted_rgb = sorted(filtered, key=lambda x: x.count(128))
+        r, g, b = sorted_rgb[index % len(sorted_rgb)]
+        a = int(settings.opacity * 255)
+        if normalize:
+            return np.array([r / 255.0, g / 255.0, b / 255.0, a / 255.0], dtype=float)
+        return np.array([r, g, b, a], dtype=float)
+
+    raise ValueError(f"Unknown color scheme: {scheme}")
+
+
+def _get_colors(part_fixed, parts_moving=None, normalize=True, scheme='default'):
+    emphasize_moving = settings.emphasize_moving and parts_moving is not None
+    part_ids = list(part_fixed) + (list(parts_moving) if parts_moving is not None else [])
+
+    # Resolve "default" eagerly so the cache bucket doesn't depend on call-site part count.
+    resolved_scheme = settings.color_scheme if scheme == "default" else scheme
+
+    cache = _BASE_COLOR_CACHE.setdefault((resolved_scheme, normalize), {})
+    for pid in part_ids:
+        if pid not in cache:
+            cache[pid] = _generate_base_color(resolved_scheme, normalize, list(cache.values()))
 
     max_val = 1.0 if normalize else 255
     gray = np.array([0.5, 0.5, 0.5]) * max_val
-    bleak_blend = 0.85  # how strongly non-moving parts are pulled toward gray
-    boost = 1.08  # slight saturation boost for moving parts
+    bleak_blend = settings.bleak
+    boost = settings.boost
 
-    for i, part_id in enumerate(part_ids):
-        color = np.array(colors[i % len(colors)], dtype=float).copy()
-        if emphasize_moving and parts_moving is not None:
+    color_map = {}
+    for part_id in part_ids:
+        color = cache[part_id].astype(float).copy()
+        if emphasize_moving:
             rgb = color[:3]
             if part_id in parts_moving:
                 mean = rgb.mean()
@@ -99,9 +121,16 @@ def _get_fixed_color():
     return np.array([120, 120, 120, 255]) / 255.0
 
 
-def get_body_color_dict(parts_fix, parts_free): # parts_free = parts_rest - parts_fix + [part_move]
+def get_body_color_dict(parts_fix, parts_free, parts_moving=None): # parts_free = parts_rest - parts_fix + [part_move]
     body_color_dict = {}
-    colors = _get_colors(parts_fix, parts_free)
+    # Only `parts_moving` (typically just the currently-moving part) should be
+    # emphasized; parts_free includes all non-fixed parts and must not be reused
+    # as the moving-set or every part gets boosted.
+    if parts_moving is None:
+        parts_moving = []
+    parts_moving = list(parts_moving)
+    non_moving = [p for p in [*parts_fix, *parts_free] if p not in parts_moving]
+    colors = _get_colors(non_moving, parts_moving=parts_moving)
     for part_id in [*parts_fix, *parts_free]:
         if part_id in parts_free:
             color = colors[part_id][:3]
@@ -206,7 +235,7 @@ def get_path_sim_string(assembly_dir, parts_fix, part_move, parts_removed=[], sa
     string = _get_path_sim_substring()
     # part_move must be in the id list so its colour is generated; parts_moving
     # must be a list/set so the `in` check is membership rather than substring.
-    colors = _get_colors([part_move, *parts_fix, *parts_removed], [part_move])
+    colors = _get_colors([*parts_fix, *parts_removed], [part_move])
     for part_id in [part_move, *parts_fix, *parts_removed]:
 
         if part_id in parts_removed:

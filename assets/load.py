@@ -10,6 +10,7 @@ sys.path.append(project_base_dir)
 import numpy as np
 import json
 import trimesh
+from functools import lru_cache
 from scipy.spatial.transform import Rotation as R
 
 from assets.color import get_color
@@ -70,10 +71,25 @@ def load_part_ids(obj_dir):
     return part_ids
 
 
+@lru_cache(maxsize=16)
 def load_assembly(obj_dir, transform='final'):
     '''
-    Load the entire assembly from dir
-    transform: 'final', 'initial' or 'none'
+    Load the entire assembly from dir.
+    transform: 'final', 'initial' or 'none'.
+
+    Cached because the planner's main thread calls this once per iteration
+    (via _compute_poses → get_combined_mesh) and every call previously
+    re-read all .obj files from disk + reapplied transforms. With cache,
+    only the first call per (obj_dir, transform) does I/O; subsequent calls
+    return the same dict in O(1). The cache is also visible to worker
+    processes that fork from the parent (Linux), so a populated parent
+    cache prunes worker-side reloads as a side effect.
+
+    Caveat: the returned dict's mesh objects are MUTATED at load time
+    (apply_transform + face_colors), so downstream callers must not mutate
+    them again. All current callers either read-only or call
+    `trimesh.util.concatenate` which copies; if you add a new caller that
+    mutates the mesh in place, copy it first or evict the cache.
     '''
     obj_ids = load_part_ids(obj_dir)
     obj_ids = sorted(obj_ids)

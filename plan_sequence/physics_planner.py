@@ -36,7 +36,7 @@ COL_TH_PATH = 0.01
 COL_TH_STABLE = 0.00
 MIN_SEP = 0.5
 DEBUG_SIM = False
-DEBUG_STABILITY = True
+DEBUG_STABILITY = False
 
 DOF_MAX_TIME = 5.0  # per-direction probe timeout (s); shorter than path-planner's MAX_TIME
 
@@ -467,19 +467,21 @@ class MultiPartStabilityPlanner:
     max_step = MAX_STEP
     col_th = COL_TH_STABLE
 
-    def __init__(self, asset_folder, assembly_dir, parts_fix, parts_move, pose=None, save_sdf=False, allow_gap=False):
+    def __init__(self, asset_folder, assembly_dir, parts_fix, parts_move, pose=None, save_sdf=False, allow_gap=False, ignore_unstable=()):
         model_string = get_stability_sim_string(assembly_dir, parts_fix, parts_move, pose=pose, save_sdf=save_sdf, col_th=self.col_th)
         self.sim = redmax.Simulation(model_string, asset_folder)
         self.parts_fix = parts_fix.copy()
         self.parts_move = parts_move.copy()
         self.allow_gap = allow_gap
+        # Parts whose falls should be tolerated rather than treated as failure.
+        # Populated by SequencePlanner when settings.no_stable_pose_action ==
+        # 'ignore_unstable' and the precheck observed inherently unstable parts.
+        self.ignore_unstable = frozenset(ignore_unstable)
 
     def check_success(self, max_step=MAX_STEP, timeout=None, progress=False, progress_desc='stability', record_path=None):
 
         t_start = time()
 
-        if DEBUG_STABILITY:
-            print(f'[MultiPartStabilityPlanner] checking stability for parts_move={self.parts_move} with parts_fix={self.parts_fix}')
         # initialize sim and stability checker
         self.sim.reset()
         checker = StabilityChecker(self.allow_gap)
@@ -487,6 +489,8 @@ class MultiPartStabilityPlanner:
 
         # check initial connectivity
         parts_disconnected = checker.check_disconnected_parts()
+        if self.ignore_unstable:
+            parts_disconnected = [p for p in parts_disconnected if p not in self.ignore_unstable]
         if len(parts_disconnected) > 0:
             return False, parts_disconnected
 
@@ -501,11 +505,11 @@ class MultiPartStabilityPlanner:
             self.sim.forward(1, verbose=DEBUG_SIM)
             checker.update_status()
 
-            if DEBUG_STABILITY:
-                print(f'[MultiPartStabilityPlanner] step {i}  parts_move: {self.parts_move}  parts_fix: {self.parts_fix}')
             if (i + 1) % CHECK_FREQ == 0:
                 # check fallen parts
                 parts_fall = checker.check_fallen_parts()
+                if self.ignore_unstable:
+                    parts_fall = [p for p in parts_fall if p not in self.ignore_unstable]
                 if len(parts_fall) > 0:
                     if DEBUG_STABILITY and record_path is not None:
                         print(f'[MultiPartStabilityPlanner] fallen parts: {parts_fall} at step {i}')
@@ -669,40 +673,179 @@ def plot_stability_curve(pos_list_map):
     plt.show()
 
 
-def find_stable_initial_poses(asset_folder, assembly_dir, parts, max_poses=3,
+def _render_pose_debug_pyvista(assembly_dir, parts, poses, save_dir, size=(720, 540)):
+    '''
+    Off-screen pyvista screenshot per candidate stable pose. Each part is
+    colored distinctly, a light ground plane is drawn at z=0, and the camera
+    is set to iso so you can visually confirm the resting orientation.
+    Saves <save_dir>/pose_XX.png and returns the list of paths.
+    '''
+    import pyvista as pv
+    import matplotlib.cm as cm
+
+    os.makedirs(save_dir, exist_ok=True)
+    assembly = load_assembly(assembly_dir)
+    part_meshes = [(p, assembly[p]['mesh']) for p in parts if p in assembly]
+
+    out_paths = []
+    for i, pose in enumerate(poses):
+        plotter = pv.Plotter(off_screen=True, window_size=size)
+        cmap = cm.tab20(np.linspace(0, 1, max(len(part_meshes), 1)))
+
+        xy_min = np.full(2, np.inf)
+        xy_max = np.full(2, -np.inf)
+        for j, (part_id, m) in enumerate(part_meshes):
+            m_posed = m.copy()
+            m_posed.apply_transform(pose)
+            color = tuple(float(c) for c in cmap[j % len(cmap)][:3])
+            plotter.add_mesh(pv.wrap(m_posed), color=color, show_edges=False, opacity=1.0)
+            xy_min = np.minimum(xy_min, m_posed.vertices[:, :2].min(axis=0))
+            xy_max = np.maximum(xy_max, m_posed.vertices[:, :2].max(axis=0))
+
+        size_xy = float(max((xy_max - xy_min).max() * 1.5, 1.0))
+        center_xy = ((xy_min + xy_max) / 2).tolist()
+        ground = pv.Plane(center=(center_xy[0], center_xy[1], 0.0),
+                          direction=(0, 0, 1), i_size=size_xy, j_size=size_xy)
+        plotter.add_mesh(ground, color='lightgray', opacity=0.3, show_edges=True)
+
+        plotter.add_axes()
+        plotter.camera_position = 'iso'
+        plotter.add_text(f'pose {i + 1}/{len(poses)}', position='upper_left', font_size=10)
+
+        out = os.path.join(save_dir, f'pose_{i:02d}.png')
+        plotter.screenshot(out)
+        plotter.close()
+        out_paths.append(out)
+
+    return out_paths
+
+
+def _check_pose_standalone(asset_folder, assembly_dir, parts, pose,
+                           save_sdf, allow_gap, max_step, timeout, pose_idx):
+    '''
+    Picklable worker for parallel `find_stable_initial_poses`. Builds a fresh
+    MultiPartStabilityPlanner (with parts_fix=[]) and runs the gravity sim.
+    Returns {'pose_idx', 'success', 'fallen', '_dt_build', '_dt_run'}.
+    '''
+    t_build = time()
+    planner = MultiPartStabilityPlanner(
+        asset_folder, assembly_dir,
+        parts_fix=[], parts_move=list(parts),
+        pose=pose, save_sdf=save_sdf, allow_gap=allow_gap,
+    )
+    dt_build = time() - t_build
+
+    t_run = time()
+    success, fallen = planner.check_success(
+        max_step=max_step, timeout=timeout, progress=False,
+    )
+    dt_run = time() - t_run
+
+    return {
+        'pose_idx': pose_idx,
+        'success': bool(success),
+        'fallen': fallen,
+        '_dt_build': dt_build,
+        '_dt_run': dt_run,
+    }
+
+
+def find_stable_initial_poses(asset_folder, assembly_dir, parts, max_poses=5,
                               save_sdf=False, allow_gap=False,
-                              max_step=MAX_STEP, timeout=None, progress=True):
+                              max_step=MAX_STEP, timeout=None, progress=True,
+                              num_proc=1, first_only=True, debug_dir=None):
     '''
     Pre-flight check for the full assembly. Compute trimesh stable poses for
     the combined mesh and keep only those for which the assembly stands
     self-supported under gravity (no parts need fixing).
 
-    Returns the subset of `get_stable_poses` outputs (in original order) that
-    pass MultiPartStabilityPlanner with parts_fix=[] and parts_move=parts.
+    Returns (valid_poses, observed_fallen) where
+      - valid_poses is the subset of `get_stable_poses` outputs (in original
+        order) that pass MultiPartStabilityPlanner with parts_fix=[] and
+        parts_move=parts.
+      - observed_fallen is a frozenset of part IDs that were observed falling
+        in at least one candidate pose check (union across all poses).
 
     When `progress` is True (default), prints per-pose timing breakdowns
     (mesh, candidate enumeration, sim build, sim run) and shows a tqdm bar
-    over the inner stability-check forward steps.
+    over the inner stability-check forward steps (serial mode only).
+
+    When `num_proc > 1` the candidate poses are simulated in parallel via
+    `utils.parallel.parallel_execute`. If `first_only=True` (default) the
+    pool terminates remaining workers as soon as one stable pose is found.
     '''
     from plan_sequence.stable_pose import get_combined_mesh, get_stable_poses
 
     t0 = time()
     if progress:
-        print(f'[find_stable_initial_poses] start: {len(parts)} parts, max_poses={max_poses}, max_step={max_step}')
+        print(f'[find_stable_initial_poses] start: {len(parts)} parts, max_poses={max_poses}, max_step={max_step}, num_proc={num_proc}, first_only={first_only}')
 
     t_mesh = time()
     mesh = get_combined_mesh(assembly_dir, parts)
     dt_mesh = time() - t_mesh
 
     t_poses = time()
-    candidate_poses = get_stable_poses(mesh, max_num=max_poses)
+    # prob_th=1.0 disables the cumulative-probability early-exit; the only cap
+    # is `max_num=max_poses`, so the caller's pose budget is actually honored.
+    candidate_poses = get_stable_poses(mesh, prob_th=1.0, max_num=max_poses)
     dt_poses = time() - t_poses
 
     if progress:
         print(f'[find_stable_initial_poses] mesh: {dt_mesh:.2f}s  '
               f'trimesh stable poses ({len(candidate_poses)}): {dt_poses:.2f}s')
 
+    if not candidate_poses:
+        if progress:
+            print(f'[find_stable_initial_poses] done in {time() - t0:.2f}s  kept 0/0 pose(s)')
+        return [], frozenset()
+
+    if debug_dir is not None:
+        try:
+            paths = _render_pose_debug_pyvista(assembly_dir, parts, candidate_poses, debug_dir)
+            if progress:
+                print(f'[find_stable_initial_poses] debug renders saved: {paths}')
+        except Exception as e:
+            print(f'[find_stable_initial_poses] WARNING: debug render failed: {e}')
+
+    if num_proc > 1:
+        from utils.parallel import parallel_execute
+
+        worker_args = [
+            (asset_folder, assembly_dir, list(parts), pose,
+             save_sdf, allow_gap, max_step, timeout, i)
+            for i, pose in enumerate(candidate_poses)
+        ]
+
+        def _terminate(result):
+            return first_only and result['success']
+
+        valid_idx = []
+        observed_fallen = set()
+        for result in parallel_execute(
+            _check_pose_standalone, worker_args, num_proc,
+            show_progress=progress, desc='initial stable pose check',
+            terminate_func=_terminate,
+        ):
+            i = result['pose_idx']
+            if progress:
+                outcome = 'STABLE' if result['success'] else f"unstable (fallen={result['fallen']})"
+                print(f"[find_stable_initial_poses] pose {i + 1}/{len(candidate_poses)}: "
+                      f"build {result['_dt_build']:.2f}s  run {result['_dt_run']:.2f}s  → {outcome}")
+            if result['success']:
+                valid_idx.append(i)
+            elif result['fallen']:
+                observed_fallen.update(result['fallen'])
+
+        valid_poses = [candidate_poses[i] for i in sorted(valid_idx)]
+        if progress:
+            print(f'[find_stable_initial_poses] done in {time() - t0:.2f}s  '
+                  f'kept {len(valid_poses)}/{len(candidate_poses)} pose(s)  '
+                  f'observed_fallen={sorted(observed_fallen)}')
+        return valid_poses, frozenset(observed_fallen)
+
+    # Serial path: keeps the inner per-step tqdm bar for live progress.
     valid_poses = []
+    observed_fallen = set()
     for i, pose in enumerate(candidate_poses):
         t_build = time()
         planner = MultiPartStabilityPlanner(
@@ -730,11 +873,16 @@ def find_stable_initial_poses(asset_folder, assembly_dir, parts, max_poses=3,
 
         if success:
             valid_poses.append(pose)
+            if first_only:
+                break
+        elif fallen:
+            observed_fallen.update(fallen)
 
     if progress:
         print(f'[find_stable_initial_poses] done in {time() - t0:.2f}s  '
-              f'kept {len(valid_poses)}/{len(candidate_poses)} pose(s)')
-    return valid_poses
+              f'kept {len(valid_poses)}/{len(candidate_poses)} pose(s)  '
+              f'observed_fallen={sorted(observed_fallen)}')
+    return valid_poses, frozenset(observed_fallen)
 
 
 def get_contact_graph(asset_folder, assembly_dir, parts=None, contact_eps=CONTACT_EPS, save_sdf=False):

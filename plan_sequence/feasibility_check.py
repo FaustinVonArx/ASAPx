@@ -179,11 +179,11 @@ def check_stable_noforce(asset_folder, assembly_dir, parts, save_sdf=False, time
     return success, G
 
 
-def check_stable(asset_folder, assembly_dir, parts_fix, parts_move, pose=None, save_sdf=False, timeout=None, allow_gap=False, debug=0, render=False, record_path=None):
+def check_stable(asset_folder, assembly_dir, parts_fix, parts_move, pose=None, save_sdf=False, timeout=None, allow_gap=False, debug=0, render=False, record_path=None, ignore_unstable=()):
     '''
     Check if gravitationally stable for a given fixed part
     '''
-    planner = MultiPartStabilityPlanner(asset_folder, assembly_dir, parts_fix, parts_move, pose=pose, save_sdf=save_sdf, allow_gap=allow_gap)
+    planner = MultiPartStabilityPlanner(asset_folder, assembly_dir, parts_fix, parts_move, pose=pose, save_sdf=save_sdf, allow_gap=allow_gap, ignore_unstable=ignore_unstable)
 
     success, parts_fall = planner.check_success(timeout=timeout, record_path=record_path)
     if debug > 0:
@@ -194,7 +194,7 @@ def check_stable(asset_folder, assembly_dir, parts_fix, parts_move, pose=None, s
     return success, parts_fall
 
 
-def get_stable_plan_1pose_serial(asset_folder, assembly_dir, parts, base_part, pose, max_fix=None, save_sdf=False, timeout=None, allow_gap=False, debug=0, render=False, return_count=False, log_dir=None, step_label=None):
+def get_stable_plan_1pose_serial(asset_folder, assembly_dir, parts, base_part, pose, max_fix=None, save_sdf=False, timeout=None, allow_gap=False, debug=0, render=False, return_count=False, log_dir=None, step_label=None, ignore_unstable=()):
     '''
     Get all gravitationally stable plans given 1 pose through serial greedy search
     '''
@@ -224,7 +224,7 @@ def get_stable_plan_1pose_serial(asset_folder, assembly_dir, parts, base_part, p
         else:
             record_path = None
 
-        success, parts_fall = check_stable(asset_folder, assembly_dir, parts_fix, parts_move, pose, save_sdf, timeout, allow_gap, debug, render, record_path=record_path)
+        success, parts_fall = check_stable(asset_folder, assembly_dir, parts_fix, parts_move, pose, save_sdf, timeout, allow_gap, debug, render, record_path=record_path, ignore_unstable=ignore_unstable)
         count += 1
 
         if debug > 0:

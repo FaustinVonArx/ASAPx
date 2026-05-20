@@ -138,9 +138,9 @@ def _render_step_worker(asset_folder, assembly_dir, step_arg, result_paths, opti
     parts_free = [p for p in parts_rest if parts_fix is None or p not in parts_fix] + [part_move]
 
     if show_fix:
-        body_color_dict = get_body_color_dict(parts_fix, parts_free)
+        body_color_dict = get_body_color_dict(parts_fix, parts_free, parts_moving=[part_move])
     else:
-        body_color_dict = get_body_color_dict([], parts_rest + [part_move])
+        body_color_dict = get_body_color_dict([], parts_rest + [part_move], parts_moving=[part_move])
 
     if record_dir is not None:
         record_path = os.path.join(record_dir, f'{i}_{part_move}.mp4' if make_video else f'{i}_{part_move}.gif')

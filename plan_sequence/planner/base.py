@@ -22,6 +22,7 @@ from plan_sequence.feasibility_check import check_assemblable, get_stable_plan_1
 from plan_sequence.stable_pose import get_combined_mesh, get_stable_poses
 from plan_robot.run_grasp_plan import GraspPlanner
 from plan_robot.run_grasp_arm_plan import GraspArmPlanner
+import settings
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -52,7 +53,7 @@ def _simulate_standalone(asset_folder, assembly_dir, save_sdf, base_part,
                           part_move, parts_rest, parts_removed, pose,
                           max_grippers, timeout, optimizer, debug, render,
                           allow_gap=False, get_dof=False, tools=None,
-                          skip_stability=False):
+                          skip_stability=False, ignore_unstable=()):
     """Module-level wrapper around _simulate logic, picklable for use with parallel_execute."""
     _t0 = time()
     if get_dof:
@@ -68,7 +69,7 @@ def _simulate_standalone(asset_folder, assembly_dir, save_sdf, base_part,
         dof = None
     dt_path = time() - _t0
 
-    if action is not None and _below_ground_after_disassembly(assembly_dir, part_move, pose, path):
+    if action is not None and settings.filter_below_ground and _below_ground_after_disassembly(assembly_dir, part_move, pose, path):
         action = None
 
     dt_stab = None
@@ -85,6 +86,7 @@ def _simulate_standalone(asset_folder, assembly_dir, save_sdf, base_part,
             asset_folder, assembly_dir, parts_rest, base_part,
             pose=pose, max_fix=max_fix, save_sdf=save_sdf,
             timeout=timeout, allow_gap=allow_gap, debug=debug, render=render,
+            ignore_unstable=ignore_unstable,
         )
         dt_stab = time() - _t0
 
@@ -141,7 +143,7 @@ class SequencePlanner:
     '''
     Disassembly sequence planning (without ground, 1 direction gravity, 1 part at a time)
     '''
-    def __init__(self, seq_generator, num_proc=1, save_sdf=False, allow_gap=False, get_dof=False, tools=None, skip_stability=False):
+    def __init__(self, seq_generator, num_proc=1, save_sdf=False, allow_gap=False, get_dof=False, tools=None, skip_stability=False, ignore_unstable=()):
         self.seq_generator = seq_generator
         self.asset_folder = seq_generator.asset_folder
         self.assembly_dir = seq_generator.assembly_dir
@@ -154,6 +156,10 @@ class SequencePlanner:
         self.get_dof = get_dof
         self.tools = tools
         self.skip_stability = skip_stability
+        # Populated by plan() when settings.no_stable_pose_action == 'ignore_unstable'
+        # and the precheck observed parts falling. Forwarded into every downstream
+        # stability check so those parts no longer count as failures.
+        self._ignored_unstable_parts = frozenset(ignore_unstable)
         self.part_mass = get_body_mass(self.asset_folder, self.assembly_dir, self.parts, save_sdf=self.save_sdf)
         self.t_start = None
         self.n_eval = None
@@ -183,8 +189,8 @@ class SequencePlanner:
             print(f'[planner._simulate] path_finding: {_dt_path:.3f}s  found={action is not None}')
 
         #NOTE when on, a theoretically feasible policy might not be found
-        #if action is not None and _below_ground_after_disassembly(self.assembly_dir, part_move, pose, path):
-        #    action = None
+        if action is not None and settings.filter_below_ground and _below_ground_after_disassembly(self.assembly_dir, part_move, pose, path):
+            action = None
 
         if action is None:
             parts_fix_list = None
@@ -195,7 +201,7 @@ class SequencePlanner:
             max_fix = max_grippers - 1 if max_grippers is not None else None
             _t0 = time()
             step_label = f'part{part_move}_eval{self.n_eval}' if log_dir is not None else None
-            parts_fix_list = get_stable_plan_1pose_serial(self.asset_folder, self.assembly_dir, parts_rest, self.base_part, pose=pose, max_fix=max_fix, save_sdf=self.save_sdf, timeout=timeout, debug=debug, render=render, log_dir=log_dir, step_label=step_label)
+            parts_fix_list = get_stable_plan_1pose_serial(self.asset_folder, self.assembly_dir, parts_rest, self.base_part, pose=pose, max_fix=max_fix, save_sdf=self.save_sdf, timeout=timeout, debug=debug, render=render, log_dir=log_dir, step_label=step_label, ignore_unstable=self._ignored_unstable_parts)
             _dt_stab = time() - _t0
             self._timing['stability_check'] += _dt_stab
             self._timing_counts['stability_check'] += 1
@@ -331,8 +337,24 @@ class SequencePlanner:
         self.n_eval = 0
         G0 = self.parts.copy()
         tree = nx.DiGraph()
-        initial_poses = self._initial_stable_poses(G0, max_poses)
+        initial_poses, observed_fallen = self._initial_stable_poses(G0, max_poses, log_dir=log_dir)
         tree.add_node(tuple(G0), n_eval=0, n_gripper=1, poses=initial_poses)
+
+        if self.base_part is None and not initial_poses:
+            action = getattr(settings, 'no_stable_pose_action', 'exit')
+            if action == 'exit':
+                self.stop_msg = 'no self-stable initial pose'
+                print('[planner.base.plan] aborting: no self-stable initial pose found '
+                      "(settings.no_stable_pose_action='exit')")
+                return tree
+            elif action == 'ignore_unstable':
+                self._ignored_unstable_parts = frozenset(observed_fallen)
+                print(f"[planner.base.plan] no self-stable initial pose; "
+                      f"ignoring {sorted(self._ignored_unstable_parts)} in all future stability checks "
+                      f"(settings.no_stable_pose_action='ignore_unstable')")
+            else:  # 'continue' or anything unrecognised
+                print(f"[planner.base.plan] no self-stable initial pose; continuing with no seed "
+                      f"(settings.no_stable_pose_action={action!r})")
 
         if plan_arm:
             grasp_planner = GraspArmPlanner(self.asset_folder, self.assembly_dir, gripper_type, gripper_scale)
@@ -463,24 +485,32 @@ class SequencePlanner:
     def _reset(self):
         pass
 
-    def _initial_stable_poses(self, parts, max_poses):
+    def _initial_stable_poses(self, parts, max_poses, log_dir=None):
         '''
         Pre-flight pose seed for the full assembly. When base_part is set the
         sim pose is always identity, so this is a no-op. Otherwise compute
         trimesh stable poses and keep only those for which the assembly is
         self-supporting under gravity (no parts would need fixing).
+        When `log_dir` is provided, pyvista debug screenshots of each candidate
+        pose are written to `<log_dir>/precheck_poses/`.
+
+        Returns (poses, observed_fallen). `observed_fallen` is a frozenset of
+        part IDs that were seen falling in at least one candidate pose check —
+        the caller uses it when settings.no_stable_pose_action == 'ignore_unstable'.
         '''
         if self.base_part is not None:
-            return []
-        poses = find_stable_initial_poses(
+            return [], frozenset()
+        debug_dir = os.path.join(log_dir, 'precheck_poses') if log_dir is not None else None
+        poses, observed_fallen = find_stable_initial_poses(
             self.asset_folder, self.assembly_dir, parts,
             max_poses=max_poses, save_sdf=self.save_sdf, allow_gap=self.allow_gap,
+            num_proc=self.num_proc, first_only=True, debug_dir=debug_dir,
         )
         if not poses:
-            print('[planner] WARNING: no self-stable initial pose found for full assembly — parts would fall without fixing; continuing without seeded pose')
+            print(f'[planner] WARNING: no self-stable initial pose found for full assembly — parts would fall without fixing (observed_fallen={sorted(observed_fallen)})')
         else:
             print(f'[planner] precheck: seeded {len(poses)} self-stable initial pose(s) on root node')
-        return poses
+        return poses, observed_fallen
 
     def wh_select_node(self, tree):
         raise NotImplementedError

@@ -9,6 +9,7 @@ from .base import SequencePlanner, _simulate_standalone_tagged
 from plan_sequence.physics_planner import get_contact_graph, CONTACT_EPS
 from plan_sequence.stable_pose import get_combined_mesh, get_stable_poses
 from utils.parallel import parallel_execute
+import settings
 
 
 class DFASequencePlanner(SequencePlanner):
@@ -44,10 +45,10 @@ class DFASequencePlanner(SequencePlanner):
 
     @staticmethod
     def plot_tree(tree, save_path=None):
+        import os
         import tempfile
         from collections import Counter
         from matplotlib.patches import Patch
-        from networkx.drawing.nx_agraph import graphviz_layout
 
         colors = DFASequencePlanner._OUTCOME_COLORS
         classify = DFASequencePlanner._classify_sim_info
@@ -71,7 +72,32 @@ class DFASequencePlanner(SequencePlanner):
 
         node_colors = [colors[_node_kind(n)] for n in tree.nodes]
         edge_colors = [colors[_edge_kind(e)] for e in tree.edges]
-        pos = graphviz_layout(tree, prog='dot')
+
+        # graphviz_layout is the preferred hierarchical layout but it depends
+        # on pygraphviz (system `graphviz` + python `pygraphviz`). The
+        # backend-loading dance occasionally fails in fresh subprocess
+        # interpreters even when it works fine in the parent shell — fall
+        # through to pydot, then to a spring layout, so the plot is at least
+        # produced rather than killing the planning loop.
+        pos = None
+        for _attempt in ('agraph', 'pydot', 'spring'):
+            try:
+                if _attempt == 'agraph':
+                    from networkx.drawing.nx_agraph import graphviz_layout
+                    pos = graphviz_layout(tree, prog='dot')
+                elif _attempt == 'pydot':
+                    from networkx.drawing.nx_pydot import graphviz_layout as _pydot_layout
+                    pos = _pydot_layout(tree, prog='dot')
+                else:
+                    pos = nx.spring_layout(tree, seed=0)
+                break
+            except Exception as _layout_err:
+                print(f'[DFA.plot_tree] layout backend {_attempt!r} failed: {_layout_err}')
+        if pos is None:
+            # Even spring failed (extremely unlikely) — bail gracefully.
+            print('[DFA.plot_tree] no layout backend available; skipping plot.')
+            return
+
         fig, ax = plt.subplots(figsize=(16, 10))
         nx.draw(tree, pos, ax=ax, node_color=node_colors, edge_color=edge_colors,
                 with_labels=False, node_size=40, arrowsize=6)
@@ -84,10 +110,16 @@ class DFASequencePlanner(SequencePlanner):
         ]
         ax.legend(handles=legend, loc='upper right', fontsize=9, framealpha=0.9)
         out = save_path or tempfile.mktemp(suffix='.png', prefix='dfa_tree_')
-        fig.savefig(out, dpi=120, bbox_inches='tight')
-        plt.close(fig)
-        if save_path is None:
-            print(f'[DFA] tree saved to {out}')
+        try:
+            # Make sure the parent directory exists (in case log_dir resolution
+            # took an unexpected turn in a subprocess).
+            os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
+            fig.savefig(out, dpi=120, bbox_inches='tight')
+            print(f'[DFA.plot_tree] tree → {out}')
+        except Exception as _save_err:
+            print(f'[DFA.plot_tree] savefig({out!r}) failed: {_save_err}')
+        finally:
+            plt.close(fig)
 
     def _reset(self):
         G0 = self.parts.copy()
@@ -187,6 +219,9 @@ class DFASequencePlanner(SequencePlanner):
         self.stop_msg = None
         self._timing = defaultdict(float)
         self._timing_counts = defaultdict(int)
+        # Stash log_dir on self so overridable hooks (e.g. LLM frontier selection)
+        # can write caches / decision logs alongside the planner output.
+        self.log_dir = log_dir
         assert budget is not None or timeout is not None
 
         self._reset()
@@ -197,8 +232,24 @@ class DFASequencePlanner(SequencePlanner):
         self._n_stability_success = 0
         G0 = self.parts.copy()
         tree = nx.DiGraph()
-        #NOTE call inital stable pose here 
-        tree.add_node(tuple(G0), n_eval=0, n_gripper=1, poses=[])
+        initial_poses, observed_fallen = self._initial_stable_poses(G0, max_poses, log_dir=log_dir)
+        tree.add_node(tuple(G0), n_eval=0, n_gripper=1, poses=initial_poses)
+
+        if self.base_part is None and not initial_poses:
+            action = getattr(settings, 'no_stable_pose_action', 'exit')
+            if action == 'exit':
+                self.stop_msg = 'no self-stable initial pose'
+                print('[DFA.plan] aborting: no self-stable initial pose found '
+                      "(settings.no_stable_pose_action='exit')")
+                return tree
+            elif action == 'ignore_unstable':
+                self._ignored_unstable_parts = frozenset(observed_fallen)
+                print(f"[DFA.plan] no self-stable initial pose; "
+                      f"ignoring {sorted(self._ignored_unstable_parts)} in all future stability checks "
+                      f"(settings.no_stable_pose_action='ignore_unstable')")
+            else:  # 'continue' or anything unrecognised
+                print(f"[DFA.plan] no self-stable initial pose; continuing with no seed "
+                      f"(settings.no_stable_pose_action={action!r})")
 
         if debug > 0:
             contact_graph = get_contact_graph(self.asset_folder, self.assembly_dir, G0, contact_eps=CONTACT_EPS, save_sdf=self.save_sdf)
@@ -282,7 +333,7 @@ class DFASequencePlanner(SequencePlanner):
                             self.asset_folder, self.assembly_dir, self.save_sdf, self.base_part,
                             p, G_prime, parts_removed_G, pose, max_grippers,
                             remaining_timeout, optimizer, max(debug - 2, 0), render, self.allow_gap, self.get_dof,
-                            self.tools, self.skip_stability,
+                            self.tools, self.skip_stability, self._ignored_unstable_parts,
                             i,  # parent_idx tag — stripped by _simulate_standalone_tagged
                         ))
 
@@ -431,7 +482,7 @@ class DFASequencePlanner(SequencePlanner):
 
                 self._iter_timings.append((iter_idx, len(live), len(received), time() - iter_start))
 
-                if debug > 1:
+                if debug > 0:
                     print(f'[DFA.plan] elapsed: {time() - self.t_start:.2f}s  evals: {self.n_eval}  '
                           f'next_frontier={len(self.frontier)}')
                     self.plot_tree(tree, save_path=log_dir + f'/dfa_tree_eval{self.n_eval}.png' if log_dir is not None else None)

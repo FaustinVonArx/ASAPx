@@ -17,7 +17,7 @@ from assets.save import clear_saved_sdfs
 
 
 def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc, seed, budget, max_gripper, max_pose, pose_reuse, early_term, timeout, base_part,
-    save_sdf, clear_sdf, plan_grasp, plan_arm, gripper_type, gripper_scale, optimizer, debug, render, record_dir, log_dir, allow_gap=False, n_success_term=1, connect_path=False, get_dof=False, tools=None, skip_stability=False, max_frontier=4):
+    save_sdf, clear_sdf, plan_grasp, plan_arm, gripper_type, gripper_scale, optimizer, debug, render, record_dir, log_dir, allow_gap=False, n_success_term=1, connect_path=False, get_dof=False, tools=None, skip_stability=False, max_frontier=4, seq_optimizer=None):
 
     try:
         generator_cls = generators[generator_name]
@@ -38,7 +38,7 @@ def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc,
         # Integrated sequence selection + divide-optimizer split probe.
         # The chosen sequence replaces stats['sequence']; the split is purely
         # diagnostic (printed when debug > 0). See BaseSequenceOptimizer.
-        if stats.get('success'):
+        if stats.get('success') and seq_optimizer == 'divide':
             from plan_sequence.optimizer.base import BaseSequenceOptimizer
             from plan_sequence.optimizer.divide import DivideOptimizer
 

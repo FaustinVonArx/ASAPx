@@ -23,11 +23,11 @@ class SimRenderer:
             os.remove(os.path.join(record_folder, "0.png"))
 
             if make_video:
-                os.system(f"ffmpeg -framerate 30 -i {images_path} -c:v libx264 -pix_fmt yuv420p {record_path} -hide_banner -loglevel error")
+                os.system(f"ffmpeg -y -framerate 30 -i {images_path} -c:v libx264 -pix_fmt yuv420p {record_path} -hide_banner -loglevel error")
             else:
                 palette_path = os.path.join(record_folder, 'palette.png')
-                os.system("ffmpeg -i {} -vf palettegen {} -hide_banner -loglevel error".format(images_path, palette_path))
-                os.system("ffmpeg -i {} -i {} -lavfi paletteuse {} -hide_banner -loglevel error".format(images_path, palette_path, record_path))
+                os.system("ffmpeg -y -i {} -vf palettegen {} -hide_banner -loglevel error".format(images_path, palette_path))
+                os.system("ffmpeg -y -i {} -i {} -lavfi paletteuse {} -hide_banner -loglevel error".format(images_path, palette_path, record_path))
 
             shutil.rmtree(record_folder)
 
