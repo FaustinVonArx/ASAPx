@@ -21,9 +21,33 @@ N_DOF = len(DOF_ORDER)
 # subgraph induced by X. All three normalised terms land in [0, ~1], so weight
 # magnitudes are directly comparable. Fragmentation penalises cuts that split
 # either side into multiple physically-disconnected sub-pieces.
-BALANCE_WEIGHT = 1.0
-CONTACT_WEIGHT = 0.7
-FRAGMENTATION_WEIGHT = 1.0
+#
+# Initial values are pulled from `settings.divide_weights` so they can be tuned
+# without touching this file. Missing keys (or no settings module) fall back to
+# the hard-coded defaults below.
+_DEFAULT_BALANCE = 1.0
+_DEFAULT_CONTACT = 0.7
+_DEFAULT_FRAGMENTATION = 1.0
+try:
+    import settings as _user_settings  # project-root settings.py
+    _w = getattr(_user_settings, 'divide_weights', None) or {}
+except ImportError:
+    _w = {}
+BALANCE_WEIGHT = float(_w.get('balance', _DEFAULT_BALANCE))
+CONTACT_WEIGHT = float(_w.get('contact', _DEFAULT_CONTACT))
+FRAGMENTATION_WEIGHT = float(_w.get('fragmentation', _DEFAULT_FRAGMENTATION))
+
+# Visualization-only flag: when True, build_obstruction_graph also records
+# explicit "non-blocking" observations into a sibling matrix
+# graph.nodes[p]['non_blocking']. Pulled from settings.mark_non_blocking with
+# a True default; can also be overridden per call via the kwarg of the same
+# name. The main `obstruction` matrix remains binary {0, 1} so existing
+# consumers (find_locally_free_subassemblies, find_symmetric_additions) are
+# unaffected.
+try:
+    _MARK_NON_BLOCKING_DEFAULT = bool(getattr(_user_settings, 'mark_non_blocking', True))
+except NameError:
+    _MARK_NON_BLOCKING_DEFAULT = True
 
 
 class DivideOptimizer(BaseSequenceOptimizer):
@@ -60,7 +84,27 @@ class DivideOptimizer(BaseSequenceOptimizer):
         self.locally_free = None
         self.symmetric_additions = None
 
-    def build_obstruction_graph(self, apply_mirrors=True):
+    def build_obstruction_graph(self, apply_mirrors=True, mark_non_blocking=None):
+        '''
+        Build the per-part obstruction matrices from the planning tree.
+
+        When ``mark_non_blocking`` is True (default from
+        ``settings.mark_non_blocking``), this also records explicit non-blocking
+        observations into a sibling matrix ``graph.nodes[p]['non_blocking']``:
+        at every feasibly-reachable node u, for each part p with
+        ``dof_u[p][d] == 1`` we mark every other part q in u as "observed not
+        blocking p in d" (q can't be a blocker for p in d, because p is free in
+        d while q is present at its fixed assembly position). The matrix has
+        the same shape as ``obstruction`` and the diagonal is pre-set to 1
+        ("part trivially doesn't block itself") for visualization completeness.
+
+        The non_blocking matrix is purely diagnostic — only the visualization
+        functions consult it. The main ``obstruction`` matrix stays {0, 1} and
+        the planning logic that reads it is unchanged.
+        '''
+        if mark_non_blocking is None:
+            mark_non_blocking = _MARK_NON_BLOCKING_DEFAULT
+
         if not any(self.tree.nodes[n].get('dof_info') for n in self.tree.nodes):
             print('[DivideOptimizer] tree has no dof_info; re-run planner with get_dof=True. Aborting.')
             return None
@@ -80,8 +124,16 @@ class DivideOptimizer(BaseSequenceOptimizer):
 
         for p in all_parts:
             graph.nodes[p]['obstruction'] = np.zeros((n_parts + 1, N_DOF), dtype=int)
+            if mark_non_blocking:
+                nb = np.zeros((n_parts + 1, N_DOF), dtype=int)
+                # Diagonal: a part trivially doesn't block itself. Marked as
+                # "non-blocking" for visual completeness; excluded from the
+                # known% metric by the viz function.
+                nb[parts_idx[p], :] = 1
+                graph.nodes[p]['non_blocking'] = nb
         graph.graph['parts_idx'] = parts_idx
         graph.graph['dof_order'] = list(DOF_ORDER)
+        graph.graph['mark_non_blocking'] = bool(mark_non_blocking)
 
         # Traverse only the feasibly-reachable sub-tree.
         visited = {self.root}
@@ -94,9 +146,25 @@ class DivideOptimizer(BaseSequenceOptimizer):
                 if p not in parts_idx:
                     continue
                 M = graph.nodes[p]['obstruction']
+                NB = graph.nodes[p]['non_blocking'] if mark_non_blocking else None
                 for d in range(N_DOF):
                     if int(dof[d]) == 0:
                         M[any_row, d] = 1
+                    elif mark_non_blocking and int(dof[d]) == 1:
+                        # p is free in d at u: every other part still in u is
+                        # observed-not-blocking p in d.
+                        for q in u:
+                            if q == p or q not in parts_idx:
+                                continue
+                            i_q = parts_idx[q]
+                            if M[i_q, d] == 1:
+                                # In clean geometry this can't happen; warn so
+                                # numerical flakes in the DoF probe surface.
+                                print(f'[DivideOptimizer] WARN non-blocking observation for '
+                                      f'({p}, {q}, {DOF_ORDER[d]}) at node {sorted(u)} but '
+                                      f'q is already marked as blocker — keeping +1.')
+                                continue
+                            NB[i_q, d] = 1
 
             for _, v, edata in self.tree.out_edges(u, data=True):
                 sim_info = edata.get('sim_info') or {}
@@ -111,12 +179,52 @@ class DivideOptimizer(BaseSequenceOptimizer):
                         if dof_parent is None or dof_child is None:
                             continue
                         M = graph.nodes[p]['obstruction']
+                        NB = graph.nodes[p].get('non_blocking') if mark_non_blocking else None
                         for d in range(N_DOF):
                             if int(dof_parent[d]) == 0 and int(dof_child[d]) == 1:
+                                if mark_non_blocking and NB is not None \
+                                        and NB[parts_idx[removed], d] == 1:
+                                    print(f'[DivideOptimizer] WARN blocker inference for '
+                                          f'({p}, {removed}, {DOF_ORDER[d]}) at parent '
+                                          f'{sorted(u)} but the cell was already marked '
+                                          f'non-blocking — clearing the -1 and keeping +1.')
+                                    NB[parts_idx[removed], d] = 0
                                 M[parts_idx[removed], d] = 1
                 if v not in visited:
                     visited.add(v)
                     stack.append(v)
+
+        # Bottom-row free flag + propagation, anchored at the root. By
+        # monotonicity (removing a part never creates a new DoF block, so
+        # freedom at a super-assembly carries to every sub-assembly we'd ever
+        # visit), if dof_root[p][d] == 1 then no part is a blocker for (p, d)
+        # anywhere in the feasibly-reachable tree. We set the bottom-row
+        # NB[any_row, d] = 1 so the visualization paints it the same colour as
+        # the per-part free cells (instead of leaving the bottom row blank),
+        # and propagate -1 to every per-part NB cell in column d.
+        if mark_non_blocking:
+            dof_root = self.tree.nodes[self.root].get('dof_info') or {}
+            for p in all_parts:
+                dof_p = dof_root.get(p)
+                if dof_p is None:
+                    continue
+                M = graph.nodes[p]['obstruction']
+                NB = graph.nodes[p]['non_blocking']
+                i_p = parts_idx[p]
+                for d in range(N_DOF):
+                    if int(dof_p[d]) != 1:
+                        continue
+                    NB[any_row, d] = 1
+                    for r in range(n_parts):
+                        if r == i_p:
+                            continue
+                        if M[r, d] == 1:
+                            # +1 wins. Unreachable in clean geometry: a free
+                            # root direction can't have any per-part blocker.
+                            print(f'[DivideOptimizer] WARN dof_root[{p}][{DOF_ORDER[d]}]=free '
+                                  f'but a per-part blocker entry exists at row {r}; keeping +1.')
+                            continue
+                        NB[r, d] = 1
 
         self.obstruction_graph = graph
 
@@ -449,17 +557,22 @@ class DivideOptimizer(BaseSequenceOptimizer):
         ax0.set_title('Contact graph')
         ax0.set_axis_off()
 
-        existing_rgb = np.array([0.85, 0.20, 0.20])
-        proposed_rgb = np.array([0.20, 0.45, 0.90])
+        has_nb = bool(graph.graph.get('mark_non_blocking', False))
+        existing_rgb  = np.array([0.85, 0.20, 0.20])  # red — observed blocker
+        proposed_rgb  = np.array([0.20, 0.45, 0.90])  # blue — mirror-inferred
+        non_block_rgb = np.array([0.25, 0.65, 0.30])  # green — observed non-blocker
 
         for i, p in enumerate(parts):
             ax = axes[i + 1]
             M = graph.nodes[p]['obstruction']
+            NB = graph.nodes[p].get('non_blocking')
             A = additions[p]
 
             rgb = np.ones((M.shape[0], M.shape[1], 3), dtype=float)
-            rgb[M > 0] = existing_rgb
-            rgb[A > 0] = proposed_rgb
+            if has_nb and NB is not None:
+                rgb[NB == 1] = non_block_rgb
+            rgb[M == 1] = existing_rgb
+            rgb[A > 0] = proposed_rgb  # mirror takes precedence visually
 
             ax.imshow(rgb, aspect='auto')
             ax.set_title(f'Part {p}')
@@ -473,14 +586,21 @@ class DivideOptimizer(BaseSequenceOptimizer):
                 for c in range(M.shape[1]):
                     if A[r, c]:
                         ax.text(c, r, '+', ha='center', va='center', color='white', fontsize=7)
-                    elif M[r, c]:
+                    elif M[r, c] == 1:
                         ax.text(c, r, '1', ha='center', va='center', color='white', fontsize=7)
+                    elif has_nb and NB is not None and NB[r, c] == 1:
+                        ax.text(c, r, '0', ha='center', va='center', color='white', fontsize=7)
 
         legend_handles = [
-            plt.Rectangle((0, 0), 1, 1, color=existing_rgb, label='directly observed'),
+            plt.Rectangle((0, 0), 1, 1, color=existing_rgb, label='directly observed (+1)'),
             plt.Rectangle((0, 0), 1, 1, color=proposed_rgb, label='mirror-inferred'),
         ]
-        fig.legend(handles=legend_handles, loc='lower center', ncol=2, frameon=False)
+        if has_nb:
+            legend_handles.append(
+                plt.Rectangle((0, 0), 1, 1, color=non_block_rgb, label='not blocking (-1)')
+            )
+        fig.legend(handles=legend_handles, loc='lower center',
+                   ncol=len(legend_handles), frameon=False)
 
         for j in range(n_panels, len(axes)):
             axes[j].set_axis_off()
@@ -543,6 +663,16 @@ class DivideOptimizer(BaseSequenceOptimizer):
         '''
         Render the obstruction graph: the contact graph in the first panel, and
         one heatmap per part for its (n_parts + 1, 6) obstruction matrix.
+
+        Cell encoding in the per-part rows (rows 0..n_parts-1):
+            - red   == blocking      (obstruction == 1)
+            - green == not blocking  (non_blocking == 1, when available)
+            - white == undecided     (neither set)
+
+        The bottom "any" row is binary (red == any blocker observed at some
+        node; white == none). The suptitle reports the percentage of per-part
+        cells with a decisive observation (excluding the diagonal and the
+        bottom row).
         '''
         if self.obstruction_graph is None:
             print('[DivideOptimizer] obstruction graph not built; call build_obstruction_graph() first.')
@@ -554,6 +684,30 @@ class DivideOptimizer(BaseSequenceOptimizer):
         parts = list(parts_idx.keys())
         n_parts = len(parts)
         row_labels = [str(p) for p in parts] + ['any']
+        has_nb = bool(graph.graph.get('mark_non_blocking', False))
+
+        # Colors
+        blocking_rgb   = np.array([0.85, 0.20, 0.20])  # red
+        non_block_rgb  = np.array([0.25, 0.65, 0.30])  # green
+        undecided_rgb  = np.array([0.96, 0.96, 0.96])  # near-white
+
+        # Aggregate known% across all per-part rows excluding diagonal and bottom row.
+        known = 0
+        total = 0
+        for p in parts:
+            M = graph.nodes[p]['obstruction']
+            NB = graph.nodes[p].get('non_blocking')
+            i_p = parts_idx[p]
+            for r in range(n_parts):
+                if r == i_p:
+                    continue
+                for c in range(N_DOF):
+                    total += 1
+                    if M[r, c] == 1:
+                        known += 1
+                    elif has_nb and NB is not None and NB[r, c] == 1:
+                        known += 1
+        pct_known = (100.0 * known / total) if total > 0 else 0.0
 
         n_panels = n_parts + 1
         n_cols = min(4, n_panels)
@@ -578,7 +732,14 @@ class DivideOptimizer(BaseSequenceOptimizer):
         for i, p in enumerate(parts):
             ax = axes[i + 1]
             M = graph.nodes[p]['obstruction']
-            ax.imshow(M, cmap='Reds', vmin=0, vmax=1, aspect='auto')
+            NB = graph.nodes[p].get('non_blocking')
+
+            rgb = np.broadcast_to(undecided_rgb, (M.shape[0], M.shape[1], 3)).copy()
+            if has_nb and NB is not None:
+                rgb[NB == 1] = non_block_rgb
+            rgb[M == 1] = blocking_rgb  # +1 always wins over -1 (see build_obstruction_graph)
+
+            ax.imshow(rgb, aspect='auto')
             ax.set_title(f'Part {p}')
             ax.set_xticks(range(len(dof_order)))
             ax.set_xticklabels(dof_order, fontsize=7)
@@ -587,13 +748,35 @@ class DivideOptimizer(BaseSequenceOptimizer):
             ax.axhline(n_parts - 0.5, color='black', linewidth=1)
             for r in range(M.shape[0]):
                 for c in range(M.shape[1]):
-                    if M[r, c]:
+                    if M[r, c] == 1:
                         ax.text(c, r, '1', ha='center', va='center', color='white', fontsize=7)
+                    elif has_nb and NB is not None and NB[r, c] == 1:
+                        ax.text(c, r, '0', ha='center', va='center', color='white', fontsize=7)
 
         for j in range(n_panels, len(axes)):
             axes[j].set_axis_off()
 
-        fig.tight_layout()
+        legend_handles = [
+            plt.Rectangle((0, 0), 1, 1, color=blocking_rgb,  label='blocking (+1)'),
+        ]
+        if has_nb:
+            legend_handles.append(
+                plt.Rectangle((0, 0), 1, 1, color=non_block_rgb, label='not blocking (-1)')
+            )
+        legend_handles.append(
+            plt.Rectangle((0, 0), 1, 1, color=undecided_rgb, ec='black', label='undecided')
+        )
+        fig.legend(handles=legend_handles, loc='lower center',
+                   ncol=len(legend_handles), frameon=False, fontsize=9)
+
+        nb_state = 'on' if has_nb else 'off'
+        fig.suptitle(
+            f'Obstruction graph  —  non-blocking inference: {nb_state}  —  '
+            f'known: {known}/{total}  ({pct_known:.1f}%, excludes diagonal & "any" row)',
+            fontsize=11,
+        )
+
+        fig.tight_layout(rect=(0, 0.04, 1, 0.96))
         if save_path is not None:
             fig.savefig(save_path, dpi=120, bbox_inches='tight')
             print(f'[DivideOptimizer] obstruction graph saved to {save_path}')

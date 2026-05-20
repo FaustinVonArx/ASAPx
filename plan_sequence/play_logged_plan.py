@@ -91,9 +91,145 @@ def interpolate_path(states):
     return interpolated_path
 
 
+def _render_step_worker(asset_folder, assembly_dir, step_arg, result_paths, options):
+    """Render one disassembly step in isolation. Top-level so it is picklable and
+    can be dispatched across multiprocessing workers. All cross-step state must
+    be pre-resolved by the caller and passed via ``step_arg`` — this worker does
+    not touch the planning tree or any accumulating list, so concurrent calls
+    for different steps share no mutable Python state."""
+    import time as _time
+    _t0 = _time.time()
+    print(f'[play_logged_plan] pid={os.getpid()} step {step_arg["i"]} ({step_arg["part_move"]}) START', flush=True)
+    i = step_arg['i']
+    part_move = step_arg['part_move']
+    parts_rest = step_arg['parts_rest']
+    parts_removed = step_arg['parts_removed']
+    sim_info = step_arg['sim_info']
+    tool_mesh = step_arg.get('tool_mesh')
+
+    record_dir = result_paths.get('record_dir')
+    pose_dir = result_paths.get('pose_dir')
+    part_dir = result_paths.get('part_dir')
+    path_dir = result_paths.get('path_dir')
+    record_dir_grasp = result_paths.get('record_dir_grasp')
+    extra_views = result_paths.get('extra_views') or []
+
+    save_path = options['save_path']
+    save_record = options['save_record']
+    save_all = options['save_all']
+    save_sdf = options['save_sdf']
+    make_video = options['make_video']
+    reverse = options['reverse']
+    show_fix = options['show_fix']
+    show_grasp = options['show_grasp']
+    show_arm = options['show_arm']
+    gripper_type = options['gripper_type']
+    gripper_scale = options['gripper_scale']
+    optimizer = options['optimizer']
+    camera_pos = options['camera_pos']
+    camera_lookat = options['camera_lookat']
+    connect_path = options['connect_path']
+    n_frame = options.get('n_frame', 300)
+
+    action = np.array(sim_info['action'])
+    pose = np.array(sim_info['pose']) if sim_info['pose'] is not None else None
+    grasps = sim_info['grasp'] if show_grasp else None
+    parts_fix = sim_info['parts_fix']
+    parts_free = [p for p in parts_rest if parts_fix is None or p not in parts_fix] + [part_move]
+
+    if show_fix:
+        body_color_dict = get_body_color_dict(parts_fix, parts_free)
+    else:
+        body_color_dict = get_body_color_dict([], parts_rest + [part_move])
+
+    if record_dir is not None:
+        record_path = os.path.join(record_dir, f'{i}_{part_move}.mp4' if make_video else f'{i}_{part_move}.gif')
+    else:
+        record_path = None
+
+    if save_path or save_record or save_all:
+        path_planner = MultiPartPathPlanner(asset_folder, assembly_dir, parts_rest, part_move,
+            parts_removed=parts_removed, pose=pose, save_sdf=save_sdf,
+            camera_pos=camera_pos, camera_lookat=camera_lookat)
+        success, path = path_planner.plan_path(action, rotation=True, connect_path=connect_path)
+        assert success, f'[play_logged_plan] step {i} part_move {part_move}: path planner failed'
+
+        min_path_len = 300
+        while len(path) < min_path_len:
+            path = interpolate_path(path)
+
+        if (show_grasp or show_arm) and grasps is not None:
+            n_render = min(3, len(grasps))
+            random_indices = np.random.choice(len(grasps), n_render, replace=False)
+            for idx in random_indices:
+                grasp = grasps[idx][0]
+                if record_dir_grasp is not None:
+                    record_path_grasp = os.path.join(record_dir_grasp, f'{i}_{part_move}_g{idx}.mp4' if make_video else f'{i}_{part_move}_g{idx}.gif')
+                else:
+                    record_path_grasp = None
+                if show_arm:
+                    body_matrices = render_path_with_grasp_and_arm(asset_folder, assembly_dir, part_move, parts_rest, parts_removed, pose, path, gripper_type, gripper_scale, grasp, optimizer, camera_lookat, camera_pos,
+                        body_color_dict, reverse, save_record or save_all, record_path_grasp, make_video)
+                else:
+                    body_matrices = render_path_with_grasp(asset_folder, assembly_dir, part_move, parts_rest, parts_removed, pose, path, gripper_type, gripper_scale, grasp, camera_lookat, camera_pos,
+                        body_color_dict, reverse, save_record or save_all, record_path_grasp, make_video)
+
+                if path_dir is not None:
+                    path_i_dir = os.path.join(path_dir, f'{i}_{part_move}_g{idx}')
+                    save_path_all_objects(path_i_dir, body_matrices, n_frame=n_frame)
+
+        if connect_path:
+            _fit_camera_to_path(path_planner, path, camera_pos, camera_lookat)
+
+        path_planner.sim.set_body_color_map(body_color_dict)
+        if record_path is not None:
+            if tool_mesh is not None:
+                body_matrices = path_planner.render_with_tool(
+                    tool_mesh, path=path, reverse=reverse,
+                    record_path=record_path, make_video=make_video,
+                    body_color_dict=body_color_dict,
+                )
+            else:
+                body_matrices = path_planner.render(path=path, reverse=reverse, record_path=record_path, make_video=make_video)
+
+            if path_dir is not None:
+                path_i_dir = os.path.join(path_dir, f'{i}_{part_move}')
+                save_path_all_objects(path_i_dir, body_matrices, n_frame=n_frame)
+
+        for view_record_dir, view_camera_pos, view_camera_lookat in extra_views:
+            view_record_path = os.path.join(view_record_dir,
+                f'{i}_{part_move}.mp4' if make_video else f'{i}_{part_move}.gif')
+            if tool_mesh is not None:
+                path_planner.render_with_tool(
+                    tool_mesh, path=path, reverse=reverse,
+                    record_path=view_record_path, make_video=make_video,
+                    camera_pos=list(view_camera_pos), camera_lookat=list(view_camera_lookat),
+                    body_color_dict=body_color_dict,
+                )
+            else:
+                if connect_path:
+                    _fit_camera_to_path(path_planner, path, view_camera_pos, view_camera_lookat)
+                else:
+                    path_planner.sim.viewer_options.camera_pos = list(view_camera_pos)
+                    path_planner.sim.viewer_options.camera_lookat = list(view_camera_lookat)
+                path_planner.render(path=path, reverse=reverse, record_path=view_record_path, make_video=make_video)
+
+    if pose_dir is not None:
+        pose_path = os.path.join(pose_dir, f'{i}_{part_move}.npy')
+        np.save(pose_path, pose, allow_pickle=True)
+
+    if part_dir is not None:
+        part_path = os.path.join(part_dir, f'{i}_{part_move}.json')
+        with open(part_path, 'w') as fp:
+            json.dump(parts_fix, fp)
+
+    print(f'[play_logged_plan] pid={os.getpid()} step {i} ({part_move}) DONE in {_time.time() - _t0:.1f}s', flush=True)
+    return i
+
+
 def play_logged_plan(asset_folder, assembly_dir, sequence, tree, result_dir, save_mesh, save_pose, save_part, save_path, save_record, save_all,
     reverse=False, show_fix=False, show_grasp=False, show_arm=False, gripper_type=None, gripper_scale=None, optimizer='L-BFGS-B', save_sdf=False, clear_sdf=False, make_video=False, budget=None, camera_pos=None, camera_lookat=None, connect_path=False,
-    extra_views=None, tool_meshes_per_step=None):
+    extra_views=None, tool_meshes_per_step=None, num_proc=1, n_frame=300):
     # extra_views: list of (record_dir, camera_pos, camera_lookat) — each entry
     # re-renders the already-simulated path from a different camera, writing
     # GIFs/MP4s into its record_dir. No additional physics simulation is run.
@@ -102,6 +238,11 @@ def play_logged_plan(asset_folder, assembly_dir, sequence, tree, result_dir, sav
     # for the step's moving part, the tool mesh (already positioned in the part's OBJ frame,
     # e.g. via ToolAnalyzer._apply_tool_geometric) is attached as a fixed child of the
     # moving part and replayed alongside the part trajectory.
+    #
+    # num_proc: when > 1, render each disassembly step in a separate process. Steps share
+    # no mutable state (parts_assembled/parts_removed are pre-resolved per step before
+    # dispatch), so they can be rendered fully in parallel. Falls back to a serial loop
+    # when num_proc <= 1 or the sequence has fewer than 2 steps.
 
     parts_assembled = sorted(load_part_ids(assembly_dir))
 
@@ -157,115 +298,64 @@ def play_logged_plan(asset_folder, assembly_dir, sequence, tree, result_dir, sav
         os.makedirs(view_record_dir, exist_ok=True)
 
     try:
-        parts_removed = []
-
-        for i, part_move in enumerate(tqdm(sequence)):
-            parts_rest = parts_assembled.copy()
-            parts_rest.remove(part_move)
-
-            sim_info = tree.edges[tuple(parts_assembled), tuple(parts_rest)]['sim_info']
+        # Pre-resolve per-step state so workers see no mutable accumulators.
+        # parts_assembled / parts_removed at step i are fully determined by sequence[:i],
+        # which is exactly what makes the loop parallelizable.
+        step_args = []
+        _parts_assembled = list(parts_assembled)
+        _parts_removed = []
+        for i, part_move in enumerate(sequence):
+            parts_rest = [p for p in _parts_assembled if p != part_move]
+            sim_info = tree.edges[tuple(_parts_assembled), tuple(parts_rest)]['sim_info']
             assert part_move == sim_info['part_move']
-            action = np.array(sim_info['action'])
-            pose = np.array(sim_info['pose']) if sim_info['pose'] is not None else None
-            if show_grasp:
-                grasps = sim_info['grasp']
-            else:
-                grasps = None
+            step_args.append({
+                'i': i,
+                'part_move': part_move,
+                'parts_rest': parts_rest,
+                'parts_removed': list(_parts_removed),
+                'sim_info': sim_info,
+                'tool_mesh': (tool_meshes_per_step or {}).get(part_move),
+            })
+            _parts_assembled = parts_rest
+            _parts_removed.append(part_move)
 
-            parts_fix = sim_info['parts_fix']
-            parts_free = [part_i for part_i in parts_rest if parts_fix is None or part_i not in parts_fix] + [part_move]
-            
-            if show_fix:
-                body_color_dict = get_body_color_dict(parts_fix, parts_free) # visualize fixes
-            else:
-                body_color_dict = get_body_color_dict([], parts_assembled)
+        result_paths = {
+            'record_dir': record_dir,
+            'pose_dir': pose_dir,
+            'part_dir': part_dir,
+            'path_dir': path_dir,
+            'record_dir_grasp': record_dir_grasp,
+            'extra_views': extra_views,
+        }
+        options = {
+            'save_path': save_path or save_all,
+            'save_record': save_record or save_all,
+            'save_all': save_all,
+            'save_sdf': save_sdf,
+            'make_video': make_video,
+            'reverse': reverse,
+            'show_fix': show_fix,
+            'show_grasp': show_grasp,
+            'show_arm': show_arm,
+            'gripper_type': gripper_type,
+            'gripper_scale': gripper_scale,
+            'optimizer': optimizer,
+            'camera_pos': camera_pos,
+            'camera_lookat': camera_lookat,
+            'connect_path': connect_path,
+            'n_frame': n_frame,
+        }
 
-            if record_dir is not None:
-                record_path = os.path.join(record_dir, f'{i}_{part_move}.mp4' if make_video else f'{i}_{part_move}.gif')
-            else:
-                record_path = None
-            
-            # print(f'[play_logged_plan] {i}-th step, part_move: {part_move}')
-
-            if save_path or save_record or save_all:
-                path_planner = MultiPartPathPlanner(asset_folder, assembly_dir, parts_rest, part_move, parts_removed=parts_removed, pose=pose, save_sdf=save_sdf,
-                    camera_pos=camera_pos, camera_lookat=camera_lookat)
-                # success, path = path_planner.check_success(action, return_path=True)
-                success, path = path_planner.plan_path(action, rotation=True, connect_path=connect_path)
-                assert success, f'[play_logged_plan] path planner: part_move {part_move} with action {action} is not successful'
-
-                min_path_len = 300
-                while len(path) < min_path_len:
-                    path = interpolate_path(path)
-                
-                if (show_grasp or show_arm) and grasps is not None:
-                    n_render = min(3, len(grasps))
-                    random_indices = np.random.choice(len(grasps), n_render, replace=False)
-                    for idx in random_indices:
-                        grasp = grasps[idx][0]
-                        if record_dir_grasp is not None:
-                            record_path_grasp = os.path.join(record_dir_grasp, f'{i}_{part_move}_g{idx}.mp4' if make_video else f'{i}_{part_move}_g{idx}.gif')
-                        else:
-                            record_path_grasp = None
-                        if show_arm:
-                            body_matrices = render_path_with_grasp_and_arm(asset_folder, assembly_dir, part_move, parts_rest, parts_removed, pose, path, gripper_type, gripper_scale, grasp, optimizer, camera_lookat, camera_pos,
-                                body_color_dict, reverse, save_record or save_all, record_path_grasp, make_video)
-                        else:
-                            body_matrices = render_path_with_grasp(asset_folder, assembly_dir, part_move, parts_rest, parts_removed, pose, path, gripper_type, gripper_scale, grasp, camera_lookat, camera_pos,
-                                body_color_dict, reverse, save_record or save_all, record_path_grasp, make_video)
-
-                        if path_dir is not None:
-                            path_i_dir = os.path.join(path_dir, f'{i}_{part_move}_g{idx}')
-                            save_path_all_objects(path_i_dir, body_matrices, n_frame=300)
-                            
-                if connect_path:
-                    _fit_camera_to_path(path_planner, path, camera_pos, camera_lookat)
-
-                path_planner.sim.set_body_color_map(body_color_dict)
-                tool_mesh = (tool_meshes_per_step or {}).get(part_move)
-                if record_path is not None:
-                    if tool_mesh is not None:
-                        body_matrices = path_planner.render_with_tool(
-                            tool_mesh, path=path, reverse=reverse,
-                            record_path=record_path, make_video=make_video,
-                            body_color_dict=body_color_dict,
-                        )
-                    else:
-                        body_matrices = path_planner.render(path=path, reverse=reverse, record_path=record_path, make_video=make_video)
-
-                    if path_dir is not None:
-                        path_i_dir = os.path.join(path_dir, f'{i}_{part_move}')
-                        save_path_all_objects(path_i_dir, body_matrices, n_frame=300)
-
-                for view_record_dir, view_camera_pos, view_camera_lookat in extra_views:
-                    view_record_path = os.path.join(view_record_dir,
-                        f'{i}_{part_move}.mp4' if make_video else f'{i}_{part_move}.gif')
-                    if tool_mesh is not None:
-                        path_planner.render_with_tool(
-                            tool_mesh, path=path, reverse=reverse,
-                            record_path=view_record_path, make_video=make_video,
-                            camera_pos=list(view_camera_pos), camera_lookat=list(view_camera_lookat),
-                            body_color_dict=body_color_dict,
-                        )
-                    else:
-                        if connect_path:
-                            _fit_camera_to_path(path_planner, path, view_camera_pos, view_camera_lookat)
-                        else:
-                            path_planner.sim.viewer_options.camera_pos = list(view_camera_pos)
-                            path_planner.sim.viewer_options.camera_lookat = list(view_camera_lookat)
-                        path_planner.render(path=path, reverse=reverse, record_path=view_record_path, make_video=make_video)
-
-            if pose_dir is not None:
-                pose_path = os.path.join(pose_dir, f'{i}_{part_move}.npy')
-                np.save(pose_path, pose, allow_pickle=True)
-
-            if part_dir is not None:
-                part_path = os.path.join(part_dir, f'{i}_{part_move}.json')
-                with open(part_path, 'w') as fp:
-                    json.dump(parts_fix, fp)
-
-            parts_assembled = parts_rest
-            parts_removed.append(part_move)
+        if num_proc and num_proc > 1 and len(step_args) > 1:
+            print(f'[play_logged_plan] dispatching {len(step_args)} steps across up to {num_proc} workers')
+            from utils.parallel import parallel_execute
+            worker_args = [(asset_folder, assembly_dir, sa, result_paths, options) for sa in step_args]
+            for _ in parallel_execute(_render_step_worker, worker_args, num_proc, desc='play_logged_plan'):
+                pass
+        else:
+            print(f'[play_logged_plan] running {len(step_args)} steps serially (num_proc={num_proc})')
+            for sa in tqdm(step_args, desc='play_logged_plan'):
+                _render_step_worker(asset_folder, assembly_dir, sa, result_paths, options)
 
     except (Exception, KeyboardInterrupt) as e:
         if type(e) == KeyboardInterrupt:

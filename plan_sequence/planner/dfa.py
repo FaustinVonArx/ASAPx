@@ -137,6 +137,15 @@ class DFASequencePlanner(SequencePlanner):
                     break
         return out
 
+    def _select_next_frontier(self, tree, feasible_children, max_frontier):
+        """Choose up to `max_frontier` child subassemblies for the next iteration.
+
+        feasible_children: list of (G_prime, sim_info, parent_G) tuples in the
+        order they came back from the parallel batch. Default takes the first
+        `max_frontier` entries; subclasses can override to apply a quality score.
+        """
+        return [G_prime for G_prime, _, _ in feasible_children[:max_frontier]]
+
     def _compute_poses(self, tree, G, max_poses, pose_reuse):
         if self.base_part is not None:
             return [None]
@@ -205,6 +214,8 @@ class DFASequencePlanner(SequencePlanner):
         # in one pooled batch, then derives the next frontier from feasible children.
         # max_frontier=1 collapses to single-parent DFS.
         self.frontier = [G0]
+        self._iter_timings = []  # (iter_idx, n_parents_expanded, n_received, dt_seconds)
+        iter_idx = 0
 
         try:
             while True:
@@ -220,6 +231,9 @@ class DFASequencePlanner(SequencePlanner):
                 if timeout is not None and (time() - self.t_start) > timeout:
                     self.stop_msg = 'timeout'
                     break
+
+                iter_idx += 1
+                iter_start = time()
 
                 # Keep only parents in the current frontier that still have work
                 # (unexpanded candidates or 'unfinished' children to retry).
@@ -276,6 +290,7 @@ class DFASequencePlanner(SequencePlanner):
                     # Every live parent's candidates were already resolved; drop them
                     # so the next iteration triggers a fresh backtrack.
                     self.frontier = []
+                    self._iter_timings.append((iter_idx, len(live), 0, time() - iter_start))
                     continue
 
                 # Per-parent success quotas. Stop the whole pool only when every live
@@ -349,7 +364,9 @@ class DFASequencePlanner(SequencePlanner):
                 # strictly greater than any tag used by prior batches.
                 n_eval_tag = self.n_eval - len(received)
 
-                feasible_children = []  # list of (G_prime, parent_idx) in arrival order
+                # (G_prime, chosen_sim_info, parent_G) — passed to _select_next_frontier
+                # so subclasses can score candidates using sim outcomes + parent context.
+                feasible_children = []
                 for i, G in enumerate(live):
                     parent_received = received_by_parent[i]
 
@@ -369,9 +386,9 @@ class DFASequencePlanner(SequencePlanner):
                             if len(G_prime) == 2:
                                 solution_found = True
                             else:
-                                feasible_children.append(G_prime)
+                                feasible_children.append((G_prime, chosen_sim_info, G))
 
-                        if debug > 0:
+                        if debug > 2:
                             print(f'[DFA.plan] add edge ({G} → {G_prime}), feasible: {chosen_sim_info["feasible"]}')
 
                     if self.get_dof:
@@ -408,11 +425,14 @@ class DFASequencePlanner(SequencePlanner):
 
                 # Next frontier: up to max_frontier feasible children from this batch.
                 # If none were feasible, leave the frontier empty so the next iteration
-                # backtracks via the tree scan.
-                self.frontier = feasible_children[:max_frontier]
+                # backtracks via the tree scan. Subclasses may override
+                # _select_next_frontier to rank candidates by a quality score.
+                self.frontier = self._select_next_frontier(tree, feasible_children, max_frontier)
+
+                self._iter_timings.append((iter_idx, len(live), len(received), time() - iter_start))
 
                 if debug > 1:
-                    print(f'[DFA.plan] elapsed: {time() - self.t_start:.1f}s  evals: {self.n_eval}  '
+                    print(f'[DFA.plan] elapsed: {time() - self.t_start:.2f}s  evals: {self.n_eval}  '
                           f'next_frontier={len(self.frontier)}')
                     self.plot_tree(tree, save_path=log_dir + f'/dfa_tree_eval{self.n_eval}.png' if log_dir is not None else None)
 

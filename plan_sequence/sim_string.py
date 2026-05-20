@@ -34,7 +34,7 @@ def _get_color(index, alpha=1.0):
     colors = np.array(colors) / 255.0
     return colors[int(index) % 5]
 
-def _get_colors(part_ids, normalize=True, scheme='default'):
+def _get_colors(part_ids, parts_moving=None, normalize=True, scheme='default', emphasize_moving=True):
     color_map = {}
 
     if scheme=="original" or (scheme=="default" and len(part_ids) <= 5):
@@ -74,8 +74,25 @@ def _get_colors(part_ids, normalize=True, scheme='default'):
         sorted_rgb = sorted(filtered_rgb, key=lambda x: x.count(128)) # Have most extreme colors (like 255 0 0) be at the top
         colors = [[r, g, b, int(settings.opacity * 255)] for r, g, b in sorted_rgb]
 
+    max_val = 1.0 if normalize else 255
+    gray = np.array([0.5, 0.5, 0.5]) * max_val
+    bleak_blend = 0.85  # how strongly non-moving parts are pulled toward gray
+    boost = 1.08  # slight saturation boost for moving parts
+
     for i, part_id in enumerate(part_ids):
-        color_map[part_id] = colors[i % len(colors)]
+        color = np.array(colors[i % len(colors)], dtype=float).copy()
+        if emphasize_moving and parts_moving is not None:
+            rgb = color[:3]
+            if part_id in parts_moving:
+                mean = rgb.mean()
+                rgb = mean + (rgb - mean) * boost
+                rgb = np.clip(rgb, 0, max_val)
+            else:
+                rgb = rgb * (1 - bleak_blend) + gray * bleak_blend
+            color[:3] = rgb
+        if not normalize:
+            color = color.astype(int)
+        color_map[part_id] = color
     return color_map
 
 def _get_fixed_color():
@@ -84,7 +101,7 @@ def _get_fixed_color():
 
 def get_body_color_dict(parts_fix, parts_free): # parts_free = parts_rest - parts_fix + [part_move]
     body_color_dict = {}
-    colors = _get_colors([*parts_fix, *parts_free])
+    colors = _get_colors(parts_fix, parts_free)
     for part_id in [*parts_fix, *parts_free]:
         if part_id in parts_free:
             color = colors[part_id][:3]
@@ -187,7 +204,9 @@ def get_path_sim_string(assembly_dir, parts_fix, part_move, parts_removed=[], sa
 
     sdf_args = 'load_sdf="true" save_sdf="true"' if save_sdf else ''
     string = _get_path_sim_substring()
-    colors = _get_colors([part_move, *parts_fix, *parts_removed])
+    # part_move must be in the id list so its colour is generated; parts_moving
+    # must be a list/set so the `in` check is membership rather than substring.
+    colors = _get_colors([part_move, *parts_fix, *parts_removed], [part_move])
     for part_id in [part_move, *parts_fix, *parts_removed]:
 
         if part_id in parts_removed:
@@ -269,7 +288,7 @@ def get_stability_sim_string(assembly_dir, parts_fix, parts_move, gravity=True, 
     sdf_args = 'load_sdf="true" save_sdf="true"' if save_sdf else ''
     string = _get_stablility_sim_substring(gravity=gravity)
 
-    colors = _get_colors([*parts_fix, *parts_move])
+    colors = _get_colors(parts_fix, parts_move)
     for part_id in [*parts_fix, *parts_move]:
         if part_id in parts_fix:
             joint_type = 'fixed'

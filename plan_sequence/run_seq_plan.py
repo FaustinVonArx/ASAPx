@@ -35,6 +35,56 @@ def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc,
 
         stats = planner.get_stats(tree)
 
+        # Integrated sequence selection + divide-optimizer split probe.
+        # The chosen sequence replaces stats['sequence']; the split is purely
+        # diagnostic (printed when debug > 0). See BaseSequenceOptimizer.
+        if stats.get('success'):
+            from plan_sequence.optimizer.base import BaseSequenceOptimizer
+            from plan_sequence.optimizer.divide import DivideOptimizer
+
+            opt = BaseSequenceOptimizer(tree)
+
+            # Best-effort divide optimizer on the full assembly graph.
+            div = None
+            try:
+                div = DivideOptimizer(tree, asset_folder=asset_folder, assembly_dir=assembly_dir)
+                if div.build_obstruction_graph() is None:
+                    div = None
+                else:
+                    div.find_locally_free_subassemblies(timeout=100)
+                    div.verify_locally_free(top_k=10, num_proc=num_proc)
+            except Exception as _e:
+                print(f'[seq_plan] divide optimizer error: {_e}')
+                div = None
+
+            # Per-edge scoring closure if the planner exposes one.
+            _score_fn = None
+            if hasattr(planner, '_score_child') and hasattr(planner, '_load_weights'):
+                _weights = planner._load_weights()
+                _planner = planner
+                def _score_fn(G_prime, sim_info, parent_G,
+                              _p=_planner, _w=_weights):
+                    return _p._score_child(_w, G_prime, sim_info, parent_G)
+
+            try:
+                import settings as _user_settings
+                _threshold = float(getattr(_user_settings, 'divide_split_threshold', 0.1))
+            except ImportError:
+                _threshold = 0.1
+
+            chosen_sequence = opt.optimize_scored(
+                score_fn=_score_fn, divide_optimizer=div,
+                threshold=_threshold, debug=debug,
+            )
+            if chosen_sequence is not None:
+                if debug > 0 and div is not None:
+                    print(f'[seq_plan] divide optimizer found {len(div.locally_free)} locally free subassemblies:')
+                    for idx, entry in enumerate(div.locally_free):
+                        S, R, score = entry[0], entry[1], entry[2]
+                        print(f'  {idx+1}. S={sorted(S)}  R={sorted(R)}  score={score:.4f}  '
+                              f'{"ACCEPTED" if score >= _threshold else "rejected"}')
+                stats['sequence'] = list(chosen_sequence)
+
         if log_dir is not None:
             planner.log(tree, stats, log_dir)
             with open(os.path.join(log_dir, 'setup.json'), 'w') as fp:

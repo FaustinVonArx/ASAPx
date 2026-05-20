@@ -179,13 +179,13 @@ def check_stable_noforce(asset_folder, assembly_dir, parts, save_sdf=False, time
     return success, G
 
 
-def check_stable(asset_folder, assembly_dir, parts_fix, parts_move, pose=None, save_sdf=False, timeout=None, allow_gap=False, debug=0, render=False):
+def check_stable(asset_folder, assembly_dir, parts_fix, parts_move, pose=None, save_sdf=False, timeout=None, allow_gap=False, debug=0, render=False, record_path=None):
     '''
     Check if gravitationally stable for a given fixed part
     '''
     planner = MultiPartStabilityPlanner(asset_folder, assembly_dir, parts_fix, parts_move, pose=pose, save_sdf=save_sdf, allow_gap=allow_gap)
 
-    success, parts_fall = planner.check_success(timeout=timeout)
+    success, parts_fall = planner.check_success(timeout=timeout, record_path=record_path)
     if debug > 0:
         print(f'[check_stable] success: {success}, parts_fall: {parts_fall}, parts_fix: {parts_fix}, parts_move: {parts_move}')
         if render:
@@ -194,7 +194,7 @@ def check_stable(asset_folder, assembly_dir, parts_fix, parts_move, pose=None, s
     return success, parts_fall
 
 
-def get_stable_plan_1pose_serial(asset_folder, assembly_dir, parts, base_part, pose, max_fix=None, save_sdf=False, timeout=None, allow_gap=False, debug=0, render=False, return_count=False):
+def get_stable_plan_1pose_serial(asset_folder, assembly_dir, parts, base_part, pose, max_fix=None, save_sdf=False, timeout=None, allow_gap=False, debug=0, render=False, return_count=False, log_dir=None, step_label=None):
     '''
     Get all gravitationally stable plans given 1 pose through serial greedy search
     '''
@@ -203,7 +203,7 @@ def get_stable_plan_1pose_serial(asset_folder, assembly_dir, parts, base_part, p
 
     max_fix = len(parts) if max_fix is None else min(max_fix, len(parts))
     parts_fix = [] if base_part is None else [base_part]
-    
+
     while True:
 
         parts_move = parts.copy()
@@ -219,7 +219,12 @@ def get_stable_plan_1pose_serial(asset_folder, assembly_dir, parts, base_part, p
                     return None
             t_start = time()
 
-        success, parts_fall = check_stable(asset_folder, assembly_dir, parts_fix, parts_move, pose, save_sdf, timeout, allow_gap, debug, render)
+        if log_dir is not None and step_label is not None:
+            record_path = os.path.join(log_dir, 'stability_debug', f'{step_label}_fix{len(parts_fix)}.gif')
+        else:
+            record_path = None
+
+        success, parts_fall = check_stable(asset_folder, assembly_dir, parts_fix, parts_move, pose, save_sdf, timeout, allow_gap, debug, render, record_path=record_path)
         count += 1
 
         if debug > 0:

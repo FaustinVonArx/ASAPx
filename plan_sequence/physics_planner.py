@@ -36,9 +36,9 @@ COL_TH_PATH = 0.01
 COL_TH_STABLE = 0.00
 MIN_SEP = 0.5
 DEBUG_SIM = False
+DEBUG_STABILITY = True
 
-DOF_NUM_STEPS = 50
-DOF_RETURN_EPS = 1e-3
+DOF_MAX_TIME = 5.0  # per-direction probe timeout (s); shorter than path-planner's MAX_TIME
 
 
 class State:
@@ -164,19 +164,18 @@ class MultiPartPathPlanner:
         else:
             return True
 
-    def compute_dof(self, num_steps=DOF_NUM_STEPS, return_eps=DOF_RETURN_EPS):
+    def compute_dof(self, max_time=DOF_MAX_TIME):
         '''
-        Probe each of 6 assembly-local axis-aligned directions to estimate
-        translational DoFs. Local directions are rotated by self.pose[:3,:3]
-        before being applied, so the returned 6-vector is pose-invariant.
-        For each direction, apply a constant force for up to num_steps single
-        forward steps, stopping early when qdotdot drops below 0.01 * force_mag.
-        DoF[i] = 1 if the trajectory never returned within return_eps of an
-        earlier visited position; else 0.
+        Probe each of 6 assembly-local axis-aligned directions using the same
+        logic as check_success: run frame_skip forward steps per chunk, repeat
+        until the part is fully disassembled from its neighbours (DoF=1) or
+        qdotdot drops below 0.01*force_mag / times out (DoF=0).
+        Local directions are rotated by self.pose[:3,:3] before being applied
+        so the returned 6-vector is pose-invariant.
         Returns a length-6 numpy int array in local-frame order
         [+Z, -Z, +X, -X, +Y, -Y].
         '''
-        t_start = time()
+        t_start_all = time()
         local_directions = [
             np.array([0, 0, 1]),
             np.array([0, 0, -1]),
@@ -188,30 +187,43 @@ class MultiPartPathPlanner:
         R = self.pose[:3, :3] if self.pose is not None else np.eye(3)
         directions = [R @ d for d in local_directions]
         dof = np.zeros(6, dtype=int)
+
         for i, direction in enumerate(directions):
             self.sim.reset()
             self.apply_action(direction)
-            init_state = self.get_state()
-            positions = [init_state.q[:3].copy()]
-            prev_qdot = init_state.qdot[:3].copy()
-            for _ in range(num_steps):
-                self.sim.forward(1, verbose=False)
+            t_probe = time()
+            free = False
+
+            while True:
+                self.set_state(self.get_state())
+                state = self.get_state()
+                last_qdot = state.qdot[:3]
+
+                timed_out = False
+                for _ in range(self.frame_skip):
+                    self.sim.forward(1, verbose=False)
+                    if time() - t_probe > max_time:
+                        timed_out = True
+                        break
+
+                if timed_out:
+                    break
+
+                if self.is_disassembled():
+                    free = True
+                    break
+
                 new_state = self.get_state()
-                positions.append(new_state.q[:3].copy())
-                cur_qdot = new_state.qdot[:3].copy()
-                qdotdot = (cur_qdot - prev_qdot) / self.sim.options.h
-                prev_qdot = cur_qdot
+                qdot = new_state.qdot[:3]
+                qdotdot = (qdot - last_qdot) / self.sim.options.h / self.frame_skip
                 if np.linalg.norm(qdotdot) < 0.01 * self.force_mag:
                     break
-            final_pos = positions[-1]
-            returned = any(
-                np.linalg.norm(final_pos - prev_pos) < return_eps
-                for prev_pos in positions[:-1]
-            )
-            dof[i] = 0 if returned else 1
+
+            dof[i] = 1 if free else 0
+
         self.sim.reset()
-        elapsed = time() - t_start
-        print(f'[compute_dof] elapsed: {elapsed:.3f}s  dof: {dof.tolist()}')
+        elapsed = time() - t_start_all
+        #print(f'[compute_dof] elapsed: {elapsed:.3f}s  dof: {dof.tolist()}')
         return dof
 
     def check_tool(self, tools, asset_folder_bfs=None, output_dir=None, show=False, verbose=False):
@@ -462,10 +474,12 @@ class MultiPartStabilityPlanner:
         self.parts_move = parts_move.copy()
         self.allow_gap = allow_gap
 
-    def check_success(self, max_step=MAX_STEP, timeout=None, progress=False, progress_desc='stability'):
+    def check_success(self, max_step=MAX_STEP, timeout=None, progress=False, progress_desc='stability', record_path=None):
 
         t_start = time()
 
+        if DEBUG_STABILITY:
+            print(f'[MultiPartStabilityPlanner] checking stability for parts_move={self.parts_move} with parts_fix={self.parts_fix}')
         # initialize sim and stability checker
         self.sim.reset()
         checker = StabilityChecker(self.allow_gap)
@@ -487,19 +501,25 @@ class MultiPartStabilityPlanner:
             self.sim.forward(1, verbose=DEBUG_SIM)
             checker.update_status()
 
+            if DEBUG_STABILITY:
+                print(f'[MultiPartStabilityPlanner] step {i}  parts_move: {self.parts_move}  parts_fix: {self.parts_fix}')
             if (i + 1) % CHECK_FREQ == 0:
                 # check fallen parts
                 parts_fall = checker.check_fallen_parts()
                 if len(parts_fall) > 0:
-                    # checker.plot_his()
-                    # self.render()
+                    if DEBUG_STABILITY and record_path is not None:
+                        print(f'[MultiPartStabilityPlanner] fallen parts: {parts_fall} at step {i}')
+                        os.makedirs(os.path.dirname(record_path), exist_ok=True)
+                        self.render(record_path=record_path)
                     return False, parts_fall
 
             if timeout is not None and time() - t_start > timeout:
                 return False, None
 
-        # checker.plot_his()
-        # self.render()
+        if DEBUG_STABILITY and record_path is not None:
+            print(f'[MultiPartStabilityPlanner] stable for {max_step} steps')
+            os.makedirs(os.path.dirname(record_path), exist_ok=True)
+            self.render(record_path=record_path)
 
         return True, None
 

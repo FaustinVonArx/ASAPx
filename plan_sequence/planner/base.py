@@ -166,7 +166,7 @@ class SequencePlanner:
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-    def _simulate(self, part_move, parts_rest, parts_removed, pose, max_grippers, timeout=None, grasp_planner=None, optimizer='L-BFGS-B', debug=0, render=False):
+    def _simulate(self, part_move, parts_rest, parts_removed, pose, max_grippers, timeout=None, grasp_planner=None, optimizer='L-BFGS-B', debug=0, render=False, log_dir=None):
         assert len(parts_rest) > 0
         _t0 = time()
         if self.get_dof:
@@ -182,8 +182,9 @@ class SequencePlanner:
         if debug > 0:
             print(f'[planner._simulate] path_finding: {_dt_path:.3f}s  found={action is not None}')
 
-        if action is not None and _below_ground_after_disassembly(self.assembly_dir, part_move, pose, path):
-            action = None
+        #NOTE when on, a theoretically feasible policy might not be found
+        #if action is not None and _below_ground_after_disassembly(self.assembly_dir, part_move, pose, path):
+        #    action = None
 
         if action is None:
             parts_fix_list = None
@@ -193,7 +194,8 @@ class SequencePlanner:
         else:
             max_fix = max_grippers - 1 if max_grippers is not None else None
             _t0 = time()
-            parts_fix_list = get_stable_plan_1pose_serial(self.asset_folder, self.assembly_dir, parts_rest, self.base_part, pose=pose, max_fix=max_fix, save_sdf=self.save_sdf, timeout=timeout, debug=debug, render=render)
+            step_label = f'part{part_move}_eval{self.n_eval}' if log_dir is not None else None
+            parts_fix_list = get_stable_plan_1pose_serial(self.asset_folder, self.assembly_dir, parts_rest, self.base_part, pose=pose, max_fix=max_fix, save_sdf=self.save_sdf, timeout=timeout, debug=debug, render=render, log_dir=log_dir, step_label=step_label)
             _dt_stab = time() - _t0
             self._timing['stability_check'] += _dt_stab
             self._timing_counts['stability_check'] += 1
@@ -389,8 +391,8 @@ class SequencePlanner:
                         if sim_timeout is not None and sim_timeout < 0:
                             break
 
-                        sim_info = self._simulate(p, G_prime, parts_removed, pose, max_grippers=max_grippers, timeout=sim_timeout, 
-                            grasp_planner=grasp_planner, optimizer=optimizer, debug=debug - 1, render=render)
+                        sim_info = self._simulate(p, G_prime, parts_removed, pose, max_grippers=max_grippers, timeout=sim_timeout,
+                            grasp_planner=grasp_planner, optimizer=optimizer, debug=debug - 1, render=render, log_dir=log_dir)
                         self.n_eval += 1
                         self._update_tree(tree, G, G_prime, self.n_eval, sim_info)
 
@@ -439,15 +441,24 @@ class SequencePlanner:
 
     def _print_timing_summary(self):
         t_total = time() - self.t_start
-        print(f'  timing summary (wall-clock total: {t_total:.1f}s):')
+        print(f'  timing summary (wall-clock total: {t_total:.2f}s):')
         order = ['path_finding', 'stability_check', 'stable_pose', 'grasp_planning']
         for key in order + [k for k in self._timing if k not in order]:
             if key not in self._timing:
                 continue
             t = self._timing[key]
             n = self._timing_counts[key]
-            avg_ms = 1000 * t / n if n > 0 else 0.0
-            print(f'  {key:<20} avg {avg_ms:8.1f}ms  ({n} calls)')
+            avg = t / n if n > 0 else 0.0
+            print(f'  {key:<20} total {t:8.2f}s  avg {avg:7.3f}s  ({n} calls)')
+
+        iter_timings = getattr(self, '_iter_timings', None)
+        if iter_timings:
+            print(f'  per-iteration breakdown ({len(iter_timings)} iterations):')
+            print(f'    {"iter":>4}  {"parents":>7}  {"sims":>5}  {"duration":>9}  {"cum":>8}')
+            cum = 0.0
+            for idx, n_parents, n_received, dt in iter_timings:
+                cum += dt
+                print(f'    {idx:>4}  {n_parents:>7}  {n_received:>5}  {dt:>8.2f}s  {cum:>7.2f}s')
 
     def _reset(self):
         pass
