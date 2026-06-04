@@ -20,6 +20,69 @@ from plan_robot.util_grasp import get_gripper_finger_states, get_gripper_base_na
 from plan_robot.motion_plan_arm import ArmMotionPlanner
 
 
+def _build_static_meshes(assembly_dir, move_id, still_ids, removed_ids, pose, move_delta_T=None):
+    """Return a list of trimesh meshes representing the static environment at
+    one moment in time, in world frame, used for arm-motion collision checks.
+
+    move_delta_T: optional 4x4 relative transform applied to the move part's
+    posed mesh. None => place it at its assembled (pre-disassembly) pose, used
+    by the reach phase. For the retreat phase, the caller passes
+        T_end @ inv(T_start)
+    where T_start / T_end come from `get_transform_matrix_euler(part_path[i][:3], part_path[i][3:])`
+    so the move part rides along to its post-disassembly world pose.
+    """
+    assembly = load_assembly_all_transformed(assembly_dir)
+    pose_arr = np.eye(4) if pose is None else np.asarray(pose, dtype=float)
+    meshes = []
+    for sid in still_ids:
+        if sid not in assembly:
+            continue
+        m = assembly[sid].get('mesh_final')
+        if m is None:
+            continue
+        m = m.copy()
+        m.apply_transform(pose_arr)
+        meshes.append(m)
+    for rid in removed_ids:
+        if rid not in assembly:
+            continue
+        m = assembly[rid].get('mesh_initial')
+        if m is None:
+            continue
+        meshes.append(m.copy())
+    if move_id in assembly:
+        m = assembly[move_id].get('mesh_final')
+        if m is not None:
+            m = m.copy()
+            m.apply_transform(pose_arr)
+            if move_delta_T is not None:
+                m.apply_transform(move_delta_T)
+            meshes.append(m)
+    return meshes
+
+
+def _states_from_arm_path(sim, gripper_type, gripper_scale, arm_chain, arm_path_full,
+                          fixed_part_local, gripper_base_name, finger_open_state):
+    """Build per-frame redmax state vectors for an arm trajectory in which the
+    moving part stays put (its world-frame local state never changes) and the
+    arm/gripper move according to the planned `arm_path_full` (each entry is a
+    full-Q list including the base link at index 0).
+
+    fixed_part_local: the local sim state for the move part, repeated every frame.
+    finger_open_state: the local sim state for the gripper fingers (open ratio
+    matching the reach/retreat phase), repeated every frame.
+
+    Returns a list of np.ndarray states ready to feed sim.set_state_his(...).
+    """
+    states = []
+    for arm_q_full in arm_path_full:
+        gripper_qm = get_gripper_qm_from_arm_q(arm_chain, arm_q_full, gripper_type)
+        gripper_local = sim.get_joint_q_from_qm(gripper_base_name, gripper_qm)
+        arm_active = arm_q_full[1:]  # strip the immutable base link
+        states.append(np.concatenate([fixed_part_local, gripper_local, finger_open_state, arm_active]))
+    return states
+
+
 def arr_to_str(arr):
     return ' '.join([str(x) for x in arr])
 
@@ -308,11 +371,107 @@ def render_path_with_grasp_and_arm(asset_folder, assembly_dir, move_id, still_id
 
     # get arm path
     arm_chain = get_arm_chain(base_pos=arm_pos, base_euler=arm_euler, scale=arm_scale)
-    arm_path_local = get_arm_path_from_gripper_path(gripper_path, gripper_type, arm_chain, arm_q_pre, optimizer) # full
-    arm_path_local = [arm_q[1:] for arm_q in arm_path_local] # active
+    arm_path_full = get_arm_path_from_gripper_path(gripper_path, gripper_type, arm_chain, arm_q_pre, optimizer)  # full
+    arm_path_local = [arm_q[1:] for arm_q in arm_path_full]  # active
 
-    # set state history
-    states = [np.concatenate([part_state, gripper_state, finger_state, arm_state]) for part_state, gripper_state, finger_state, arm_state in zip(part_path_local, gripper_path_local, finger_path_local, arm_path_local)]
+    # Disassembly-phase states (existing behavior).
+    states_disassembly = [
+        np.concatenate([part_state, gripper_state, finger_state, arm_state])
+        for part_state, gripper_state, finger_state, arm_state
+        in zip(part_path_local, gripper_path_local, finger_path_local, arm_path_local)
+    ]
+
+    # Reach + retreat: plan collision-free arm trajectories in joint space via
+    # RRT-Connect. The reach trajectory takes the arm from rest_q to arm_q_pre
+    # with the gripper open and no part held. The retreat trajectory takes it
+    # from the final disassembly arm_q back to rest_q, again with no part held;
+    # the just-removed part stays parked at its post-disassembly pose so it's
+    # part of the collision environment.
+    #
+    # Both phases are best-effort: if RRT fails (collision at start/goal, no
+    # connection within the iteration budget, or any backend error) we silently
+    # skip that phase and fall back to rendering only the disassembly motion.
+    rest_q_active = list(get_default_arm_rest_q())  # 7-element active
+    arm_q_first_full = np.asarray(arm_path_full[0], dtype=float)
+    arm_q_last_full = np.asarray(arm_path_full[-1], dtype=float)
+    arm_q_first_active = arm_q_first_full[1:]
+    arm_q_last_active = arm_q_last_full[1:]
+    finger_open_state = np.concatenate(
+        list(get_gripper_finger_states(gripper_type, 1.0, gripper_scale).values())
+    )
+    part_state_first = part_path_local[0]
+    part_state_last = part_path_local[-1]
+
+    states_reach = []
+    states_retreat = []
+    try:
+        motion_planner = ArmMotionPlanner(
+            base_pos=arm_pos, base_euler=arm_euler,
+            scale=arm_scale, gripper_type=gripper_type,
+        )
+    except Exception as e:
+        print(f'[render_path_with_grasp_and_arm] ArmMotionPlanner init failed: {e}; '
+              f'skipping reach/retreat phases.')
+        motion_planner = None
+
+    if motion_planner is not None:
+        # Reach: rest -> grasp, environment = full assembly with move part at
+        # its starting pose, no part attached to the gripper.
+        try:
+            still_meshes_reach = _build_static_meshes(
+                assembly_dir, move_id, still_ids, removed_ids, pose, move_delta_T=None,
+            )
+            reach_path_full = motion_planner.plan_with_grasp(
+                start=rest_q_active, goal=list(arm_q_first_active),
+                move_mesh=None, move_transform=None,
+                still_meshes=still_meshes_reach, open_ratio=1.0,
+                verbose=False,
+            )
+            if reach_path_full is not None:
+                states_reach = _states_from_arm_path(
+                    sim, gripper_type, gripper_scale, arm_chain, reach_path_full,
+                    fixed_part_local=part_state_first,
+                    gripper_base_name=gripper_base_name,
+                    finger_open_state=finger_open_state,
+                )
+            else:
+                print('[render_path_with_grasp_and_arm] reach RRT returned no path; skipping reach phase.')
+        except Exception as e:
+            print(f'[render_path_with_grasp_and_arm] reach planning failed: {e}; skipping reach phase.')
+
+        # Retreat: grasp_last -> rest, environment = full assembly with move
+        # part parked at its post-disassembly pose, no part attached.
+        try:
+            T_start = get_transform_matrix_euler(part_path[0][:3], part_path[0][3:])
+            T_end = get_transform_matrix_euler(part_path[-1][:3], part_path[-1][3:])
+            move_delta_T = T_end @ np.linalg.inv(T_start)
+            still_meshes_retreat = _build_static_meshes(
+                assembly_dir, move_id, still_ids, removed_ids, pose, move_delta_T=move_delta_T,
+            )
+            retreat_path_full = motion_planner.plan_with_grasp(
+                start=list(arm_q_last_active), goal=rest_q_active,
+                move_mesh=None, move_transform=None,
+                still_meshes=still_meshes_retreat, open_ratio=1.0,
+                verbose=False,
+            )
+            if retreat_path_full is not None:
+                states_retreat = _states_from_arm_path(
+                    sim, gripper_type, gripper_scale, arm_chain, retreat_path_full,
+                    fixed_part_local=part_state_last,
+                    gripper_base_name=gripper_base_name,
+                    finger_open_state=finger_open_state,
+                )
+            else:
+                print('[render_path_with_grasp_and_arm] retreat RRT returned no path; skipping retreat phase.')
+        except Exception as e:
+            print(f'[render_path_with_grasp_and_arm] retreat planning failed: {e}; skipping retreat phase.')
+
+    # Concatenate: reach (gripper opens at grasp), disassembly, retreat. We
+    # don't insert separate finger-closing/opening interpolation frames — the
+    # finger state simply switches between the open and grasp-closed values at
+    # the phase boundaries. Good enough for visualization; if a smoother
+    # transition is wanted later, `get_finger_open_path` is already wired up.
+    states = states_reach + states_disassembly + states_retreat
     if reverse:
         states = states[::-1]
     sim.set_state_his(states, [np.zeros_like(states[0]) for _ in range(len(states))])

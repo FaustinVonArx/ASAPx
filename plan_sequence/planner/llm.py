@@ -115,9 +115,14 @@ class LLMDFASequencePlanner(HeuristicDFASequencePlanner):
             sample = _random.sample(feasible_children, l)
 
         # Heuristic-best within the SAME sample, logged for offline comparison.
+        # Thread parent_pose so the heuristic's pose_change feature sees the
+        # predecessor's orientation instead of falling back to 0.
         weights = self._load_weights()
-        heuristic_scores = [self._score_child(weights, *t) for t in sample]
-        heuristic_best = max(range(len(sample)), key=lambda i: heuristic_scores[i])
+        parent_pose = self._parent_pose_for(tree, parent_G)
+        heuristic_costs = [
+            self._cost_child(weights, *t, parent_pose=parent_pose) for t in sample
+        ]
+        heuristic_best = min(range(len(sample)), key=lambda i: heuristic_costs[i])
 
         # Resolve cache root under log_dir. Fall back to /tmp when log_dir unset.
         log_dir = getattr(self, 'log_dir', None) or '/tmp/llm_planner'
@@ -190,7 +195,7 @@ class LLMDFASequencePlanner(HeuristicDFASequencePlanner):
         decision = {
             'parent': sorted(map(str, parent_G)),
             'sample_parts': [str(p) for p in candidate_parts],
-            'heuristic_scores': [float(s) for s in heuristic_scores],
+            'heuristic_costs': [float(c) for c in heuristic_costs],
             'heuristic_idx': int(heuristic_best),
             'heuristic_part': str(candidate_parts[heuristic_best]) if candidate_parts else None,
             'llm_idx': int(llm_choice),

@@ -19,7 +19,7 @@ from assets.load import load_part_ids
 from plan_sequence.sim_string import get_body_color_dict
 from plan_sequence.physics_planner import MultiPartPathPlanner, get_body_mass, find_stable_initial_poses
 from plan_sequence.feasibility_check import check_assemblable, get_stable_plan_1pose_parallel, get_stable_plan_1pose_serial, check_tool
-from plan_sequence.stable_pose import get_combined_mesh, get_stable_poses
+from plan_sequence.stable_pose import get_combined_mesh, get_stable_poses, translation_pose_to_ground
 from plan_robot.run_grasp_plan import GraspPlanner
 from plan_robot.run_grasp_arm_plan import GraspArmPlanner
 import settings
@@ -56,15 +56,18 @@ def _simulate_standalone(asset_folder, assembly_dir, save_sdf, base_part,
                           skip_stability=False, ignore_unstable=()):
     """Module-level wrapper around _simulate logic, picklable for use with parallel_execute."""
     _t0 = time()
+    diag_assembly = {}
     if get_dof:
         action, path, dof = check_assemblable(
             asset_folder, assembly_dir, parts_rest, part_move,
             pose=pose, save_sdf=save_sdf, return_path=True, debug=debug, render=render, get_dof=True,
+            diagnostics=diag_assembly,
         )
     else:
         action, path = check_assemblable(
             asset_folder, assembly_dir, parts_rest, part_move,
             pose=pose, save_sdf=save_sdf, return_path=True, debug=debug, render=render,
+            diagnostics=diag_assembly,
         )
         dof = None
     dt_path = time() - _t0
@@ -73,6 +76,7 @@ def _simulate_standalone(asset_folder, assembly_dir, save_sdf, base_part,
         action = None
 
     dt_stab = None
+    diag_stability = {}
     if action is None:
         parts_fix = None
     elif skip_stability:
@@ -86,17 +90,19 @@ def _simulate_standalone(asset_folder, assembly_dir, save_sdf, base_part,
             asset_folder, assembly_dir, parts_rest, base_part,
             pose=pose, max_fix=max_fix, save_sdf=save_sdf,
             timeout=timeout, allow_gap=allow_gap, debug=debug, render=render,
-            ignore_unstable=ignore_unstable,
+            ignore_unstable=ignore_unstable, diagnostics=diag_stability,
         )
         dt_stab = time() - _t0
 
     tool_result = None
     dt_tool = None
+    diag_tool = {}
     if tools and action is not None and parts_fix is not None:
         _t0 = time()
         tool_result = check_tool(
             asset_folder=asset_folder, assembly_dir=assembly_dir,
             parts_fix=parts_rest, part_move=part_move, tools=tools, debug=debug,
+            diagnostics=diag_tool,
         )
         dt_tool = time() - _t0
 
@@ -104,16 +110,21 @@ def _simulate_standalone(asset_folder, assembly_dir, save_sdf, base_part,
     feasible = action is not None and parts_fix is not None and (not tool_required or tool_result is not None)
     if feasible:
         fail_reason = None
+        fail_evidence = None
     elif action is None:
         fail_reason = 'assembly'
+        fail_evidence = diag_assembly or None
     elif parts_fix is None:
         fail_reason = 'stability'
+        fail_evidence = diag_stability or None
     else:
         fail_reason = 'tool'
+        fail_evidence = diag_tool or None
 
     return {
         'feasible': feasible,
         'fail_reason': fail_reason,
+        'fail_evidence': fail_evidence,
         'action': action,
         'base_part': base_part,
         'parts_fix': parts_fix,
@@ -172,15 +183,174 @@ class SequencePlanner:
         np.random.seed(seed)
         torch.manual_seed(seed)
 
+    @staticmethod
+    def _parent_pose_for(tree, parent_G):
+        """Look up the pose used to reach `parent_G` from its tree predecessor.
+        Returns None for the root (no in-edge) or when the in-edge has no
+        stored pose. Lives on the base class so any planner can use it without
+        having to inherit from HeuristicDFASequencePlanner."""
+        if tree is None or parent_G is None:
+            return None
+        key = tuple(parent_G)
+        if not tree.has_node(key):
+            return None
+        for pred in tree.predecessors(key):
+            sim_info = tree.edges[pred, key].get('sim_info', {})
+            return sim_info.get('pose')
+        return None
+
+    @staticmethod
+    def _rotation_angle_between(pose_a, pose_b):
+        """Angular distance in radians between the rotation blocks of two
+        4x4 SE(3) poses. Returns +inf when either pose is missing or non-
+        conformable, so callers using this as a sort key naturally push
+        bad / None poses to the end."""
+        if pose_a is None or pose_b is None:
+            return float('inf')
+        try:
+            Ra = np.asarray(pose_a, dtype=float)[:3, :3]
+            Rb = np.asarray(pose_b, dtype=float)[:3, :3]
+            R_diff = Ra.T @ Rb
+            trace = float(np.trace(R_diff))
+            cos_theta = max(-1.0, min(1.0, (trace - 1.0) / 2.0))
+            return float(np.arccos(cos_theta))
+        except (ValueError, TypeError):
+            return float('inf')
+
+    @staticmethod
+    def _sort_poses_by_proximity(poses, ref_pose):
+        """Return poses ordered by ascending rotation-angle distance to
+        ref_pose. When ref_pose is None or poses is empty, returns a shallow
+        copy unchanged so the trimesh probability ordering is preserved."""
+        if ref_pose is None or not poses:
+            return list(poses)
+        return sorted(
+            poses,
+            key=lambda p: SequencePlanner._rotation_angle_between(ref_pose, p),
+        )
+
+    def _pick_initial_pose_interactive(self, parts, initial_poses, log_dir=None,
+                                       fallback_candidates=None, per_pose=None):
+        """When settings.interactive_initial_pose is True, render every
+        candidate initial pose, list them to stdin, and ask the user to pick
+        one as the assembly's starting orientation. Returns a single-element
+        list when the user picks, or the original verified-pose list when the
+        user skips / runs in a non-interactive shell / the flag is off.
+
+        fallback_candidates: optional broader list (typically the unverified
+        trimesh stable poses for the full assembly). When the verified
+        `initial_poses` has fewer than 2 entries (e.g. the gravity precheck
+        with no_stable_pose_action='continue' rejected most candidates), the
+        picker falls back to this list so the user still has options to
+        compare. Without this fallback the flag would silently do nothing
+        whenever the precheck filter is aggressive.
+
+        per_pose: optional list of {'pose_idx', 'pose', 'success', 'fallen'}
+        from `find_stable_initial_poses`. When the picker is off, the
+        non-interactive auto-pick uses this to pick the single pose with the
+        fewest falling parts; ties are broken by pose_idx (trimesh's own
+        highest-probability ordering). Without per_pose the function keeps
+        the legacy "return initial_poses unchanged" behavior (used by the
+        'skip' branch where no gravity check ran).
+        """
+        if not getattr(settings, 'interactive_initial_pose', False):
+            return self._auto_pick_initial_pose(initial_poses, per_pose)
+        interactive = bool(getattr(sys.stdin, 'isatty', lambda: False)())
+        if not interactive:
+            if len(initial_poses) > 1:
+                print('[init_pose] non-interactive shell; auto-picking by fewest-fallen + trimesh probability.')
+            return self._auto_pick_initial_pose(initial_poses, per_pose)
+
+        # Build the candidate set shown to the user. Prefer the verified
+        # initial_poses; if too few, augment with the unverified fallback so
+        # the user always has a meaningful set to choose from.
+        candidates = list(initial_poses)
+        fallback = list(fallback_candidates) if fallback_candidates else []
+        augmented = False
+        if len(candidates) < 2 and len(fallback) > len(candidates):
+            if len(candidates) == 0:
+                print(f'[init_pose] precheck found no self-stable initial pose; '
+                      f'offering {len(fallback)} unverified trimesh candidate(s) '
+                      f'so the picker still has something to show.')
+            else:
+                print(f'[init_pose] precheck verified only {len(candidates)} pose(s); '
+                      f'augmenting with {len(fallback) - len(candidates)} unverified '
+                      f'trimesh candidate(s) for the picker.')
+            candidates = list(fallback)
+            augmented = True
+
+        if not candidates:
+            print('[init_pose] no candidate poses available; nothing to pick from.')
+            return initial_poses
+
+        from plan_sequence.planner._renders import render_part_in_context
+        from pathlib import Path as _Path
+
+        cache_base = _Path(log_dir) if log_dir else _Path('/tmp/init_pose_renders')
+        cache_dir = cache_base / 'initial_pose_renders'
+
+        print('\n' + '=' * 70)
+        label = 'candidate' if len(candidates) == 1 else 'candidates'
+        marker = ' (unverified — gravity precheck filtered)' if augmented else ''
+        print(f'[init_pose] choose initial stable pose ({len(candidates)} {label}){marker}:')
+        for i, pose in enumerate(candidates):
+            try:
+                png = render_part_in_context(
+                    self.assembly_dir, list(parts), None,
+                    cache_dir=str(cache_dir), size=(512, 512), pose=pose,
+                )
+            except Exception as e:
+                png = f'(render failed: {e})'
+            print(f'  [{i}] {png}')
+
+        try:
+            raw = input('[init_pose] pick index (Enter to use [0]): ').strip()
+        except EOFError:
+            print('[init_pose] EOF; using [0].')
+            return [candidates[0]]
+        if raw == '':
+            print('[init_pose] using pose [0].')
+            return [candidates[0]]
+        try:
+            idx = int(raw)
+        except ValueError:
+            print(f'[init_pose] invalid input {raw!r}; using [0].')
+            return [candidates[0]]
+        if not (0 <= idx < len(candidates)):
+            print(f'[init_pose] index {idx} out of range; using [0].')
+            return [candidates[0]]
+        print(f'[init_pose] using pose [{idx}].')
+        return [candidates[idx]]
+
+    def _auto_pick_initial_pose(self, initial_poses, per_pose):
+        """Non-interactive single-pose pick when settings.interactive_initial_pose
+        is off (or stdin is not a tty). Selects the candidate with the fewest
+        falling parts; ties are broken by trimesh's own probability ordering
+        (lower pose_idx = higher prob). Falls back to `initial_poses`
+        unchanged when `per_pose` is unavailable (e.g. the 'skip' branch
+        skipped the gravity check entirely)."""
+        if not per_pose:
+            return initial_poses
+        # Sort by (fallen_count, pose_idx). Success poses (empty fallen) come first,
+        # then those with the least falling, with trimesh-probability as tiebreaker.
+        ranked = sorted(per_pose, key=lambda e: (len(e.get('fallen') or []), e['pose_idx']))
+        best = ranked[0]
+        n_fallen = len(best.get('fallen') or [])
+        marker = 'verified-stable' if best['success'] else f'{n_fallen} fallen'
+        print(f"[init_pose] auto-picked pose [{best['pose_idx']}] "
+              f"({marker}; trimesh rank {best['pose_idx']} of {len(per_pose)}).")
+        return [best['pose']]
+
     def _simulate(self, part_move, parts_rest, parts_removed, pose, max_grippers, timeout=None, grasp_planner=None, optimizer='L-BFGS-B', debug=0, render=False, log_dir=None):
         assert len(parts_rest) > 0
         _t0 = time()
+        diag_assembly = {}
         if self.get_dof:
             action, path, dof = check_assemblable(self.asset_folder, self.assembly_dir, parts_rest, part_move, pose=pose, save_sdf=self.save_sdf,
-                return_path=True, debug=debug, render=render, get_dof=True)
+                return_path=True, debug=debug, render=render, get_dof=True, diagnostics=diag_assembly)
         else:
             action, path = check_assemblable(self.asset_folder, self.assembly_dir, parts_rest, part_move, pose=pose, save_sdf=self.save_sdf,
-                return_path=True, debug=debug, render=render)
+                return_path=True, debug=debug, render=render, diagnostics=diag_assembly)
             dof = None
         _dt_path = time() - _t0
         self._timing['path_finding'] += _dt_path
@@ -192,6 +362,7 @@ class SequencePlanner:
         if action is not None and settings.filter_below_ground and _below_ground_after_disassembly(self.assembly_dir, part_move, pose, path):
             action = None
 
+        diag_stability = {}
         if action is None:
             parts_fix_list = None
         elif self.skip_stability:
@@ -201,7 +372,7 @@ class SequencePlanner:
             max_fix = max_grippers - 1 if max_grippers is not None else None
             _t0 = time()
             step_label = f'part{part_move}_eval{self.n_eval}' if log_dir is not None else None
-            parts_fix_list = get_stable_plan_1pose_serial(self.asset_folder, self.assembly_dir, parts_rest, self.base_part, pose=pose, max_fix=max_fix, save_sdf=self.save_sdf, timeout=timeout, debug=debug, render=render, log_dir=log_dir, step_label=step_label, ignore_unstable=self._ignored_unstable_parts)
+            parts_fix_list = get_stable_plan_1pose_serial(self.asset_folder, self.assembly_dir, parts_rest, self.base_part, pose=pose, max_fix=max_fix, save_sdf=self.save_sdf, timeout=timeout, debug=debug, render=render, log_dir=log_dir, step_label=step_label, ignore_unstable=self._ignored_unstable_parts, diagnostics=diag_stability)
             _dt_stab = time() - _t0
             self._timing['stability_check'] += _dt_stab
             self._timing_counts['stability_check'] += 1
@@ -233,11 +404,13 @@ class SequencePlanner:
             grasps = None
 
         tool_result = None
+        diag_tool = {}
         if feasible and self.tools:
             _t0 = time()
             tool_result = check_tool(
                 asset_folder=self.asset_folder, assembly_dir=self.assembly_dir,
                 parts_fix=parts_rest, part_move=part_move, tools=self.tools, debug=debug,
+                diagnostics=diag_tool,
             )
             self._timing['tool_check'] += time() - _t0
             self._timing_counts['tool_check'] += 1
@@ -246,18 +419,24 @@ class SequencePlanner:
 
         if feasible:
             fail_reason = None
+            fail_evidence = None
         elif action is None:
             fail_reason = 'assembly'
+            fail_evidence = diag_assembly or None
         elif parts_fix is None:
             fail_reason = 'stability'
+            fail_evidence = diag_stability or None
         elif self.tools and tool_result is None:
             fail_reason = 'tool'
+            fail_evidence = diag_tool or None
         else:
             fail_reason = 'grasp'
+            fail_evidence = None
 
         sim_info = {
             'feasible': feasible,
             'fail_reason': fail_reason,
+            'fail_evidence': fail_evidence,
             'action': action,
             'base_part': self.base_part,
             'parts_fix': parts_fix,
@@ -337,11 +516,68 @@ class SequencePlanner:
         self.n_eval = 0
         G0 = self.parts.copy()
         tree = nx.DiGraph()
-        initial_poses, observed_fallen = self._initial_stable_poses(G0, max_poses, log_dir=log_dir)
+        action = getattr(settings, 'no_stable_pose_action', 'exit')
+        # Compute the unverified trimesh stable-pose candidate set once. Used
+        # directly as the seed in the 'skip' branch, AND as a fallback for the
+        # interactive picker on the non-'skip' branches when the gravity
+        # precheck rejects most/all candidates (otherwise the picker has
+        # nothing to show and silently no-ops).
+        G0_mesh = get_combined_mesh(self.assembly_dir, G0)
+        trimesh_candidates = get_stable_poses(G0_mesh, max_num=max_poses)
+        _per_pose = None
+        if action == 'skip' and self.base_part is None:
+            initial_poses = list(trimesh_candidates)
+            if not initial_poses:
+                initial_poses = [translation_pose_to_ground(G0_mesh)]
+                print("[planner.base.plan] no trimesh stable pose for full assembly; "
+                      "using translation-only ground-lift fallback "
+                      "(settings.no_stable_pose_action='skip')")
+            else:
+                print(f"[planner.base.plan] skipping initial stable-pose gravity check "
+                      f"(settings.no_stable_pose_action='skip'); seeded {len(initial_poses)} "
+                      f"trimesh stable pose(s) on root node")
+            observed_fallen = frozenset()
+        else:
+            initial_poses, observed_fallen, _per_pose = self._initial_stable_poses(G0, max_poses, log_dir=log_dir)
+            # When the precheck rejected every candidate AND observed parts
+            # falling, render one PNG per attempted pose (precheck_unstable_<i>.png),
+            # each rendered in that pose's orientation with that pose's fallen
+            # parts highlighted. Single-file overwrite was hiding the fact that
+            # the CLI reported per-pose fallen sets but only one image was
+            # surfacing. Gated by render_sequence so a global render-off run
+            # doesn't produce the diagnostic PNGs either; the textual ID list
+            # still prints so the user knows which parts fell.
+            if not initial_poses and observed_fallen:
+                print(f"[planner.base.plan] precheck observed {len(observed_fallen)} "
+                      f"part(s) falling: {sorted(observed_fallen)}")
+                if getattr(settings, 'render_sequence', True):
+                    from plan_sequence.planner._renders import render_unstable_parts
+                    from pathlib import Path as _Path
+                    _save_dir = _Path(log_dir) if log_dir else _Path('/tmp')
+                    for _entry in _per_pose:
+                        if _entry['success'] or not _entry['fallen']:
+                            continue
+                        _idx = _entry['pose_idx']
+                        _png = render_unstable_parts(
+                            self.assembly_dir, G0, _entry['fallen'],
+                            save_path=_save_dir / f'precheck_unstable_{_idx:02d}.png',
+                            pose=_entry['pose'],
+                        )
+                        if _png is not None:
+                            print(f"[planner.base.plan] unstable-parts visualisation pose "
+                                  f"{_idx}: {_png}  (fallen={_entry['fallen']})")
+        # When settings.interactive_initial_pose is True (and we're on a tty),
+        # let the user pick which stable pose seeds the search. The fallback
+        # list ensures the picker has options to show even when the gravity
+        # precheck filtered everything out under 'continue' / 'ignore_unstable'.
+        initial_poses = self._pick_initial_pose_interactive(
+            G0, initial_poses, log_dir=log_dir,
+            fallback_candidates=trimesh_candidates,
+            per_pose=_per_pose,
+        )
         tree.add_node(tuple(G0), n_eval=0, n_gripper=1, poses=initial_poses)
 
-        if self.base_part is None and not initial_poses:
-            action = getattr(settings, 'no_stable_pose_action', 'exit')
+        if self.base_part is None and not initial_poses and action != 'skip':
             if action == 'exit':
                 self.stop_msg = 'no self-stable initial pose'
                 print('[planner.base.plan] aborting: no self-stable initial pose found '
@@ -392,14 +628,29 @@ class SequencePlanner:
                     poses = tree.nodes[tuple(G)]['poses'][:pose_reuse]
                     G_mesh = get_combined_mesh(self.assembly_dir, G)
                     _t0 = time()
-                    poses.extend(get_stable_poses(G_mesh, max_num=max_poses - pose_reuse))
+                    fresh = get_stable_poses(G_mesh, max_num=max_poses - pose_reuse)
                     _dt_pose = time() - _t0
                     self._timing['stable_pose'] += _dt_pose
                     self._timing_counts['stable_pose'] += 1
+                    # Default behaviour: when multiple stable poses exist for
+                    # this subassembly, prefer the one closest (by rotation
+                    # angle) to the previous step's pose. Keeps the operator
+                    # from re-orienting the assembly when an equivalent pose
+                    # is available. When no parent pose is known (root, or
+                    # first-time visit before any feasible edge) the trimesh
+                    # probability ordering is preserved.
+                    parent_pose = self._parent_pose_for(tree, G)
+                    if parent_pose is not None and len(fresh) > 1:
+                        fresh = self._sort_poses_by_proximity(fresh, parent_pose)
+                    poses.extend(fresh)
                     if debug > 1:
                         print(f'[planner.base.plan] stable_pose: {_dt_pose:.3f}s  n_poses={len(poses)}')
                     if len(poses) == 0:
-                        poses = [None]
+                        # Deterministic ground-lift fallback so parts never clip
+                        # the ground when trimesh can't find a stable pose for
+                        # this subassembly. Replaces the previous `[None]`
+                        # (which left the assembly straddling z=0).
+                        poses = [translation_pose_to_ground(G_mesh)]
 
                 for p in self.seq_generator.generate_candidate_part(G): # NOTE: maybe can specify which parts to exclude
                     G_prime = G.copy()
@@ -494,23 +745,36 @@ class SequencePlanner:
         When `log_dir` is provided, pyvista debug screenshots of each candidate
         pose are written to `<log_dir>/precheck_poses/`.
 
-        Returns (poses, observed_fallen). `observed_fallen` is a frozenset of
-        part IDs that were seen falling in at least one candidate pose check —
-        the caller uses it when settings.no_stable_pose_action == 'ignore_unstable'.
+        Returns (poses, observed_fallen, per_pose).
+          - `observed_fallen` is a frozenset of part IDs that were seen falling
+            in at least one candidate pose check — the caller uses it when
+            settings.no_stable_pose_action == 'ignore_unstable'.
+          - `per_pose` is the per-pose result list from
+            find_stable_initial_poses; used by callers to render one
+            diagnostic image per candidate (precheck_unstable_<i>.png).
         '''
         if self.base_part is not None:
-            return [], frozenset()
+            return [], frozenset(), []
         debug_dir = os.path.join(log_dir, 'precheck_poses') if log_dir is not None else None
-        poses, observed_fallen = find_stable_initial_poses(
+        # settings.debug_stability turns on per-pose gravity-sim replays.
+        # Paths under <log_dir>/precheck_stability/ — produced by reusing the
+        # sim's already-populated state history, so no re-simulation.
+        stability_debug_dir = None
+        if log_dir is not None and getattr(settings, 'debug_stability', False):
+            stability_debug_dir = os.path.join(log_dir, 'precheck_stability')
+            os.makedirs(stability_debug_dir, exist_ok=True)
+            print(f'[planner] precheck stability-debug GIFs will land in {stability_debug_dir}')
+        poses, observed_fallen, per_pose = find_stable_initial_poses(
             self.asset_folder, self.assembly_dir, parts,
             max_poses=max_poses, save_sdf=self.save_sdf, allow_gap=self.allow_gap,
-            num_proc=self.num_proc, first_only=True, debug_dir=debug_dir,
+            num_proc=self.num_proc, first_only=False, debug_dir=debug_dir,
+            stability_debug_dir=stability_debug_dir,
         )
         if not poses:
             print(f'[planner] WARNING: no self-stable initial pose found for full assembly — parts would fall without fixing (observed_fallen={sorted(observed_fallen)})')
         else:
             print(f'[planner] precheck: seeded {len(poses)} self-stable initial pose(s) on root node')
-        return poses, observed_fallen
+        return poses, observed_fallen, per_pose
 
     def wh_select_node(self, tree):
         raise NotImplementedError
@@ -536,17 +800,50 @@ class SequencePlanner:
         for node in node_expand_list:
             part_a, part_b = node
             mass_a, mass_b = self.part_mass[part_a], self.part_mass[part_b]
-            part_fix, part_move = (part_a, part_b) if mass_a > mass_b else (part_b, part_a)
-            if part_move == self.base_part: part_fix, part_move = part_move, part_fix
+            # Primary role assignment: lighter part moves, heavier stays fixed.
+            primary_fix, primary_move = (part_a, part_b) if mass_a > mass_b else (part_b, part_a)
+            # Try both role assignments before giving up. The mass-based pick is
+            # usually right (less inertia on the gripper actuating the move) but
+            # for some geometries the only feasible separation direction is
+            # blocked under the primary assignment (e.g. settings.filter_below_ground
+            # rejects every pose because the lighter part naturally extracts
+            # downward in all stable orientations). Swapping roles is cheap and
+            # catches those cases. Skip the swap when one of the two is the
+            # base_part (it must remain fixed by definition).
+            role_pairs = [(primary_fix, primary_move)]
+            if self.base_part is None:
+                role_pairs.append((primary_move, primary_fix))
+            else:
+                # base_part must be fixed; flip to enforce it if the mass heuristic
+                # chose otherwise. No further swap to try.
+                if primary_move == self.base_part:
+                    role_pairs = [(primary_move, primary_fix)]
+
             parts_removed = [part for part in G0 if part != part_a and part != part_b]
             poses = tree.nodes[tuple(node)]['poses'][:pose_reuse]
-            poses.extend(get_stable_poses(get_combined_mesh(self.assembly_dir, node), max_num=max_poses - pose_reuse))
-            if len(poses) == 0 or self.base_part is not None: poses = [None]
-            for pose in poses:
-                sim_info = self._simulate(part_move, [part_fix], parts_removed, pose=pose, max_grippers=2, grasp_planner=grasp_planner, optimizer=optimizer, debug=debug - 1, render=render)
-                if sim_info['feasible']:
-                    SequencePlanner._update_tree(self, tree, list(node), [part_fix], next_n_eval, sim_info)
-                    next_n_eval += 1
+            node_mesh = get_combined_mesh(self.assembly_dir, node)
+            fresh = get_stable_poses(node_mesh, max_num=max_poses - pose_reuse)
+            # Same proximity-prefer pass as in plan(): when the parent step's
+            # pose is known, order fresh stable poses closest-first.
+            parent_pose = self._parent_pose_for(tree, node)
+            if parent_pose is not None and len(fresh) > 1:
+                fresh = self._sort_poses_by_proximity(fresh, parent_pose)
+            poses.extend(fresh)
+            if self.base_part is not None:
+                poses = [None]
+            elif len(poses) == 0:
+                poses = [translation_pose_to_ground(node_mesh)]
+
+            matched = False
+            for part_fix, part_move in role_pairs:
+                for pose in poses:
+                    sim_info = self._simulate(part_move, [part_fix], parts_removed, pose=pose, max_grippers=2, grasp_planner=grasp_planner, optimizer=optimizer, debug=debug - 1, render=render)
+                    if sim_info['feasible']:
+                        SequencePlanner._update_tree(self, tree, list(node), [part_fix], next_n_eval, sim_info)
+                        next_n_eval += 1
+                        matched = True
+                        break
+                if matched:
                     break
 
     @staticmethod
@@ -617,6 +914,68 @@ class SequencePlanner:
         return sequence
 
     @staticmethod
+    def find_partial_sequence(tree):
+        '''
+        Best-effort sequence for a run that got stuck before fully
+        disassembling. Returns the removal order along the deepest reachable
+        feasible path from the root (the smallest subassembly that was reached
+        through a chain of feasible edges). Returns [] when no feasible edge
+        exists at all (no progress past the root).
+
+        Unlike find_sequence (which requires a size-1 leaf), this accepts any
+        feasible node, so the result may be a prefix of a full sequence.
+        '''
+        # Deepest feasible node = smallest reachable subassembly. Break ties by
+        # fewer grippers, then by earlier discovery (n_eval).
+        best = None
+        for node in tree.nodes:
+            info = tree.nodes[node]
+            if info['n_gripper'] is None:
+                continue
+            if best is None:
+                best = node
+                continue
+            best_info = tree.nodes[best]
+            key = (len(node), info['n_gripper'], info['n_eval'])
+            best_key = (len(best), best_info['n_gripper'], best_info['n_eval'])
+            if key < best_key:
+                best = node
+
+        if best is None or tree.in_degree(best) == 0:
+            return []  # no feasible progress past the root
+
+        # Walk up to the root along feasible edges, collecting removed parts.
+        sequence = []
+        node = best
+        while tree.in_degree(node) > 0:
+            node_info = tree.nodes[node]
+            for parent_node in tree.predecessors(node):
+                parent_info = tree.nodes[parent_node]
+                if parent_info['n_gripper'] is not None and parent_info['n_gripper'] <= node_info['n_gripper']:
+                    part_move = tree.edges[parent_node, node]['sim_info']['part_move']
+                    sequence.insert(0, part_move)
+                    node = parent_node
+                    break
+            else:
+                break  # no feasible parent found (shouldn't happen for a reachable node)
+        return sequence
+
+    @staticmethod
+    def find_deepest_reached_nodes(tree):
+        '''
+        All feasibly-reached nodes (n_gripper is not None) of minimum length,
+        i.e. the deepest reached nodes in the search tree (most parts already
+        disassembled). Returns a list of node tuples (may have >1 entries on
+        ties). Returns [] when no feasible progress past the root exists.
+        '''
+        feasible = [(node, tree.nodes[node]) for node in tree.nodes
+                    if tree.nodes[node].get('n_gripper') is not None]
+        if not feasible:
+            return []
+        min_len = min(len(n) for n, _ in feasible)
+        return [n for n, _ in feasible if len(n) == min_len]
+
+    @staticmethod
     def check_success(tree):
 
         success = False
@@ -645,13 +1004,18 @@ class SequencePlanner:
         success, n_eval, n_gripper = SequencePlanner.check_success(tree)
         if success:
             sequence = SequencePlanner.find_sequence(tree)
+            partial = False
         else:
-            sequence = None
+            # Stuck before full disassembly — return the deepest feasible
+            # prefix so the caller can still report/render partial progress.
+            sequence = SequencePlanner.find_partial_sequence(tree)
+            partial = bool(sequence)
         return {
             'success': success,
+            'partial': partial,
             'n_eval': n_eval,
             'n_gripper': n_gripper,
-            'sequence': [x for x in sequence] if sequence is not None else None,
+            'sequence': [x for x in sequence] if sequence else None,
         }
 
     def log(self, tree, stats, log_dir, plot=False):

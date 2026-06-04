@@ -40,6 +40,20 @@ def get_combined_mesh(assembly_dir, parts=None):
     return mesh
 
 
+def translation_pose_to_ground(mesh):
+    '''
+    Identity-rotation pose whose translation lifts `mesh` so its lowest vertex
+    sits at world z=0. Use as a deterministic fallback when
+    `trimesh.poses.compute_stable_poses` returns nothing for a subassembly —
+    guarantees parts never clip the ground in the canonical orientation.
+    '''
+    pose = np.eye(4)
+    if mesh is not None and len(mesh.vertices) > 0:
+        min_z = float(mesh.vertices.min(axis=0)[2])
+        pose[2, 3] = -min_z
+    return pose
+
+
 def get_stable_poses(mesh, prob_th=0.9, max_num=3, return_prob=False, shift_center=True):
 
     assert max_num >= 0

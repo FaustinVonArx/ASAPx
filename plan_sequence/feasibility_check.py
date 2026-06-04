@@ -29,11 +29,15 @@ def get_R3_actions():
     return actions
 
 def check_tool(asset_folder, assembly_dir, parts_fix, part_move, tools,
-               asset_folder_bfs=None, output_dir=None, show=False, debug=0):
+               asset_folder_bfs=None, output_dir=None, show=False, debug=0,
+               diagnostics=None, failure_record_dir=None):
     '''
     Tool-feasibility wrapper used by sequence planning: check whether any of the
     candidate `tools` can geometrically remove `part_move` from the sub-assembly
     formed by `parts_fix + [part_move]`. Delegates to physics_planner.check_tool.
+
+    diagnostics: optional mutable dict; when supplied, populated with
+        {'subkind': 'collision'|'access'|None, 'colliding_parts': [...], 'tried_tools': [...]}.
 
     Returns:
         dict {'tool_id', 'tool_mesh', 'inverted'} on success, or None on failure.
@@ -48,6 +52,8 @@ def check_tool(asset_folder, assembly_dir, parts_fix, part_move, tools,
         output_dir=output_dir,
         show=show,
         verbose=debug > 0,
+        diagnostics=diagnostics,
+        failure_record_dir=failure_record_dir,
     )
     if debug > 0:
         if result is None:
@@ -56,9 +62,13 @@ def check_tool(asset_folder, assembly_dir, parts_fix, part_move, tools,
             print(f'[check_tool] feasible tool={result["tool_id"]} (inverted={result["inverted"]}) for part_move={part_move}')
     return result
 
-def check_assemblable(asset_folder, assembly_dir, parts_fix, part_move, pose=None, save_sdf=False, debug=0, render=False, return_path=False, optimize_path=False, min_sep=None, get_dof=False):
+def check_assemblable(asset_folder, assembly_dir, parts_fix, part_move, pose=None, save_sdf=False, debug=0, render=False, return_path=False, optimize_path=False, min_sep=None, get_dof=False, diagnostics=None):
     '''
     Check if certain parts are disassemblable
+
+    diagnostics: optional mutable dict; when supplied, it is populated with
+        {'directions': [{'action': [..], 'success': bool, 'path_len': int}, ...]}
+        capturing per-axis probe results that would otherwise be discarded.
     '''
     planner = MultiPartPathPlanner(asset_folder, assembly_dir, parts_fix, part_move, pose=pose, save_sdf=save_sdf)
 
@@ -74,8 +84,16 @@ def check_assemblable(asset_folder, assembly_dir, parts_fix, part_move, pose=Non
     best_action = None
     best_path = None
     best_path_len = np.inf
+    if diagnostics is not None:
+        diagnostics['directions'] = []
     for action in actions:
         success, path = planner.check_success(action, return_path=True, min_sep=None if optimize_path else min_sep)
+        if diagnostics is not None:
+            diagnostics['directions'].append({
+                'action': [float(x) for x in action],
+                'success': bool(success),
+                'path_len': int(len(path)) if path is not None else 0,
+            })
         if debug > 0:
             print(f'[check_assemblable] success: {success}, parts_fix: {parts_fix}, part_move: {part_move}, action: {action}, path_len: {len(path)}')
             if render:
@@ -194,15 +212,20 @@ def check_stable(asset_folder, assembly_dir, parts_fix, parts_move, pose=None, s
     return success, parts_fall
 
 
-def get_stable_plan_1pose_serial(asset_folder, assembly_dir, parts, base_part, pose, max_fix=None, save_sdf=False, timeout=None, allow_gap=False, debug=0, render=False, return_count=False, log_dir=None, step_label=None, ignore_unstable=()):
+def get_stable_plan_1pose_serial(asset_folder, assembly_dir, parts, base_part, pose, max_fix=None, save_sdf=False, timeout=None, allow_gap=False, debug=0, render=False, return_count=False, log_dir=None, step_label=None, ignore_unstable=(), diagnostics=None):
     '''
     Get all gravitationally stable plans given 1 pose through serial greedy search
+
+    diagnostics: optional mutable dict; when supplied, populated with
+        {'unstable_parts': [...]} listing the union of all parts_fall observed
+        across the greedy iterations (only meaningful on failure).
     '''
     t_start = time()
     count = 0
 
     max_fix = len(parts) if max_fix is None else min(max_fix, len(parts))
     parts_fix = [] if base_part is None else [base_part]
+    fell_seen = []
 
     while True:
 
@@ -213,6 +236,9 @@ def get_stable_plan_1pose_serial(asset_folder, assembly_dir, parts, base_part, p
         if timeout is not None:
             timeout -= (time() - t_start)
             if timeout < 0:
+                if diagnostics is not None:
+                    diagnostics['unstable_parts'] = list(dict.fromkeys(fell_seen))
+                    diagnostics['timed_out'] = True
                 if return_count:
                     return None, count
                 else:
@@ -234,13 +260,20 @@ def get_stable_plan_1pose_serial(asset_folder, assembly_dir, parts, base_part, p
             break
         else:
             if parts_fall is None:
+                if diagnostics is not None:
+                    diagnostics['unstable_parts'] = list(dict.fromkeys(fell_seen))
+                    diagnostics['timed_out'] = True
                 if return_count:
                     return None, count # timeout
                 else:
                     return None
+            fell_seen.extend(parts_fall)
             parts_fix.extend(parts_fall)
-        
+
         if len(parts_fix) > max_fix:
+            if diagnostics is not None:
+                diagnostics['unstable_parts'] = list(dict.fromkeys(fell_seen))
+                diagnostics['max_fix_exceeded'] = True
             if return_count:
                 return None, count # failed
             else:

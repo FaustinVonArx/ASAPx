@@ -70,15 +70,15 @@ class BaseSequenceOptimizer:
             return None
         return random.choice(sequences)
 
-    def score_sequence(self, sequence, score_fn):
+    def cost_sequence(self, sequence, cost_fn):
         '''
         Walk the root→leaf path defined by `sequence` (an ordered list of
-        part_move ids) and sum a per-edge score.
+        part_move ids) and sum a per-edge cost.
 
-        score_fn(child_parts, sim_info, parent_parts) → float — typically a bound
-        closure over HeuristicDFASequencePlanner._score_child.
+        cost_fn(child_parts, sim_info, parent_parts) → float — typically a bound
+        closure over HeuristicDFASequencePlanner._cost_child.
 
-        Returns (total_score, per_edge_scores). If any step has no matching
+        Returns (total_cost, per_edge_costs). If any step has no matching
         feasible edge in the tree, returns (None, None).
         '''
         node = self.root
@@ -96,27 +96,28 @@ class BaseSequenceOptimizer:
             if match is None:
                 return None, None
             child, sim_info = match
-            s = float(score_fn(list(child), sim_info, list(node)))
-            per_edge.append(s)
-            total += s
+            c = float(cost_fn(list(child), sim_info, list(node)))
+            per_edge.append(c)
+            total += c
             node = child
         return total, per_edge
 
-    def optimize_scored(self, score_fn=None, divide_optimizer=None,
+    def optimize_scored(self, cost_fn=None, divide_optimizer=None,
                         threshold=0.1, debug=0):
         '''
-        Sibling to ``optimize()``: pick the valid sequence with the highest
-        per-edge-score sum, and (optionally) probe a DivideOptimizer for a
+        Sibling to ``optimize()``: pick the valid sequence with the LOWEST
+        per-edge-cost sum, and (optionally) probe a DivideOptimizer for a
         (S, R) split whose R is decomposed into connected components of the
         contact graph. The split is purely diagnostic — the full chosen
         sequence is always returned. When ``debug > 0`` the chosen sequence,
-        its score, the best split found, the threshold verdict, and the
+        its cost, the best split found, the threshold verdict, and the
         per-component sub-sequences (filtered from the full sequence) are
         printed.
 
         Args:
-            score_fn: callable (child_parts, sim_info, parent_parts) → float.
-                If None, falls back to ``optimize()`` (random valid pick).
+            cost_fn: callable (child_parts, sim_info, parent_parts) → float
+                (lower = better). If None, falls back to ``optimize()``
+                (random valid pick).
             divide_optimizer: a DivideOptimizer whose
                 ``build_obstruction_graph`` + ``find_locally_free_subassemblies``
                 + ``verify_locally_free`` have already run. When None, the
@@ -130,20 +131,21 @@ class BaseSequenceOptimizer:
         sequences = self.find_valid_sequences()
         if not sequences:
             return None
-        if score_fn is None:
+        if cost_fn is None:
             return random.choice(sequences)
 
         scored = []
         for seq in sequences:
-            total, per_edge = self.score_sequence(seq, score_fn)
+            total, per_edge = self.cost_sequence(seq, cost_fn)
             if total is None:
                 continue
             scored.append((seq, total, per_edge))
         if not scored:
             return random.choice(sequences)
 
-        scored.sort(key=lambda x: -x[1])
-        best_seq, best_score, best_per_edge = scored[0]
+        # Lowest total cost wins.
+        scored.sort(key=lambda x: x[1])
+        best_seq, best_cost, best_per_edge = scored[0]
 
         split_info = self._extract_split_info(
             best_seq, best_per_edge, divide_optimizer, threshold,
@@ -151,7 +153,7 @@ class BaseSequenceOptimizer:
 
         if debug > 0:
             self._print_optimize_scored_diagnostic(
-                best_seq, best_score, best_per_edge, split_info, threshold,
+                best_seq, best_cost, best_per_edge, split_info, threshold,
             )
         return best_seq
 
@@ -194,15 +196,15 @@ class BaseSequenceOptimizer:
         }
 
     @staticmethod
-    def _print_optimize_scored_diagnostic(best_seq, best_score, best_per_edge,
+    def _print_optimize_scored_diagnostic(best_seq, best_cost, best_per_edge,
                                            split_info, threshold):
         bar = '=' * 64
         print('\n' + bar)
         print('[optimize_scored] Sequence + Split diagnostic')
         print(bar)
         print(f'  Chosen sequence:      {best_seq}')
-        print(f'  Sequence score (sum): {best_score:.4f}')
-        print(f'  Per-edge scores:      {[round(s, 4) for s in best_per_edge]}')
+        print(f'  Sequence cost (sum):  {best_cost:.4f}')
+        print(f'  Per-edge costs:       {[round(c, 4) for c in best_per_edge]}')
         if split_info is None:
             print('  Split:                (no verified divide-optimizer candidate)')
         else:

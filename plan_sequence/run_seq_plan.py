@@ -16,6 +16,131 @@ from plan_sequence.planner import planners
 from assets.save import clear_saved_sdfs
 
 
+def _dump_failure_evidence(tree, asset_folder, assembly_dir, base_part, tools, save_sdf, log_dir, render=True):
+    '''Walk the deepest reached node(s) of `tree`, dispatch on each failed
+    outgoing edge's `fail_reason`, and (when `render` is True) dump GIF/PNG
+    evidence into `<log_dir>/failures/`. Always writes `<log_dir>/failures.json`
+    summarising deepest_nodes, depth and per-failure entries with extra IDs
+    and image paths.
+
+    render: when False, skip the actual GIF/PNG rendering for each failed
+    child but still produce the metadata file (entry['evidence_image']
+    remains None). Controlled by `settings.render_sequence` at the call
+    site so a global render-off run doesn't also render the "remaining"
+    parts' failure evidence.
+
+    Returns the failures payload (dict) or None when there is no feasible
+    progress past the root.'''
+    from plan_sequence.planner.base import SequencePlanner
+    from plan_sequence.feasibility_check import check_stable, check_tool
+    from plan_sequence.physics_planner import MultiPartPathPlanner
+
+    deepest = SequencePlanner.find_deepest_reached_nodes(tree)
+    if not deepest:
+        return None
+
+    failures_dir = os.path.join(log_dir, 'failures')
+    if render:
+        os.makedirs(failures_dir, exist_ok=True)
+
+    failures = []
+    seen = set()
+    for node in deepest:
+        for child in tree.successors(node):
+            sim_info = tree.edges[node, child]['sim_info']
+            if sim_info.get('feasible'):
+                continue
+            reason = sim_info.get('fail_reason')
+            evidence = sim_info.get('fail_evidence') or {}
+            part_move = sim_info.get('part_move')
+            if part_move is None or part_move in seen:
+                continue
+            seen.add(part_move)
+            pose = sim_info.get('pose')
+            parts_rest = [p for p in node if p != part_move]
+
+            entry = {
+                'child_part': part_move,
+                'fail_reason': reason,
+                'evidence_image': None,
+            }
+
+            try:
+                if reason == 'stability':
+                    entry['unstable_parts'] = evidence.get('unstable_parts', [])
+                    if render:
+                        rec = os.path.join(failures_dir, f'{part_move}_stability.gif')
+                        parts_fix_init = [base_part] if base_part is not None else []
+                        parts_move_init = [p for p in parts_rest if p not in parts_fix_init]
+                        try:
+                            check_stable(
+                                asset_folder, assembly_dir, parts_fix_init, parts_move_init,
+                                pose=pose, save_sdf=save_sdf, record_path=rec,
+                            )
+                        except Exception as _e:
+                            print(f'[failure_dump] stability render failed for {part_move}: {_e}')
+                        if os.path.exists(rec):
+                            entry['evidence_image'] = os.path.relpath(rec, log_dir)
+
+                elif reason == 'assembly':
+                    entry['directions'] = evidence.get('directions', [])
+                    if render:
+                        best_dir = None
+                        best_len = -1
+                        for d in evidence.get('directions', []):
+                            if d.get('path_len', 0) > best_len:
+                                best_len = d['path_len']
+                                best_dir = d.get('action')
+                        if best_dir is not None:
+                            try:
+                                planner_obj = MultiPartPathPlanner(
+                                    asset_folder, assembly_dir, parts_rest, part_move,
+                                    pose=pose, save_sdf=save_sdf,
+                                )
+                                action = np.array(best_dir)
+                                _, path = planner_obj.check_success(action, return_path=True)
+                                rec = os.path.join(failures_dir, f'{part_move}_assembly.gif')
+                                planner_obj.render(path=path, record_path=rec)
+                                if os.path.exists(rec):
+                                    entry['evidence_image'] = os.path.relpath(rec, log_dir)
+                            except Exception as _e:
+                                print(f'[failure_dump] assembly render failed for {part_move}: {_e}')
+
+                elif reason == 'tool' and tools:
+                    entry['subkind'] = evidence.get('subkind')
+                    entry['colliding_parts'] = evidence.get('colliding_parts', [])
+                    entry['tried_tools'] = evidence.get('tried_tools', [])
+                    if render:
+                        fail_dir = os.path.join(failures_dir, f'{part_move}_tool')
+                        diag2 = {}
+                        try:
+                            check_tool(
+                                asset_folder=asset_folder, assembly_dir=assembly_dir,
+                                parts_fix=parts_rest, part_move=part_move, tools=tools,
+                                diagnostics=diag2, failure_record_dir=fail_dir,
+                            )
+                        except Exception as _e:
+                            print(f'[failure_dump] tool render failed for {part_move}: {_e}')
+                        ev_paths = diag2.get('evidence_paths', [])
+                        if ev_paths:
+                            entry['evidence_image'] = os.path.relpath(ev_paths[0], log_dir)
+                            entry['all_evidence_images'] = [os.path.relpath(p, log_dir) for p in ev_paths]
+            except Exception as _e:
+                print(f'[failure_dump] error for {part_move} ({reason}): {_e}')
+                print(traceback.format_exc())
+
+            failures.append(entry)
+
+    payload = {
+        'deepest_nodes': [list(n) for n in deepest],
+        'depth': max(len(n) for n in deepest),
+        'failures': failures,
+    }
+    with open(os.path.join(log_dir, 'failures.json'), 'w') as fp:
+        json.dump(payload, fp, indent=2)
+    return payload
+
+
 def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc, seed, budget, max_gripper, max_pose, pose_reuse, early_term, timeout, base_part,
     save_sdf, clear_sdf, plan_grasp, plan_arm, gripper_type, gripper_scale, optimizer, debug, render, record_dir, log_dir, allow_gap=False, n_success_term=1, connect_path=False, get_dof=False, tools=None, skip_stability=False, max_frontier=4, seq_optimizer=None):
 
@@ -57,14 +182,23 @@ def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc,
                 print(f'[seq_plan] divide optimizer error: {_e}')
                 div = None
 
-            # Per-edge scoring closure if the planner exposes one.
-            _score_fn = None
-            if hasattr(planner, '_score_child') and hasattr(planner, '_load_weights'):
+            # Per-edge cost closure if the planner exposes one.
+            _cost_fn = None
+            if hasattr(planner, '_cost_child') and hasattr(planner, '_load_weights'):
                 _weights = planner._load_weights()
                 _planner = planner
-                def _score_fn(G_prime, sim_info, parent_G,
-                              _p=_planner, _w=_weights):
-                    return _p._score_child(_w, G_prime, sim_info, parent_G)
+                # Capture `tree` so the heuristic's pose_change feature can
+                # look up the parent step's pose via _parent_pose_for. Without
+                # this, optimizer cost evaluations would silently miss the
+                # pose-change penalty (parent_pose would default to None).
+                _has_parent_lookup = hasattr(planner, '_parent_pose_for')
+                def _cost_fn(G_prime, sim_info, parent_G,
+                             _p=_planner, _w=_weights, _t=tree,
+                             _has_lookup=_has_parent_lookup):
+                    parent_pose = (_p._parent_pose_for(_t, parent_G)
+                                   if _has_lookup else None)
+                    return _p._cost_child(_w, G_prime, sim_info, parent_G,
+                                          parent_pose=parent_pose)
 
             try:
                 import settings as _user_settings
@@ -73,7 +207,7 @@ def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc,
                 _threshold = 0.1
 
             chosen_sequence = opt.optimize_scored(
-                score_fn=_score_fn, divide_optimizer=div,
+                cost_fn=_cost_fn, divide_optimizer=div,
                 threshold=_threshold, debug=debug,
             )
             if chosen_sequence is not None:
@@ -85,15 +219,46 @@ def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc,
                               f'{"ACCEPTED" if score >= _threshold else "rejected"}')
                 stats['sequence'] = list(chosen_sequence)
 
+            # Persist the top physically-verified subassembly split so the
+            # renderer can visualise it (see play_subassembly_split). Skipped
+            # entirely when nothing verified.
+            verified = getattr(div, 'verified_locally_free', None) if div is not None else None
+            if verified:
+                S, R, score = verified[0][0], verified[0][1], verified[0][2]
+                stats['divide_split'] = {
+                    'S': sorted(S), 'R': sorted(R), 'score': float(score),
+                }
+                if debug > 0:
+                    print(f'[seq_plan] persisted divide_split: S={sorted(S)}  R={sorted(R)}  score={score:.4f}')
+
         if log_dir is not None:
             planner.log(tree, stats, log_dir)
             with open(os.path.join(log_dir, 'setup.json'), 'w') as fp:
                 json.dump(setup, fp)
+            if not stats.get('success'):
+                # render_sequence gates both the successful-sequence GIFs and
+                # the failed-children evidence renders; metadata (failures.json)
+                # is cheap and always emitted regardless.
+                try:
+                    import settings as _user_settings
+                    _render_failures = bool(getattr(_user_settings, 'render_sequence', True))
+                except ImportError:
+                    _render_failures = True
+                try:
+                    _dump_failure_evidence(
+                        tree, asset_folder, assembly_dir, base_part, tools, save_sdf, log_dir,
+                        render=_render_failures,
+                    )
+                except Exception as _e:
+                    print(f'[seq_plan] failure-evidence dump aborted: {_e}')
+                    print(traceback.format_exc())
 
         if debug:
             print(f'[seq_plan] stats: {stats}')
 
-        if render and stats['success']:
+        # Render whenever there is a sequence to show — full on success, or the
+        # deepest feasible prefix when the planner got stuck (stats['partial']).
+        if render and stats['sequence']:
             planner.render(stats['sequence'], tree, record_dir)
 
     except (Exception, KeyboardInterrupt) as e:

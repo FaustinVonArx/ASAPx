@@ -30,7 +30,7 @@ CONTACT_EPS = 1e-1
 POS_FAR_THRESHOLD = 0.2
 POS_NEAR_THRESHOLD = 0.05
 NEAR_STEP = 100
-MAX_STEP = 1000
+MAX_STEP = 200
 CHECK_FREQ = 20
 COL_TH_PATH = 0.01
 COL_TH_STABLE = 0.00
@@ -482,6 +482,17 @@ class MultiPartStabilityPlanner:
 
         t_start = time()
 
+        # Render gate: replay the gravity sim to a GIF when the caller
+        # supplied a path AND the user opted in via settings.debug_stability.
+        # The render uses self.sim.replay() which reads the already-populated
+        # q_his / qdot_his — no physics is re-run.
+        try:
+            import settings as _user_settings
+            _record_enabled = bool(getattr(_user_settings, 'debug_stability', False))
+        except ImportError:
+            _record_enabled = False
+        do_record = _record_enabled and record_path is not None
+
         # initialize sim and stability checker
         self.sim.reset()
         checker = StabilityChecker(self.allow_gap)
@@ -511,8 +522,8 @@ class MultiPartStabilityPlanner:
                 if self.ignore_unstable:
                     parts_fall = [p for p in parts_fall if p not in self.ignore_unstable]
                 if len(parts_fall) > 0:
-                    if DEBUG_STABILITY and record_path is not None:
-                        print(f'[MultiPartStabilityPlanner] fallen parts: {parts_fall} at step {i}')
+                    if do_record:
+                        print(f'[MultiPartStabilityPlanner] fallen parts: {parts_fall} at step {i}; replaying to {record_path}')
                         os.makedirs(os.path.dirname(record_path), exist_ok=True)
                         self.render(record_path=record_path)
                     return False, parts_fall
@@ -520,8 +531,8 @@ class MultiPartStabilityPlanner:
             if timeout is not None and time() - t_start > timeout:
                 return False, None
 
-        if DEBUG_STABILITY and record_path is not None:
-            print(f'[MultiPartStabilityPlanner] stable for {max_step} steps')
+        if do_record:
+            print(f'[MultiPartStabilityPlanner] stable for {max_step} steps; replaying to {record_path}')
             os.makedirs(os.path.dirname(record_path), exist_ok=True)
             self.render(record_path=record_path)
 
@@ -721,11 +732,16 @@ def _render_pose_debug_pyvista(assembly_dir, parts, poses, save_dir, size=(720, 
 
 
 def _check_pose_standalone(asset_folder, assembly_dir, parts, pose,
-                           save_sdf, allow_gap, max_step, timeout, pose_idx):
+                           save_sdf, allow_gap, max_step, timeout, pose_idx,
+                           record_path=None):
     '''
     Picklable worker for parallel `find_stable_initial_poses`. Builds a fresh
     MultiPartStabilityPlanner (with parts_fix=[]) and runs the gravity sim.
     Returns {'pose_idx', 'success', 'fallen', '_dt_build', '_dt_run'}.
+
+    record_path: when settings.debug_stability is True, the per-pose gravity
+    sim is replayed to this GIF after the forward() loop. The replay uses
+    the sim's already-populated q_his/qdot_his — no re-simulation.
     '''
     t_build = time()
     planner = MultiPartStabilityPlanner(
@@ -738,6 +754,7 @@ def _check_pose_standalone(asset_folder, assembly_dir, parts, pose,
     t_run = time()
     success, fallen = planner.check_success(
         max_step=max_step, timeout=timeout, progress=False,
+        record_path=record_path,
     )
     dt_run = time() - t_run
 
@@ -753,18 +770,23 @@ def _check_pose_standalone(asset_folder, assembly_dir, parts, pose,
 def find_stable_initial_poses(asset_folder, assembly_dir, parts, max_poses=5,
                               save_sdf=False, allow_gap=False,
                               max_step=MAX_STEP, timeout=None, progress=True,
-                              num_proc=1, first_only=True, debug_dir=None):
+                              num_proc=1, first_only=True, debug_dir=None,
+                              stability_debug_dir=None):
     '''
     Pre-flight check for the full assembly. Compute trimesh stable poses for
     the combined mesh and keep only those for which the assembly stands
     self-supported under gravity (no parts need fixing).
 
-    Returns (valid_poses, observed_fallen) where
+    Returns (valid_poses, observed_fallen, per_pose) where
       - valid_poses is the subset of `get_stable_poses` outputs (in original
         order) that pass MultiPartStabilityPlanner with parts_fix=[] and
         parts_move=parts.
       - observed_fallen is a frozenset of part IDs that were observed falling
         in at least one candidate pose check (union across all poses).
+      - per_pose is a list of dicts, one per attempted candidate pose:
+            {'pose_idx': int, 'pose': 4x4 ndarray, 'success': bool, 'fallen': list[str]}
+        Caller uses this to render one diagnostic image per pose (e.g.
+        precheck_unstable_<i>.png) instead of a single union image.
 
     When `progress` is True (default), prints per-pose timing breakdowns
     (mesh, candidate enumeration, sim build, sim run) and shows a tqdm bar
@@ -807,12 +829,21 @@ def find_stable_initial_poses(asset_folder, assembly_dir, parts, max_poses=5,
         except Exception as e:
             print(f'[find_stable_initial_poses] WARNING: debug render failed: {e}')
 
+    # Pre-compute per-pose stability-replay paths if the caller asked for
+    # them. The render gate inside check_success is settings.debug_stability,
+    # so producing the paths here is harmless when the flag is off.
+    def _stability_record_path(i):
+        if stability_debug_dir is None:
+            return None
+        return os.path.join(stability_debug_dir, f'pose_{i:02d}.gif')
+
     if num_proc > 1:
         from utils.parallel import parallel_execute
 
         worker_args = [
             (asset_folder, assembly_dir, list(parts), pose,
-             save_sdf, allow_gap, max_step, timeout, i)
+             save_sdf, allow_gap, max_step, timeout, i,
+             _stability_record_path(i))
             for i, pose in enumerate(candidate_poses)
         ]
 
@@ -821,6 +852,7 @@ def find_stable_initial_poses(asset_folder, assembly_dir, parts, max_poses=5,
 
         valid_idx = []
         observed_fallen = set()
+        per_pose_map = {}
         for result in parallel_execute(
             _check_pose_standalone, worker_args, num_proc,
             show_progress=progress, desc='initial stable pose check',
@@ -831,21 +863,29 @@ def find_stable_initial_poses(asset_folder, assembly_dir, parts, max_poses=5,
                 outcome = 'STABLE' if result['success'] else f"unstable (fallen={result['fallen']})"
                 print(f"[find_stable_initial_poses] pose {i + 1}/{len(candidate_poses)}: "
                       f"build {result['_dt_build']:.2f}s  run {result['_dt_run']:.2f}s  → {outcome}")
+            per_pose_map[i] = {
+                'pose_idx': i,
+                'pose': candidate_poses[i],
+                'success': bool(result['success']),
+                'fallen': list(result['fallen']) if result['fallen'] else [],
+            }
             if result['success']:
                 valid_idx.append(i)
             elif result['fallen']:
                 observed_fallen.update(result['fallen'])
 
         valid_poses = [candidate_poses[i] for i in sorted(valid_idx)]
+        per_pose = [per_pose_map[i] for i in sorted(per_pose_map.keys())]
         if progress:
             print(f'[find_stable_initial_poses] done in {time() - t0:.2f}s  '
                   f'kept {len(valid_poses)}/{len(candidate_poses)} pose(s)  '
                   f'observed_fallen={sorted(observed_fallen)}')
-        return valid_poses, frozenset(observed_fallen)
+        return valid_poses, frozenset(observed_fallen), per_pose
 
     # Serial path: keeps the inner per-step tqdm bar for live progress.
     valid_poses = []
     observed_fallen = set()
+    per_pose = []
     for i, pose in enumerate(candidate_poses):
         t_build = time()
         planner = MultiPartStabilityPlanner(
@@ -863,6 +903,7 @@ def find_stable_initial_poses(asset_folder, assembly_dir, parts, max_poses=5,
         success, fallen = planner.check_success(
             max_step=max_step, timeout=timeout,
             progress=progress, progress_desc=f'pose {i + 1}/{len(candidate_poses)}',
+            record_path=_stability_record_path(i),
         )
         dt_run = time() - t_run
 
@@ -870,6 +911,13 @@ def find_stable_initial_poses(asset_folder, assembly_dir, parts, max_poses=5,
             outcome = 'STABLE' if success else f'unstable (fallen={fallen})'
             print(f'[find_stable_initial_poses] pose {i + 1}/{len(candidate_poses)}: '
                   f'run {dt_run:.2f}s  → {outcome}')
+
+        per_pose.append({
+            'pose_idx': i,
+            'pose': pose,
+            'success': bool(success),
+            'fallen': list(fallen) if fallen else [],
+        })
 
         if success:
             valid_poses.append(pose)
@@ -882,7 +930,7 @@ def find_stable_initial_poses(asset_folder, assembly_dir, parts, max_poses=5,
         print(f'[find_stable_initial_poses] done in {time() - t0:.2f}s  '
               f'kept {len(valid_poses)}/{len(candidate_poses)} pose(s)  '
               f'observed_fallen={sorted(observed_fallen)}')
-    return valid_poses, frozenset(observed_fallen)
+    return valid_poses, frozenset(observed_fallen), per_pose
 
 
 def get_contact_graph(asset_folder, assembly_dir, parts=None, contact_eps=CONTACT_EPS, save_sdf=False):
@@ -1017,7 +1065,8 @@ _ASSEMBLY_EVAL_ROOT = os.path.abspath(
 
 
 def check_tool(asset_folder, assembly_dir, parts_fix, part_move, tools,
-               asset_folder_bfs=None, output_dir=None, show=False, verbose=False):
+               asset_folder_bfs=None, output_dir=None, show=False, verbose=False,
+               diagnostics=None, failure_record_dir=None):
     '''
     Generic tool-feasibility check for a sub-assembly during sequence planning.
 
@@ -1057,4 +1106,6 @@ def check_tool(asset_folder, assembly_dir, parts_fix, part_move, tools,
         output_dir=output_dir,
         show=show,
         verbose=verbose,
+        diagnostics=diagnostics,
+        failure_record_dir=failure_record_dir,
     )

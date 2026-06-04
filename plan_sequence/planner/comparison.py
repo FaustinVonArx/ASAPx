@@ -26,7 +26,7 @@ Configure via `settings.comparison_planner`:
     }
 
 Supported selector names (`planners` list):
-  - 'heuristic'   — HeuristicDFASequencePlanner._score_child argmax over sample
+  - 'heuristic'   — HeuristicDFASequencePlanner._cost_child argmin over sample
   - 'first'       — index 0 (default DFA arrival-order behavior)
   - 'random'      — uniform random over sample (independent of the forward-pick)
   - 'llm'         — vision LLM pick over the full sample
@@ -125,9 +125,13 @@ class ComparisonDFASequencePlanner(HeuristicDFASequencePlanner):
 
     def _pick_heuristic(self, tree, sample, log_dir):
         weights = self._load_weights()
-        scores = [self._score_child(weights, *t) for t in sample]
-        idx = max(range(len(sample)), key=lambda i: scores[i])
-        return idx, {'scores': [float(s) for s in scores]}
+        # All samples in a Comparison batch share one parent (max_frontier=1),
+        # so look up parent_pose once and reuse it across the cost calls.
+        parent_G = sample[0][2] if sample else None
+        parent_pose = self._parent_pose_for(tree, parent_G) if parent_G is not None else None
+        costs = [self._cost_child(weights, *t, parent_pose=parent_pose) for t in sample]
+        idx = min(range(len(sample)), key=lambda i: costs[i])
+        return idx, {'costs': [float(c) for c in costs]}
 
     def _pick_first(self, tree, sample, log_dir):
         return 0, None

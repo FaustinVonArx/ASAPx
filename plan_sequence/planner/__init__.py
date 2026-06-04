@@ -5,6 +5,7 @@ from .dfa import DFASequencePlanner
 from .heuristic import HeuristicDFASequencePlanner
 from .llm import LLMDFASequencePlanner
 from .comparison import ComparisonDFASequencePlanner
+from .preference import PreferenceLearningDFASequencePlanner
 
 
 planners = {
@@ -15,4 +16,5 @@ planners = {
     'heuristic': HeuristicDFASequencePlanner,
     'llm': LLMDFASequencePlanner,
     'comparison': ComparisonDFASequencePlanner,
+    'preference': PreferenceLearningDFASequencePlanner,
 }

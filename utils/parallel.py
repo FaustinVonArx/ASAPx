@@ -4,7 +4,18 @@ import traceback
 
 
 def parallel_worker(worker, args, queue, proc_idx):
-    result = worker(*args)
+    # Always queue.put a result, even on exception — otherwise the parent's
+    # blocking queue.get() in parallel_execute hangs forever (since the dead
+    # process can no longer contribute). On exception we print the traceback
+    # in the child and return None as the result; the parent's consumer
+    # iterates results and is tolerant of None.
+    try:
+        result = worker(*args)
+    except (Exception, KeyboardInterrupt) as e:
+        if not isinstance(e, KeyboardInterrupt):
+            print(f'[parallel_worker] proc_idx={proc_idx} worker raised: {e}')
+            print(traceback.format_exc())
+        result = None
     queue.put([result, proc_idx, args])
 
 

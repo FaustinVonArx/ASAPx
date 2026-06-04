@@ -157,11 +157,37 @@ class DFASequencePlanner(SequencePlanner):
 
     def _find_resumable_nodes(self, tree, max_n):
         # Walk the tree for nodes that still have unexpanded or 'unfinished'
-        # candidates. Smaller subassemblies come first (deeper in the tree),
-        # so backtracking prefers nodes closer to the most recent frontier.
+        # candidates.
+        #
+        # Sort order — cumulative path cost first, depth (smallest first)
+        # second. Heuristic / preference / llm / comparison planners maintain
+        # `self._cum_cost` (root=0, child=parent_cum + edge cost); cheaper
+        # nodes are preferred backtrack targets so the frontier collapse at
+        # 3-part subassemblies (2-part children are terminal and don't
+        # propagate the frontier — see `feasible_children` skip in plan())
+        # lands on the next-most-promising sibling instead of "whichever
+        # bigger node happened to come first". Planners that don't populate
+        # `_cum_cost` see infinity here and the secondary key (depth) does
+        # all the work — same behaviour as before.
+        #
+        # Critical: only feasibly-reached nodes (n_gripper is not None) qualify.
+        # Infeasible nodes are present in the tree because base.py:_update_tree
+        # adds a node with n_gripper=None whenever a child edge comes back
+        # infeasible. Expanding from such a node and getting a feasible child
+        # back fires the `parent not feasible` assert in base._update_tree —
+        # the DFA frontier collapse + this helper were the path resurrecting
+        # those infeasible nodes as expansion targets.
+        cum = getattr(self, '_cum_cost', None) or {}
+        inf = float('inf')
+
+        def _key(node):
+            return (cum.get(tuple(node), inf), len(node))
+
         out = []
-        for node in sorted(tree.nodes, key=len):
+        for node in sorted(tree.nodes, key=_key):
             if len(node) <= 2:
+                continue
+            if tree.nodes[node].get('n_gripper') is None:
                 continue
             if tree.out_degree(node) < len(node) or self._has_unfinished_children(tree, node):
                 out.append(list(node))
@@ -178,15 +204,77 @@ class DFASequencePlanner(SequencePlanner):
         """
         return [G_prime for G_prime, _, _ in feasible_children[:max_frontier]]
 
+    def _print_candidate_summary(self, iter_idx, parents, received_by_parent,
+                                 cand_dbg, next_frontier):
+        """Compact per-frontier debug overview. One small table per parent;
+        rows are the parent's evaluated children (one per pose, since the
+        same part with different poses runs as separate sim tasks).
+        Columns: part, asm time, stab time, stability outcome, score.
+        Score = cumulative path cost from `_cum_cost` when the planner
+        populates it (heuristic / preference / llm / comparison); otherwise
+        "—". '★' marks children that survived into the next frontier.
+        """
+        def _fmt_t(dt):
+            return f'{dt:.2f}s' if isinstance(dt, (int, float)) else '  —  '
+
+        def _stab_outcome(sim_info):
+            # 'parts_fix' is None when the stability sim never ran (assembly
+            # failed first) OR when it ran and rejected the action. The two
+            # are disambiguated by whether _dt_stab was captured.
+            ran_stab = cand_dbg.get(id(sim_info), {}).get('dt_stab') is not None
+            if not ran_stab:
+                return 'skipped'
+            if sim_info.get('parts_fix') is not None:
+                return 'PASS'
+            # Stability ran and rejected → fallen-parts list lives on fail_evidence.
+            ev = sim_info.get('fail_evidence') or {}
+            extra = ev.get('extra_ids')
+            if isinstance(extra, (list, tuple)) and extra:
+                tag = ','.join(map(str, extra[:3]))
+                if len(extra) > 3:
+                    tag += f',+{len(extra) - 3}'
+                return f'FAIL[{tag}]'
+            return 'FAIL'
+
+        cum = getattr(self, '_cum_cost', None) or {}
+        next_set = {tuple(g) for g in (next_frontier or [])}
+
+        print(f'\n[DFA.frontier iter={iter_idx}] candidates ({len(parents)} parent(s)):')
+        for i, G in enumerate(parents):
+            rows = received_by_parent.get(i, [])
+            label = f'{sorted(G)[:4]}{"..." if len(G) > 4 else ""}' if len(G) > 4 else f'{sorted(G)}'
+            print(f'  parent[{i}] {label}  ({len(rows)} child eval(s))')
+            print(f'    {"part":<20}  {"asm":>7}  {"stab":>7}  {"stability":<22}  {"score":>9}  next')
+            print(f'    {"-"*20}  {"-"*7}  {"-"*7}  {"-"*22}  {"-"*9}  ----')
+            for sim_info, real_arg in rows:
+                dbg = cand_dbg.get(id(sim_info), {})
+                part = dbg.get('part', sim_info.get('part_move', '?'))
+                dt_p = _fmt_t(dbg.get('dt_path'))
+                dt_s = _fmt_t(dbg.get('dt_stab'))
+                stab = _stab_outcome(sim_info)
+                g_prime_key = tuple(real_arg[5])
+                score = cum.get(g_prime_key)
+                score_str = f'{score:9.3f}' if isinstance(score, (int, float)) else '    —    '
+                mark = ' ★' if g_prime_key in next_set else '  '
+                print(f'    {str(part):<20}  {dt_p:>7}  {dt_s:>7}  {stab:<22}  {score_str}  {mark}')
+
     def _compute_poses(self, tree, G, max_poses, pose_reuse):
         if self.base_part is not None:
             return [None]
         poses = list(tree.nodes[tuple(G)]['poses'][:pose_reuse])
         G_mesh = get_combined_mesh(self.assembly_dir, G)
         _t0 = time()
-        poses.extend(get_stable_poses(G_mesh, max_num=max_poses - pose_reuse))
+        fresh = get_stable_poses(G_mesh, max_num=max_poses - pose_reuse)
         self._timing['stable_pose'] += time() - _t0
         self._timing_counts['stable_pose'] += 1
+        # When multiple fresh stable poses are returned for this subassembly,
+        # prefer the orientation closest to the parent step's pose so the
+        # operator doesn't have to re-orient between consecutive steps unless
+        # the geometry actually demands it. No effect at the root (no parent).
+        parent_pose = self._parent_pose_for(tree, G)
+        if parent_pose is not None and len(fresh) > 1:
+            fresh = self._sort_poses_by_proximity(fresh, parent_pose)
+        poses.extend(fresh)
         if not poses:
             poses = [None]
         return poses
@@ -212,7 +300,18 @@ class DFASequencePlanner(SequencePlanner):
             )
 
         if plan_grasp or plan_arm:
-            raise NotImplementedError('Grasp/arm planning is not supported in parallel DFA mode')
+            # The parallel DFA path's _simulate_standalone worker has no
+            # grasp_planner hook, so search-time grasp/arm IK filtering is
+            # silently skipped. This is intentional: per-candidate IK +
+            # collision checks would dominate the parallel batch cost. The
+            # render pipeline (play_logged_plan._render_step_worker) instead
+            # computes grasps lazily when show_arm=True, and the full
+            # reach/disassembly/retreat trajectory is then planned in
+            # render_grasp_arm via ArmMotionPlanner. Print once so users see
+            # the flag wasn't a no-op overall.
+            print('[DFA.plan] plan_grasp/plan_arm requested but not enforced '
+                  'during parallel DFA search; grasps + arm trajectories are '
+                  'computed at render time instead.')
 
         self.t_start = time()
         solution_found = False
@@ -232,11 +331,70 @@ class DFASequencePlanner(SequencePlanner):
         self._n_stability_success = 0
         G0 = self.parts.copy()
         tree = nx.DiGraph()
-        initial_poses, observed_fallen = self._initial_stable_poses(G0, max_poses, log_dir=log_dir)
+        action = getattr(settings, 'no_stable_pose_action', 'exit')
+        # Mirror SequencePlanner.plan()'s root-pose setup. The parallel DFA
+        # branch (num_proc > 1) does NOT call super().plan(), so anything we
+        # only put in the base class is invisible here — every change to
+        # initial-pose handling must be replicated below or it silently
+        # no-ops under preference / heuristic / llm / comparison runs.
+        from plan_sequence.stable_pose import (
+            get_combined_mesh as _get_combined_mesh,
+            get_stable_poses as _get_stable_poses,
+            translation_pose_to_ground as _translation_pose_to_ground,
+        )
+        from plan_sequence.planner._renders import render_unstable_parts as _render_unstable_parts
+        from pathlib import Path as _Path
+
+        G0_mesh = _get_combined_mesh(self.assembly_dir, G0)
+        trimesh_candidates = _get_stable_poses(G0_mesh, max_num=max_poses)
+        _per_pose = None
+        if action == 'skip' and self.base_part is None:
+            initial_poses = list(trimesh_candidates)
+            if not initial_poses:
+                initial_poses = [_translation_pose_to_ground(G0_mesh)]
+                print("[DFA.plan] no trimesh stable pose for full assembly; "
+                      "using translation-only ground-lift fallback "
+                      "(settings.no_stable_pose_action='skip')")
+            else:
+                print(f"[DFA.plan] skipping initial stable-pose gravity check "
+                      f"(settings.no_stable_pose_action='skip'); seeded "
+                      f"{len(initial_poses)} trimesh stable pose(s) on root node")
+            observed_fallen = frozenset()
+        else:
+            initial_poses, observed_fallen, _per_pose = self._initial_stable_poses(G0, max_poses, log_dir=log_dir)
+            # Render one PNG per attempted pose (precheck_unstable_<i>.png)
+            # in that pose's orientation with that pose's fallen parts
+            # highlighted, instead of a single union image that hid the
+            # per-pose breakdown. Gated by render_sequence; the textual ID
+            # list still prints regardless.
+            if not initial_poses and observed_fallen:
+                print(f"[DFA.plan] precheck observed {len(observed_fallen)} "
+                      f"part(s) falling: {sorted(observed_fallen)}")
+                if getattr(settings, 'render_sequence', True):
+                    _save_dir = _Path(log_dir) if log_dir else _Path('/tmp')
+                    for _entry in _per_pose:
+                        if _entry['success'] or not _entry['fallen']:
+                            continue
+                        _idx = _entry['pose_idx']
+                        _png = _render_unstable_parts(
+                            self.assembly_dir, G0, _entry['fallen'],
+                            save_path=_save_dir / f'precheck_unstable_{_idx:02d}.png',
+                            pose=_entry['pose'],
+                        )
+                        if _png is not None:
+                            print(f"[DFA.plan] unstable-parts visualisation pose "
+                                  f"{_idx}: {_png}  (fallen={_entry['fallen']})")
+        # Interactive picker. Same fallback semantics as the serial branch:
+        # if the verified set has <2 entries, augment with the unverified
+        # trimesh candidates so the picker has something to show.
+        initial_poses = self._pick_initial_pose_interactive(
+            G0, initial_poses, log_dir=log_dir,
+            fallback_candidates=trimesh_candidates,
+            per_pose=_per_pose,
+        )
         tree.add_node(tuple(G0), n_eval=0, n_gripper=1, poses=initial_poses)
 
-        if self.base_part is None and not initial_poses:
-            action = getattr(settings, 'no_stable_pose_action', 'exit')
+        if self.base_part is None and not initial_poses and action != 'skip':
             if action == 'exit':
                 self.stop_msg = 'no self-stable initial pose'
                 print('[DFA.plan] aborting: no self-stable initial pose found '
@@ -377,6 +535,18 @@ class DFASequencePlanner(SequencePlanner):
 
                 self.n_eval += len(received)
 
+                # Per-candidate debug table data — capture timings here before
+                # the accumulation loop pops them from sim_info. id(sim_info) is
+                # a stable key because each worker call returns a fresh dict.
+                _cand_dbg = {}
+                for sim_info, real_arg, parent_idx in received:
+                    _cand_dbg[id(sim_info)] = {
+                        'parent_idx': parent_idx,
+                        'part': real_arg[4],
+                        'dt_path': sim_info.get('_dt_path'),
+                        'dt_stab': sim_info.get('_dt_stab'),
+                    }
+
                 # Accumulate per-check counts/timings (worker-side timings are stripped here).
                 for sim_info, _, _ in received:
                     self._n_assembly_checks += 1
@@ -420,6 +590,12 @@ class DFASequencePlanner(SequencePlanner):
                 feasible_children = []
                 for i, G in enumerate(live):
                     parent_received = received_by_parent[i]
+                    # Look up the pose used to reach this parent (None at root).
+                    # Used below to break ties between feasible (part, pose)
+                    # results for the same child by preferring the pose closest
+                    # to the parent's pose — otherwise the pick was whichever
+                    # worker happened to return first (race-dependent).
+                    parent_pose = self._parent_pose_for(tree, G)
 
                     # Group this parent's results by G_prime (multiple poses per part).
                     results_by_edge = defaultdict(list)
@@ -427,9 +603,18 @@ class DFASequencePlanner(SequencePlanner):
                         results_by_edge[tuple(real_arg[5])].append((sim_info, list(real_arg[5]), real_arg[4]))
 
                     for g_prime_key, edge_results in results_by_edge.items():
-                        chosen_sim_info, G_prime, p = next(
-                            (r for r in edge_results if r[0]['feasible']), edge_results[0]
-                        )
+                        # Order results: feasible first, then by proximity of
+                        # sim_info['pose'] to parent_pose (smaller rotation
+                        # angle wins). Infeasible entries are sorted to the
+                        # end so we still fall back to one of them when no
+                        # pose was feasible. Stable sort; ties (same proximity
+                        # or both None) preserve completion order, which is
+                        # the prior behaviour.
+                        edge_results.sort(key=lambda r: (
+                            not r[0].get('feasible', False),
+                            self._rotation_angle_between(parent_pose, r[0].get('pose')),
+                        ))
+                        chosen_sim_info, G_prime, p = edge_results[0]
                         n_eval_tag += 1
                         super()._update_tree(tree, G, G_prime, n_eval_tag, chosen_sim_info)
 
@@ -479,6 +664,16 @@ class DFASequencePlanner(SequencePlanner):
                 # backtracks via the tree scan. Subclasses may override
                 # _select_next_frontier to rank candidates by a quality score.
                 self.frontier = self._select_next_frontier(tree, feasible_children, max_frontier)
+
+                # Per-frontier candidate summary: part id, assemblability check
+                # time, stability check time, stability outcome, frontier score.
+                # Scores come from the planner's _cum_cost map when present
+                # (heuristic / preference / llm / comparison); plain DFA / random
+                # show "—".
+                self._print_candidate_summary(
+                    iter_idx, live, received_by_parent, _cand_dbg,
+                    next_frontier=self.frontier,
+                )
 
                 self._iter_timings.append((iter_idx, len(live), len(received), time() - iter_start))
 

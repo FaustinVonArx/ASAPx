@@ -17,6 +17,7 @@ from scipy.spatial.transform import Slerp
 
 from plan_sequence.sim_string import get_body_color_dict
 from plan_sequence.physics_planner import MultiPartPathPlanner, MultiPartStabilityPlanner
+from plan_sequence.stable_pose import get_combined_mesh
 from plan_sequence.planner.base import SequencePlanner
 from plan_robot.render_grasp import render_path_with_grasp
 from plan_robot.render_grasp_arm import render_path_with_grasp_and_arm
@@ -152,11 +153,48 @@ def _render_step_worker(asset_folder, assembly_dir, step_arg, result_paths, opti
             parts_removed=parts_removed, pose=pose, save_sdf=save_sdf,
             camera_pos=camera_pos, camera_lookat=camera_lookat)
         success, path = path_planner.plan_path(action, rotation=True, connect_path=connect_path)
-        assert success, f'[play_logged_plan] step {i} part_move {part_move}: path planner failed'
+        if not success:
+            # The planner's check_success can fail to reproduce a previously-successful
+            # action on rendering replays due to numerical edge cases (the qdotdot stall
+            # criterion sits very close to the threshold for some actions). Don't crash
+            # the worker — a hard exception here kills the multiprocessing process
+            # without putting anything on the result queue, which hangs the parent
+            # batch indefinitely. Skip rendering for this step instead: subsequent
+            # steps will still render normally; this step's GIF will be missing.
+            print(f'[play_logged_plan] WARNING: step {i} part_move {part_move}: '
+                  f'plan_path returned success=False on rendering replay (path_len={len(path)}). '
+                  f'Skipping render for this step.', flush=True)
+            print(f'[play_logged_plan] pid={os.getpid()} step {i} ({part_move}) SKIPPED in {_time.time() - _t0:.1f}s', flush=True)
+            return
 
         min_path_len = 300
         while len(path) < min_path_len:
             path = interpolate_path(path)
+
+        # Lazy grasp computation for the arm renderer. The parallel DFA path
+        # (_simulate_standalone) skips grasp planning during search to keep
+        # candidate evaluation cheap, so sim_info['grasp'] is None even when
+        # plan_arm was True at search time. If the caller asked for arm
+        # rendering and we don't have a grasp yet, instantiate GraspArmPlanner
+        # on the fly with the now-known disassembly `path`. Failure is non-fatal:
+        # the renderer skips the arm overlay when grasps stays None.
+        if show_arm and grasps is None:
+            try:
+                from plan_robot.run_grasp_arm_plan import GraspArmPlanner
+                _grasp_planner = GraspArmPlanner(
+                    asset_folder, assembly_dir,
+                    gripper_type=gripper_type, gripper_scale=gripper_scale,
+                )
+                grasps = _grasp_planner.plan(
+                    part_move, parts_rest, parts_removed, pose, path,
+                    early_terminate=True,
+                )
+                if not grasps:
+                    print(f'[play_logged_plan] step {i} ({part_move}): no feasible grasp/arm config; skipping arm render.', flush=True)
+                    grasps = None
+            except Exception as e:
+                print(f'[play_logged_plan] step {i} ({part_move}): GraspArmPlanner failed: {e}; skipping arm render.', flush=True)
+                grasps = None
 
         if (show_grasp or show_arm) and grasps is not None:
             n_render = min(3, len(grasps))
@@ -370,6 +408,158 @@ def play_logged_plan(asset_folder, assembly_dir, sequence, tree, result_dir, sav
 
     if clear_sdf:
         clear_saved_sdfs(assembly_dir)
+
+
+_UNIFIED_DIRECTIONS = [
+    np.array([1, 0, 0]), np.array([-1, 0, 0]),
+    np.array([0, 1, 0]), np.array([0, -1, 0]),
+    np.array([0, 0, 1]), np.array([0, 0, -1]),
+]
+
+
+def _render_unified_split(asset_folder, assembly_dir, parts_S, parts_R, record_path, options):
+    """Render the subassembly R separating from S, with each side fused into a
+    single rigid body. Combines each side's meshes into one .obj in a temp dir
+    (same approach as physics_planner.verify_separation), builds a two-body path
+    planner, finds the first world-axis direction that separates them, and
+    renders that motion. Returns True on success."""
+    import tempfile
+
+    if not parts_S or not parts_R:
+        return False
+
+    tmp_dir = tempfile.mkdtemp(prefix='render_split_')
+    try:
+        get_combined_mesh(assembly_dir, list(parts_S)).export(os.path.join(tmp_dir, 'S.obj'))
+        get_combined_mesh(assembly_dir, list(parts_R)).export(os.path.join(tmp_dir, 'R.obj'))
+
+        planner = MultiPartPathPlanner(
+            asset_folder, tmp_dir, ['S'], 'R', pose=None,
+            save_sdf=options['save_sdf'],
+            camera_pos=options['camera_pos'], camera_lookat=options['camera_lookat'],
+        )
+
+        path = None
+        for direction in _UNIFIED_DIRECTIONS:
+            success, candidate = planner.plan_path(direction, rotation=False, connect_path=False)
+            if success:
+                path = candidate
+                break
+        if path is None:
+            print('[play_logged_plan] unified split: no separating direction found, skipping split render')
+            return False
+
+        min_path_len = 300
+        while len(path) < min_path_len:
+            path = interpolate_path(path)
+
+        body_color_dict = get_body_color_dict(['S'], ['R'], parts_moving=['R'])
+        planner.sim.set_body_color_map(body_color_dict)
+        planner.render(path=path, reverse=options['reverse'],
+                       record_path=record_path, make_video=options['make_video'])
+        return True
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _render_subassembly_internal(asset_folder, assembly_dir, parts_subset, sequence, tree,
+                                 record_dir, options, label):
+    """Render the disassembly of the parts inside one subassembly, showing only
+    those parts. The motion for each removed part is planned in the FULL assembly
+    context (reusing the global plan), then replayed in a render-only sim that
+    contains only `parts_subset`, so the other subassembly's parts are invisible.
+
+    `label` prefixes the output GIF names (e.g. 'S' / 'R')."""
+    subset = set(parts_subset)
+    parts_assembled = sorted(load_part_ids(assembly_dir))
+
+    _parts_assembled = list(parts_assembled)
+    _parts_removed = []
+    sub_removed = []  # subset parts already rendered as removed
+
+    for i, part_move in enumerate(sequence):
+        parts_rest = [p for p in _parts_assembled if p != part_move]
+
+        if part_move in subset:
+            sub_remaining = [p for p in subset if p not in sub_removed]
+            # Skip the final lone part of the subassembly (nothing to remove it from).
+            if len(sub_remaining) > 1:
+                sim_info = tree.edges[tuple(_parts_assembled), tuple(parts_rest)]['sim_info']
+                assert part_move == sim_info['part_move']
+                action = np.array(sim_info['action'])
+                pose = np.array(sim_info['pose']) if sim_info['pose'] is not None else None
+
+                # Plan the motion with all parts present (reuse the global plan).
+                full_planner = MultiPartPathPlanner(
+                    asset_folder, assembly_dir, parts_rest, part_move,
+                    parts_removed=list(_parts_removed), pose=pose, save_sdf=options['save_sdf'],
+                    camera_pos=options['camera_pos'], camera_lookat=options['camera_lookat'],
+                )
+                success, path = full_planner.plan_path(
+                    action, rotation=True, connect_path=options['connect_path'])
+                assert success, (f'[play_logged_plan] subassembly {label} step {i} '
+                                 f'part_move {part_move}: path planner failed')
+
+                min_path_len = 300
+                while len(path) < min_path_len:
+                    path = interpolate_path(path)
+
+                # Replay the motion in a render-only sim with ONLY this subassembly's
+                # parts present, so the other subassembly is invisible.
+                sub_rest = [p for p in subset if p != part_move and p not in sub_removed]
+                reduced = MultiPartPathPlanner(
+                    asset_folder, assembly_dir, sub_rest, part_move,
+                    parts_removed=list(sub_removed), pose=pose, save_sdf=options['save_sdf'],
+                    camera_pos=options['camera_pos'], camera_lookat=options['camera_lookat'],
+                )
+                body_color_dict = get_body_color_dict([], sub_rest + [part_move], parts_moving=[part_move])
+                reduced.sim.set_body_color_map(body_color_dict)
+                ext = 'mp4' if options['make_video'] else 'gif'
+                record_path = os.path.join(record_dir, f'{label}_{i}_{part_move}.{ext}')
+                reduced.render(path=path, reverse=options['reverse'],
+                               record_path=record_path, make_video=options['make_video'])
+
+            sub_removed.append(part_move)
+
+        _parts_assembled = parts_rest
+        _parts_removed.append(part_move)
+
+
+def play_subassembly_split(asset_folder, assembly_dir, split, sequence, tree, result_dir,
+                           save_sdf=False, make_video=False, reverse=False, connect_path=False,
+                           camera_pos=None, camera_lookat=None):
+    """Render the divide-optimizer subassembly split: one clip of R separating
+    from S (each fused into a single rigid body), then the internal disassembly
+    of each subassembly shown in isolation.
+
+    `split` is the dict persisted as stats['divide_split'] = {'S': [...], 'R': [...]}.
+    Output GIFs are written under `result_dir`."""
+    parts_S = list(split.get('S') or [])
+    parts_R = list(split.get('R') or [])
+    if not parts_S or not parts_R:
+        print('[play_subassembly_split] empty split, nothing to render')
+        return
+
+    os.makedirs(result_dir, exist_ok=True)
+    options = {
+        'save_sdf': save_sdf,
+        'make_video': make_video,
+        'reverse': reverse,
+        'connect_path': connect_path,
+        'camera_pos': camera_pos,
+        'camera_lookat': camera_lookat,
+    }
+
+    ext = 'mp4' if make_video else 'gif'
+    print(f'[play_subassembly_split] S={sorted(parts_S)}  R={sorted(parts_R)}')
+
+    _render_unified_split(asset_folder, assembly_dir, parts_S, parts_R,
+                          os.path.join(result_dir, f'split.{ext}'), options)
+
+    _render_subassembly_internal(asset_folder, assembly_dir, parts_S, sequence, tree,
+                                 result_dir, options, label='S')
+    _render_subassembly_internal(asset_folder, assembly_dir, parts_R, sequence, tree,
+                                 result_dir, options, label='R')
 
 
 if __name__ == '__main__':

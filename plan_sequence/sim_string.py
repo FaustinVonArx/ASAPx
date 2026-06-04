@@ -147,7 +147,7 @@ def _arr_to_str(arr):
 def _get_basic_sim_substring(gravity=False):
     substring = f'''
 <redmax model="assemble">
-<option integrator="BDF1" timestep="1e-3" gravity="0. 0. {-9.8 if gravity else 1e-12}"/>
+<option integrator="BDF1" timestep="1e-3" gravity="0. 0. {-980 if gravity else 1e-12}"/>
 <ground pos="0 0 {GROUND_Z}" normal="0 0 1"/>
 '''
     return substring
