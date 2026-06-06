@@ -20,7 +20,10 @@ from assets.load import load_assembly_all_transformed, load_pos_quat_dict
 from assets.transform import get_pos_quat_from_pose, get_transform_from_path
 from plan_sequence.stable_pose import get_stable_poses
 from plan_sequence.feasibility_check import check_assemblable
-from plan_robot.util_grasp import Grasp, compute_antipodal_pairs, generate_gripper_states, get_gripper_open_ratio
+from plan_robot.util_grasp import (
+    Grasp, compute_antipodal_pairs, generate_gripper_states, get_gripper_open_ratio,
+    generate_rod_contacts, check_rod_feasible,
+)
 from plan_robot.render_grasp import render_path_with_grasp
 from plan_robot.geometry import load_gripper_meshes, transform_gripper_meshes, transform_part_meshes
 from utils.seed import set_seed
@@ -48,6 +51,17 @@ class GraspPlanner:
         self.n_angle = n_angle
 
     def generate_grasps(self, part_mesh, disassembly_direction=None):
+        # Rod contact model: each grasp is a single surface point with the
+        # outward normal as the approach direction. No antipodal-pair
+        # constraint, no open-ratio width filter, no angular sweep — every
+        # surface sample is a candidate. See generate_rod_contacts for
+        # details (in util_grasp.py).
+        if self.gripper_type == 'rod':
+            return generate_rod_contacts(
+                part_mesh, disassembly_direction, self.gripper_scale,
+                gripper_type='rod', sample_budget=self.n_surface_pt,
+            )
+
         grasps = []
 
         # compute antipodal points
@@ -69,6 +83,16 @@ class GraspPlanner:
         return grasp
 
     def check_grasp_feasible(self, grasp, move_mesh, still_mesh, verbose=False, render=False):
+        # Rod contact model: only rod-vs-ground and rod-vs-still need
+        # checking. No rod-vs-move (the rod approaches along the outward
+        # normal so it doesn't penetrate the moving part).
+        if self.gripper_type == 'rod':
+            rod_meshes = transform_gripper_meshes(
+                'rod', self.gripper_meshes, grasp.pos, grasp.quat,
+                self.gripper_scale, np.eye(4), 1.0,
+            )
+            return check_rod_feasible(rod_meshes, still_mesh, verbose=verbose)
+
         gripper_pos, gripper_quat, open_ratio = grasp.pos, grasp.quat, grasp.open_ratio
 
         # gripper collision manager (loose hold)

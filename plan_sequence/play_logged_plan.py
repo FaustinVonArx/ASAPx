@@ -178,11 +178,119 @@ def _render_step_worker(asset_folder, assembly_dir, step_arg, result_paths, opti
         # rendering and we don't have a grasp yet, instantiate GraspArmPlanner
         # on the fly with the now-known disassembly `path`. Failure is non-fatal:
         # the renderer skips the arm overlay when grasps stays None.
+        #
+        # The gripper / arm OBJs live under `ASAPx/assets/{panda,robotiq_*}/`,
+        # not under the top-level `./assets/` that holds the assembly part
+        # meshes (which `asset_folder` points at when called from the host
+        # repo's sequence_planner._render_plan). Resolve a separate
+        # `arm_asset_folder` from this module's own project_base_dir
+        # (= the ASAPx submodule root) so the gripper meshes load
+        # regardless of which repo invoked us.
+        arm_asset_folder = os.path.join(project_base_dir, 'assets')
+
+        # Pre-computed arm plan from arm_pipeline. If present + the step is
+        # marked feasible, we replay the precomputed (transition + disassembly)
+        # arm trajectory and skip the lazy per-step GraspArmPlanner+RRT path
+        # below entirely. Failure to load is non-fatal — falls through to the
+        # lazy path the worker already had.
+        precomputed_plan = None
+        precomputed_step = None
+        precomputed_in_transition = None
+        precomputed_out_transition = None
+        if show_arm and options.get('arm_plans_path'):
+            try:
+                from plan_robot.arm_pipeline import load_arm_plan
+                precomputed_plan = load_arm_plan(os.path.dirname(options['arm_plans_path']))
+            except Exception as _pe:
+                print(f'[play_logged_plan] step {i} ({part_move}): failed to load arm_plans: {_pe}', flush=True)
+                precomputed_plan = None
+            if precomputed_plan:
+                steps = precomputed_plan.get('steps') or []
+                # Also require arm_path_full — in simplified mode the step is
+                # marked feasible but carries no joint-space path, so there's
+                # nothing for the precomputed renderer to play back.
+                if (0 <= i < len(steps) and steps[i]
+                        and steps[i].get('feasible')
+                        and steps[i].get('arm_path_full')):
+                    precomputed_step = steps[i]
+                    # Current inter-step schema (3 transition kinds):
+                    #   prefix:  rest -> step_0.start_q                  (to_step=0)
+                    #   inter:   step_k.end_q -> step_{k+1}.start_q      (to_step=k+1)
+                    #   suffix:  step_{N-1}.end_q -> rest                (from_step=N-1, to_step=-1)
+                    # Inbound for step i = transition with to_step == i
+                    #    (prefix when i==0, inter otherwise).
+                    # Outbound for step i = transition with from_step==i AND
+                    #    to_step==-1 (suffix, only set for the last step).
+                    #
+                    # Backward compat: also accept old 'reach' / 'retreat'
+                    # kinds from JSONs written by earlier pipeline versions,
+                    # and the original sequence-level schema (kind=None).
+                    NEW_INBOUND_KINDS = {'prefix', 'inter', 'reach'}
+                    NEW_OUTBOUND_KINDS = {'suffix', 'retreat'}
+                    for tr in (precomputed_plan.get('transitions') or []):
+                        if not tr.get('feasible'):
+                            continue
+                        kind = tr.get('kind')
+                        if kind in NEW_INBOUND_KINDS and tr.get('to_step') == i:
+                            precomputed_in_transition = tr.get('arm_path_full')
+                        elif kind in NEW_OUTBOUND_KINDS and tr.get('from_step') == i:
+                            precomputed_out_transition = tr.get('arm_path_full')
+                        elif kind is None:
+                            # Old (pre-kind) schema fallback.
+                            if tr.get('to_step') == i:
+                                precomputed_in_transition = tr.get('arm_path_full')
+                            if (tr.get('from_step') == i
+                                    and tr.get('to_step') == -1):
+                                precomputed_out_transition = tr.get('arm_path_full')
+
+        if precomputed_step is not None:
+            # Render via the precomputed-arm renderer. No lazy planning, no
+            # in-worker IK/RRT; just play back the JSON. We still produce the
+            # part-only path GIF below (the path_planner.render() call) so the
+            # standard non-arm renders aren't affected.
+            try:
+                from plan_robot.render_grasp_arm import render_step_from_precomputed
+                if record_dir_grasp is not None:
+                    record_path_grasp = os.path.join(
+                        record_dir_grasp,
+                        f'{i}_{part_move}.mp4' if make_video else f'{i}_{part_move}.gif',
+                    )
+                else:
+                    record_path_grasp = None
+                # Per-step base (new schema); fall back to top-level when
+                # the JSON still uses the old sequence-level schema.
+                arm_pos_step = (precomputed_step.get('arm_pos')
+                                or precomputed_plan.get('arm_pos'))
+                arm_euler_step = (precomputed_step.get('arm_euler')
+                                  or precomputed_plan.get('arm_euler'))
+                body_matrices = render_step_from_precomputed(
+                    arm_asset_folder, assembly_dir, part_move, parts_rest, parts_removed,
+                    pose, path, gripper_type, gripper_scale,
+                    step_plan=precomputed_step,
+                    transition_in_path=precomputed_in_transition,
+                    transition_out_path=precomputed_out_transition,
+                    arm_pos=arm_pos_step, arm_euler=arm_euler_step,
+                    camera_lookat=camera_lookat, camera_pos=camera_pos,
+                    body_color_map=body_color_dict, reverse=reverse,
+                    record_path=record_path_grasp, make_video=make_video,
+                )
+                if path_dir is not None and body_matrices is not None:
+                    path_i_dir = os.path.join(path_dir, f'{i}_{part_move}_arm')
+                    save_path_all_objects(path_i_dir, body_matrices, n_frame=n_frame)
+                # Done with the arm rendering for this step — don't fall through
+                # to the lazy code paths below.
+                grasps = 'precomputed'  # sentinel: skip both fallback blocks
+            except Exception as _re:
+                print(f'[play_logged_plan] step {i} ({part_move}): precomputed-arm render failed: {_re}; '
+                      f'falling back to lazy path.', flush=True)
+                import traceback as _tb
+                print(_tb.format_exc())
+
         if show_arm and grasps is None:
             try:
                 from plan_robot.run_grasp_arm_plan import GraspArmPlanner
                 _grasp_planner = GraspArmPlanner(
-                    asset_folder, assembly_dir,
+                    arm_asset_folder, assembly_dir,
                     gripper_type=gripper_type, gripper_scale=gripper_scale,
                 )
                 grasps = _grasp_planner.plan(
@@ -196,7 +304,28 @@ def _render_step_worker(asset_folder, assembly_dir, step_arg, result_paths, opti
                 print(f'[play_logged_plan] step {i} ({part_move}): GraspArmPlanner failed: {e}; skipping arm render.', flush=True)
                 grasps = None
 
-        if (show_grasp or show_arm) and grasps is not None:
+        # Diagnostic snapshot: render the arm at rest next to the assembly
+        # whenever the step ends up WITHOUT an arm overlay — regardless of
+        # which planning path attempted it. Fires when:
+        #   - precomputed plan marked the step infeasible AND lazy fallback
+        #     also failed, OR
+        #   - no precomputed plan was loaded AND lazy fallback failed.
+        # Saved under <record_dir>/arm_debug/. Non-fatal.
+        if show_arm and grasps is None and record_dir is not None:
+            try:
+                from plan_robot.render_grasp_arm import render_arm_next_to_assembly
+                debug_dir = os.path.join(record_dir, 'arm_debug')
+                debug_path = os.path.join(debug_dir, f'step_{i}_{part_move}.png')
+                saved = render_arm_next_to_assembly(
+                    arm_asset_folder, assembly_dir, part_move, parts_rest, parts_removed,
+                    pose, gripper_type, gripper_scale, save_path=debug_path,
+                )
+                if saved is not None:
+                    print(f'[play_logged_plan] step {i} ({part_move}): arm-vs-assembly debug snapshot → {saved}', flush=True)
+            except Exception as _dbg_e:
+                print(f'[play_logged_plan] step {i} ({part_move}): debug snapshot failed: {_dbg_e}', flush=True)
+
+        if (show_grasp or show_arm) and grasps is not None and grasps != 'precomputed':
             n_render = min(3, len(grasps))
             random_indices = np.random.choice(len(grasps), n_render, replace=False)
             for idx in random_indices:
@@ -206,10 +335,10 @@ def _render_step_worker(asset_folder, assembly_dir, step_arg, result_paths, opti
                 else:
                     record_path_grasp = None
                 if show_arm:
-                    body_matrices = render_path_with_grasp_and_arm(asset_folder, assembly_dir, part_move, parts_rest, parts_removed, pose, path, gripper_type, gripper_scale, grasp, optimizer, camera_lookat, camera_pos,
+                    body_matrices = render_path_with_grasp_and_arm(arm_asset_folder, assembly_dir, part_move, parts_rest, parts_removed, pose, path, gripper_type, gripper_scale, grasp, optimizer, camera_lookat, camera_pos,
                         body_color_dict, reverse, save_record or save_all, record_path_grasp, make_video)
                 else:
-                    body_matrices = render_path_with_grasp(asset_folder, assembly_dir, part_move, parts_rest, parts_removed, pose, path, gripper_type, gripper_scale, grasp, camera_lookat, camera_pos,
+                    body_matrices = render_path_with_grasp(arm_asset_folder, assembly_dir, part_move, parts_rest, parts_removed, pose, path, gripper_type, gripper_scale, grasp, camera_lookat, camera_pos,
                         body_color_dict, reverse, save_record or save_all, record_path_grasp, make_video)
 
                 if path_dir is not None:
@@ -267,7 +396,7 @@ def _render_step_worker(asset_folder, assembly_dir, step_arg, result_paths, opti
 
 def play_logged_plan(asset_folder, assembly_dir, sequence, tree, result_dir, save_mesh, save_pose, save_part, save_path, save_record, save_all,
     reverse=False, show_fix=False, show_grasp=False, show_arm=False, gripper_type=None, gripper_scale=None, optimizer='L-BFGS-B', save_sdf=False, clear_sdf=False, make_video=False, budget=None, camera_pos=None, camera_lookat=None, connect_path=False,
-    extra_views=None, tool_meshes_per_step=None, num_proc=1, n_frame=300):
+    extra_views=None, tool_meshes_per_step=None, num_proc=1, n_frame=300, arm_plans_path=None):
     # extra_views: list of (record_dir, camera_pos, camera_lookat) — each entry
     # re-renders the already-simulated path from a different camera, writing
     # GIFs/MP4s into its record_dir. No additional physics simulation is run.
@@ -382,6 +511,11 @@ def play_logged_plan(asset_folder, assembly_dir, sequence, tree, result_dir, sav
             'camera_lookat': camera_lookat,
             'connect_path': connect_path,
             'n_frame': n_frame,
+            # Path to <log_dir>/arm_plans.json produced by arm_pipeline.
+            # When present, each render worker loads the per-step + transition
+            # arm path from this file and plays it back instead of computing
+            # arm motions lazily. None preserves the per-step lazy fallback.
+            'arm_plans_path': arm_plans_path,
         }
 
         if num_proc and num_proc > 1 and len(step_args) > 1:

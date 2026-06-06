@@ -261,7 +261,7 @@ class ArmMotionPlanner:
         
         return distance_fn, sample_fn, extend_fn, collision_fn
 
-    def plan_with_grasp(self, start, goal, move_mesh, move_transform, still_meshes, open_ratio, total_rrt_trials=5, max_rrt_iter=20, max_smooth_iter=1000, verbose=False):
+    def plan_with_grasp(self, start, goal, move_mesh, move_transform, still_meshes, open_ratio, total_rrt_trials=5, max_rrt_iter=20, max_smooth_iter=1000, verbose=False, max_time=None):
         '''
         Plan arm reaching with moving part in held and a single gripper open ratio
         ----------------------------------
@@ -270,7 +270,17 @@ class ArmMotionPlanner:
         move_mesh: mesh to move
         still_meshes: dict of still meshes {name: mesh}
         open_ratio: open ratio of gripper
+        max_time: optional total wall-clock budget (seconds) for the whole
+            planning call. Routed into rrt_connect / smooth_path via their
+            `max_time` parameters. None disables.
         '''
+        import time as _time
+        plan_start = _time.time()
+        def _remaining():
+            if max_time is None:
+                return float('inf')
+            return max(0.0, max_time - (_time.time() - plan_start))
+
         distance_fn, sample_fn, extend_fn, collision_fn = self.get_fns(move_mesh, move_transform, still_meshes, open_ratio, verbose=False)
 
         # print('visualize start')
@@ -286,11 +296,28 @@ class ArmMotionPlanner:
             if verbose:
                 print('goal is in collision')
             return None
-        
+
+        # Reserve roughly 20% of the budget for smoothing; spend the rest on
+        # RRT trials. Per-trial allowance bounds individual rrt_connect runs.
+        if max_time is None:
+            rrt_budget_total = float('inf')
+            smooth_budget = float('inf')
+            per_trial = float('inf')
+        else:
+            smooth_budget = max(1.0, 0.2 * max_time)
+            rrt_budget_total = max(0.0, max_time - smooth_budget)
+            per_trial = rrt_budget_total / max(1, total_rrt_trials)
+
         paths = []
         costs = []
         for i in range(total_rrt_trials):
-            path = rrt_connect(start, goal, distance_fn, sample_fn, extend_fn, collision_fn, max_iterations=max_rrt_iter)
+            if _remaining() <= 0:
+                if verbose:
+                    print(f'plan_with_grasp: budget exhausted at trial {i}/{total_rrt_trials}')
+                break
+            trial_budget = min(per_trial, _remaining())
+            path = rrt_connect(start, goal, distance_fn, sample_fn, extend_fn, collision_fn,
+                               max_iterations=max_rrt_iter, max_time=trial_budget)
             cost = compute_path_cost(path, cost_fn=distance_fn)
             if path is None:
                 cost = np.inf
@@ -300,6 +327,11 @@ class ArmMotionPlanner:
             if verbose:
                 print('RRT trial', i, 'cost', cost)
 
+        # No trial found a path → give up cleanly (was previously a crash
+        # via np.argmin on an empty list).
+        if not paths:
+            return None
+
         path = paths[np.argmin(costs)]
         path.insert(0, start)
 
@@ -307,7 +339,11 @@ class ArmMotionPlanner:
             print(f'path planned (len: {len(path)})')
 
         # smooth path
-        path = smooth_path(path, extend_fn, collision_fn, distance_fn, None, sample_fn, verbose=verbose, max_iterations=max_smooth_iter)
+        smooth_time = min(smooth_budget, _remaining())
+        if smooth_time <= 0:
+            smooth_time = float('inf') if max_time is None else 0.0
+        path = smooth_path(path, extend_fn, collision_fn, distance_fn, None, sample_fn,
+                           verbose=verbose, max_iterations=max_smooth_iter, max_time=smooth_time)
         path.insert(0, start)
 
         in_collision = False

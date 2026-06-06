@@ -8,7 +8,8 @@ from plan_sequence.physics_planner import get_contact_graph, CONTACT_EPS
 # Canonical feature ordering for the linear cost `cost = w · phi`. The weight
 # dict (settings.heuristic_weights) and any learned weight vector are indexed
 # in this order.
-FEATURE_ORDER = ('contact_distance', 'free_dof', 'z_alignment', 'pose_change')
+FEATURE_ORDER = ('contact_distance', 'free_dof', 'z_alignment', 'pose_change',
+                 'hold_count')
 
 
 class HeuristicDFASequencePlanner(DFASequencePlanner):
@@ -34,6 +35,13 @@ class HeuristicDFASequencePlanner(DFASequencePlanner):
          consecutive steps. 0 at the root (no predecessor) and whenever either
          pose is None. Requires `parent_pose` to be threaded in by the caller;
          pass None to keep this feature inert for a given call.
+      5. `hold_count` — number of EXTRA parts that must be held (beyond the
+         moving gripper) for the assembly to stay stable during the step,
+         taken from `len(sim_info['parts_fix'])`. 0 means the rest of the
+         assembly is self-supporting and a single gripper is enough; higher
+         values mean the operator/robot needs additional fixtures or hands.
+         0 (inert) when `parts_fix` is None (stability check did not run or
+         failed) — the feature only carries signal for feasible edges.
 
     All metrics are oriented so smaller = better; selection MINIMISES the
     weighted sum.
@@ -44,10 +52,11 @@ class HeuristicDFASequencePlanner(DFASequencePlanner):
     """
 
     DEFAULT_WEIGHTS = {
-        'contact_distance': 1.0,
-        'free_dof': 1.0,
+        'contact_distance': 0.8,
+        'free_dof': 0.4,
         'z_alignment': 1.0,
         'pose_change': 1.0,
+        'hold_count': 3.0,
     }
 
     def _load_weights(self):
@@ -156,7 +165,18 @@ class HeuristicDFASequencePlanner(DFASequencePlanner):
             except (ValueError, TypeError):
                 c4 = 0.0
 
-        return np.array([c1, c2, c3, c4], dtype=float)
+        # Feature 5 (hold_count): number of extra parts that must be held
+        # to keep the assembly stable during the step. sim_info['parts_fix']
+        # lists those parts; +1 (the moving gripper) is constant across all
+        # candidates so we leave it out. Inert (0) when parts_fix is None
+        # — stability never resolved a fix list (failed or skipped).
+        parts_fix = sim_info.get('parts_fix')
+        if parts_fix is None:
+            c5 = 0.0
+        else:
+            c5 = float(len(parts_fix))
+
+        return np.array([c1, c2, c3, c4, c5], dtype=float)
 
     def _cost_child(self, weights, G_prime, sim_info, parent_G, parent_pose=None):
         phi = self._features_child(G_prime, sim_info, parent_G, parent_pose=parent_pose)

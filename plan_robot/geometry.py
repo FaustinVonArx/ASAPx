@@ -44,6 +44,30 @@ def load_robotiq_140_meshes(asset_folder, visual=False):
     return meshes
 
 
+def _ensure_rod_obj(asset_folder):
+    """Ensure ASAPx/assets/rod/visual/rod.obj exists. Generated once at first
+    use (cylinder primitive) so we don't need to ship a binary asset. The
+    file is also where redmax's XML asset_folder resolution looks."""
+    from plan_robot.util_grasp import ROD_LENGTH, ROD_RADIUS
+    rod_dir = os.path.join(asset_folder, 'rod', 'visual')
+    obj_path = os.path.join(rod_dir, 'rod.obj')
+    if not os.path.exists(obj_path):
+        os.makedirs(rod_dir, exist_ok=True)
+        rod = trimesh.creation.cylinder(radius=ROD_RADIUS, height=ROD_LENGTH, sections=24)
+        # cylinder() centers the mesh at the origin extending along z from
+        # -h/2 to +h/2. Shift so the base sits at z=0 and the tip at +z=L —
+        # the wrist sits at the base (== mesh origin) and the contact point
+        # ends up at the tip after rotation.
+        rod.apply_translation([0, 0, ROD_LENGTH / 2.0])
+        rod.export(obj_path)
+    return obj_path
+
+
+def load_rod_meshes(asset_folder, visual=False):
+    obj_path = _ensure_rod_obj(asset_folder)
+    return {'rod_base': trimesh.load(obj_path)}
+
+
 def load_gripper_meshes(gripper_type, asset_folder, visual=False):
     if gripper_type == 'panda':
         return load_panda_meshes(asset_folder, visual=visual)
@@ -51,6 +75,8 @@ def load_gripper_meshes(gripper_type, asset_folder, visual=False):
         return load_robotiq_85_meshes(asset_folder, visual=visual)
     elif gripper_type == 'robotiq-140':
         return load_robotiq_140_meshes(asset_folder, visual=visual)
+    elif gripper_type == 'rod':
+        return load_rod_meshes(asset_folder, visual=visual)
     else:
         raise NotImplementedError
 
@@ -138,6 +164,17 @@ def transform_robotiq_140_meshes(meshes, pos, quat, scale, pose, open_ratio):
     return meshes
 
 
+def transform_rod_meshes(meshes, pos, quat, scale, pose, open_ratio):
+    # Rod has no internal joints. Just scale + rigid-transform the single
+    # rod_base mesh. open_ratio is ignored.
+    meshes = {k: v.copy() for k, v in meshes.items()}
+    pos, quat = get_pos_quat_from_pose(pos, quat, pose)
+    for name, mesh in meshes.items():
+        mesh.apply_transform(get_scale_matrix(scale))
+        mesh.apply_transform(get_transform_matrix_quat(pos, quat))
+    return meshes
+
+
 def transform_gripper_meshes(gripper_type, meshes, pos, quat, scale, pose, open_ratio):
     if gripper_type == 'panda':
         return transform_panda_meshes(meshes, pos, quat, scale, pose, open_ratio)
@@ -145,6 +182,8 @@ def transform_gripper_meshes(gripper_type, meshes, pos, quat, scale, pose, open_
         return transform_robotiq_85_meshes(meshes, pos, quat, scale, pose, open_ratio)
     elif gripper_type == 'robotiq-140':
         return transform_robotiq_140_meshes(meshes, pos, quat, scale, pose, open_ratio)
+    elif gripper_type == 'rod':
+        return transform_rod_meshes(meshes, pos, quat, scale, pose, open_ratio)
     else:
         raise NotImplementedError
 

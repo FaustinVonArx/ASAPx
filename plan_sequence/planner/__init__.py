@@ -6,6 +6,7 @@ from .heuristic import HeuristicDFASequencePlanner
 from .llm import LLMDFASequencePlanner
 from .comparison import ComparisonDFASequencePlanner
 from .preference import PreferenceLearningDFASequencePlanner
+from .generator_adapter import GeneratorAdapterDFASequencePlanner
 
 
 planners = {
@@ -17,4 +18,5 @@ planners = {
     'llm': LLMDFASequencePlanner,
     'comparison': ComparisonDFASequencePlanner,
     'preference': PreferenceLearningDFASequencePlanner,
+    'gen-adapter': GeneratorAdapterDFASequencePlanner,
 }

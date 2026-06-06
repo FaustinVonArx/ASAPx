@@ -3,6 +3,13 @@ from scipy.spatial.transform import Rotation
 from .transform import transform_pts_by_state
 
 
+# Scale factor applied to the still-assembly bbox when used as the disassembly
+# threshold.  The inflated bbox is centered at the assembly origin (0, 0, 0)
+# rather than the still-assembly bbox center, so a part must travel slightly
+# further to be considered disassembled.
+BBOX_INFLATE = 1.5
+
+
 def transform_vectors(vectors, config):
     if len(config) == 3: # translation only
         return vectors + config
@@ -27,10 +34,20 @@ def get_bbox_all(vertices, configs):
     return min_box, max_box
 
 
+def get_inflated_still_bbox(vertices_still, scale=BBOX_INFLATE):
+    """Return (min, max) of a bbox that is `scale` times the size of the still
+    assembly bbox, recentered at the assembly origin (0, 0, 0).  Used as the
+    threshold for "fully disassembled" — the moving part must escape this
+    inflated box, which is strictly larger than the original still bbox."""
+    min_box_still, max_box_still = get_bbox(vertices_still)
+    half_size = 0.5 * scale * (max_box_still - min_box_still)
+    return -half_size, half_size
+
+
 def get_bbox_goal_test(vertices_move, vertices_still):
     min_box_move, max_box_move = get_bbox(vertices_move)
-    min_box_still, max_box_still = get_bbox(vertices_still)
-    
+    min_box_still, max_box_still = get_inflated_still_bbox(vertices_still)
+
     def goal_test(config):
         if len(config) == 3: # translation only
             return ((config + min_box_move) >= max_box_still).any() or ((config + max_box_move) <= min_box_still).any()
@@ -46,9 +63,9 @@ def get_bbox_goal_test(vertices_move, vertices_still):
 def compute_nearest_bbox_goal(nodes, vertices_move, vertices_still):
     nodes_configs = np.array([n.config for n in nodes])
     if nodes_configs.shape[1] == 3: # translation only
-        
+
         min_box_move, max_box_move = get_bbox(vertices_move)
-        min_box_still, max_box_still = get_bbox(vertices_still)
+        min_box_still, max_box_still = get_inflated_still_bbox(vertices_still)
         size_box_move = max_box_move - min_box_move
         dist_to_min = -(min_box_still - (nodes_configs + min_box_move) - size_box_move)
         dist_to_max = max_box_still - (nodes_configs + max_box_move) + size_box_move
@@ -56,7 +73,7 @@ def compute_nearest_bbox_goal(nodes, vertices_move, vertices_still):
     elif nodes_configs.shape[1] == 6: # translation + rotation
 
         min_box_move, max_box_move = get_bbox_all(vertices_move, nodes_configs)
-        min_box_still, max_box_still = get_bbox(vertices_still)
+        min_box_still, max_box_still = get_inflated_still_bbox(vertices_still)
         size_box_move = max_box_move - min_box_move
         dist_to_min = -(min_box_still - min_box_move - size_box_move)
         dist_to_max = max_box_still - max_box_move + size_box_move

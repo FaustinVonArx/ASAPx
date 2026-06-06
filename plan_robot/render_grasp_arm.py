@@ -20,6 +20,15 @@ from plan_robot.util_grasp import get_gripper_finger_states, get_gripper_base_na
 from plan_robot.motion_plan_arm import ArmMotionPlanner
 
 
+def _flatten_finger_states(finger_states):
+    # Concatenate joint values across all fingers. Returns an empty 1-D array
+    # when the gripper has no fingers (e.g. the rod contact model), so
+    # downstream `np.concatenate([..., fingers, ...])` calls don't blow up.
+    if not finger_states:
+        return np.zeros(0, dtype=float)
+    return np.concatenate(list(finger_states.values()))
+
+
 def _build_static_meshes(assembly_dir, move_id, still_ids, removed_ids, pose, move_delta_T=None):
     """Return a list of trimesh meshes representing the static environment at
     one moment in time, in world frame, used for arm-motion collision checks.
@@ -81,6 +90,103 @@ def _states_from_arm_path(sim, gripper_type, gripper_scale, arm_chain, arm_path_
         arm_active = arm_q_full[1:]  # strip the immutable base link
         states.append(np.concatenate([fixed_part_local, gripper_local, finger_open_state, arm_active]))
     return states
+
+
+def render_arm_next_to_assembly(asset_folder, assembly_dir, move_id, still_ids, removed_ids,
+                                pose, gripper_type, gripper_scale,
+                                save_path, size=(900, 700)):
+    """Off-screen pyvista snapshot of the arm at its default rest pose placed
+    next to the (posed) assembly. Use this to diagnose scale / reachability
+    issues without needing to step through redmax. Renders:
+      - All static parts colored gray (assembly_final + parts_initial for the
+        ones removed in earlier steps).
+      - The arm meshes posed at rest_q with base at the first candidate from
+        get_arm_pos_candidates (gripper imagined to be at the assembly center).
+      - A ground plane outline at z=0 for reference.
+
+    Returns the saved path on success, or None on failure (e.g. pyvista import
+    error, missing meshes). Non-fatal.
+    """
+    try:
+        import pyvista as pv
+        from plan_robot.geometry import load_arm_meshes, transform_arm_meshes
+        from plan_robot.util_arm import (
+            get_arm_chain, get_arm_pos_candidates, get_arm_euler,
+            get_default_arm_rest_q,
+        )
+
+        os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+
+        # Static parts at their world-frame poses (matches what GraspArmPlanner
+        # would see at the start of this disassembly step).
+        still_meshes = _build_static_meshes(
+            assembly_dir, move_id, still_ids, removed_ids, pose, move_delta_T=None,
+        )
+
+        # Assembly center / gripper imagined position. The arm-base heuristic
+        # uses get_arm_pos_candidates which projects toward a gripper pose;
+        # use the assembly's bounding-box center as a stand-in for "where the
+        # arm would try to reach."
+        if still_meshes:
+            all_v = np.concatenate([m.vertices for m in still_meshes], axis=0)
+            center = all_v.mean(axis=0)
+            center[2] = 0.0
+        else:
+            center = np.zeros(3)
+        gripper_pos = center + np.array([0.0, 0.0, 2.0 * max(1.0, gripper_scale * 5)])  # 5cm above center
+        gripper_ori = np.array([0.0, 0.0, 1.0])  # straight down
+
+        arm_pos_candidates = get_arm_pos_candidates(
+            gripper_pos, gripper_ori, gripper_scale, center=center,
+        )
+        arm_pos = arm_pos_candidates[0]
+        arm_euler = get_arm_euler(arm_pos, center=center)
+
+        arm_scale = gripper_scale
+        chain = get_arm_chain(base_pos=arm_pos, base_euler=arm_euler, scale=arm_scale)
+        rest_q_active = get_default_arm_rest_q()
+        q_full = chain.active_to_full(rest_q_active, initial_position=[0] * len(chain.links))
+
+        # Load arm meshes (visual for the snapshot). Posed via transform_arm_meshes.
+        arm_meshes_raw = load_arm_meshes(asset_folder, visual=True, convex=False)
+        arm_meshes_posed = transform_arm_meshes(arm_meshes_raw, chain, q_full, scale=arm_scale)
+
+        # Compose the scene.
+        plotter = pv.Plotter(off_screen=True, window_size=tuple(size))
+        for m in still_meshes:
+            plotter.add_mesh(pv.wrap(m), color='lightgray', opacity=0.9, show_edges=False)
+        for arm_part_name, arm_mesh in arm_meshes_posed.items():
+            color = 'steelblue' if arm_part_name != 'linkbase' else 'darkslategray'
+            plotter.add_mesh(pv.wrap(arm_mesh), color=color, opacity=1.0, show_edges=False)
+
+        # Ground plane reference. Sized to encompass both arm and assembly.
+        if still_meshes:
+            extent = max(abs(all_v).max(), float(np.linalg.norm(arm_pos))) * 2.2
+        else:
+            extent = max(20.0, float(np.linalg.norm(arm_pos))) * 2.2
+        ground = pv.Plane(center=(center[0], center[1], 0.0),
+                          direction=(0, 0, 1), i_size=extent, j_size=extent)
+        plotter.add_mesh(ground, color='wheat', opacity=0.25, show_edges=True)
+
+        # Annotate scale.
+        try:
+            asm_bbox = np.ptp(all_v, axis=0) if still_meshes else np.zeros(3)
+            arm_reach_approx = 0.85 * arm_scale * 100  # Panda ~85 cm at scale=100
+            text = (f'assembly bbox: {asm_bbox.round(2).tolist()}\n'
+                    f'arm scale: {arm_scale}  approx reach: {arm_reach_approx:.1f}\n'
+                    f'arm base: {arm_pos.round(2).tolist()}\n'
+                    f'assembly center: {center.round(2).tolist()}')
+            plotter.add_text(text, position='upper_left', font_size=8)
+        except Exception:
+            pass
+
+        plotter.camera_position = 'iso'
+        plotter.screenshot(str(save_path))
+        plotter.close()
+        return str(save_path)
+    except Exception as e:
+        print(f'[render_arm_next_to_assembly] failed: {e}')
+        return None
 
 
 def arr_to_str(arr):
@@ -224,6 +330,19 @@ def create_gripper_arm_with_assembly_posed_xml(assembly_dir, move_id, still_ids,
     </link>
 </robot>
 '''
+    elif gripper_type == 'rod':
+        # Single rod cylinder, base at the wrist (free3d-exp joint), tip
+        # extending in +z of the local frame. No fingers. The mesh is
+        # auto-generated by _ensure_rod_obj in geometry.py at first use
+        # and lives at asset_folder/rod/visual/rod.obj.
+        string += f'''
+<robot>
+    <link name="rod_base">
+        <joint name="rod_base" type="free3d-exp" pos="{arr_to_str(gripper_pos)}" quat="{arr_to_str(gripper_quat)}"/>
+        <body name="rod_base" type="mesh" scale="{gripper_scale} {gripper_scale} {gripper_scale}" filename="rod/visual/rod.obj" pos="0 0 0" quat="1 0 0 0" transform_type="OBJ_TO_JOINT" rgba="0.85 0.55 0.15 1.0"/>
+    </link>
+</robot>
+'''
     else:
         raise NotImplementedError
     string += f'''
@@ -294,7 +413,9 @@ def get_finger_open_path(gripper_type, gripper_scale, open_ratio_start, open_rat
     finger_path = []
     for i in range(n_frame):
         open_ratio = open_ratio_start + (open_ratio_end - open_ratio_start) * (i + 1) / (n_frame + 1)
-        finger_states = np.concatenate(list(get_gripper_finger_states(gripper_type, open_ratio, gripper_scale).values()))
+        finger_states = _flatten_finger_states(
+            get_gripper_finger_states(gripper_type, open_ratio, gripper_scale)
+        )
         finger_path.append(finger_states)
     return finger_path
 
@@ -311,7 +432,8 @@ def get_all_paths_from_arm_path(sim, arm_chain, arm_path, gripper_type, open_rat
 
     gripper_path = [sim.get_joint_q_from_qm(gripper_base_name, qm) for qm in gripper_path]
     finger_states = get_gripper_finger_states(gripper_type, open_ratio, gripper_scale)
-    finger_path = [np.concatenate(list(finger_states.values())) for _ in range(len(gripper_path))]
+    finger_flat = _flatten_finger_states(finger_states)
+    finger_path = [finger_flat for _ in range(len(gripper_path))]
     arm_path = [arm_q[1:] for arm_q in arm_path]
 
     if truncate == 'start':
@@ -325,6 +447,121 @@ def get_all_paths_from_arm_path(sim, arm_chain, arm_path, gripper_type, open_rat
         return arm_path, gripper_path, finger_path
     else:
         return arm_path, gripper_path, finger_path, part_path
+
+
+def render_step_from_precomputed(asset_folder, assembly_dir, move_id, still_ids, removed_ids,
+                                  pose, part_path, gripper_type, gripper_scale,
+                                  step_plan, transition_in_path=None, transition_out_path=None,
+                                  arm_pos=None, arm_euler=None,
+                                  camera_lookat=None, camera_pos=None, body_color_map=None,
+                                  reverse=False, record_path=None, make_video=False):
+    """Replay a precomputed (transition_in + disassembly + transition_out)
+    arm trajectory for a single sequence step.
+
+    Inputs are arm_pipeline.plan_arm_sequence() outputs:
+      step_plan = the dict from plan['steps'][i] — carries grasp, arm_path_full
+                  (full Q per disassembly waypoint), and part_path_local.
+      transition_in_path = inbound transition arm_path_full (rest -> grasp or
+                  prev_step.end_q -> this.start_q). None to skip the inbound
+                  phase.
+      transition_out_path = outbound transition arm_path_full (typically only
+                  set for the very last step, to retract to rest). None to skip.
+      arm_pos / arm_euler = the shared world-frame arm base used by the
+                  whole sequence (from plan['arm_pos'], plan['arm_euler']).
+
+    No IK or RRT is run here — purely a state-vector replay through redmax.
+    Returns export_replay_matrices() on success, None otherwise.
+    """
+    if part_path is None or step_plan is None or not step_plan.get('feasible'):
+        return None
+
+    grasp_pos = np.array(step_plan['grasp']['pos'], dtype=float)
+    grasp_quat = np.array(step_plan['grasp']['quat'], dtype=float)
+    open_ratio = float(step_plan['grasp']['open_ratio'])
+    arm_path_full = [np.array(q, dtype=float) for q in step_plan['arm_path_full']]
+    arm_scale = gripper_scale
+
+    if arm_pos is None or arm_euler is None:
+        # Shouldn't happen when called from the pipeline, but be defensive.
+        print('[render_step_from_precomputed] missing arm_pos/arm_euler; aborting.')
+        return None
+    arm_pos = np.asarray(arm_pos, dtype=float)
+    arm_euler = np.asarray(arm_euler, dtype=float)
+
+    xml_string = create_gripper_arm_with_assembly_posed_xml(
+        assembly_dir=assembly_dir, move_id=move_id, still_ids=still_ids,
+        removed_ids=removed_ids, pose=pose,
+        gripper_type=gripper_type, gripper_pos=grasp_pos, gripper_quat=grasp_quat,
+        gripper_scale=gripper_scale,
+        arm_pos=arm_pos, arm_euler=arm_euler, arm_scale=arm_scale,
+    )
+    sim = redmax.Simulation(xml_string, asset_folder)
+    if camera_lookat is not None:
+        sim.viewer_options.camera_lookat = camera_lookat
+    if camera_pos is not None:
+        sim.viewer_options.camera_pos = camera_pos
+
+    grasp_finger_states = get_gripper_finger_states(gripper_type, open_ratio, gripper_scale)
+    for finger_name, finger_state in grasp_finger_states.items():
+        sim.set_joint_q_init(finger_name, np.array(finger_state))
+    sim.reset(backward_flag=False)
+    if body_color_map is not None:
+        sim.set_body_color_map(body_color_map)
+
+    finger_grasp_state = _flatten_finger_states(grasp_finger_states)
+    finger_open_state = _flatten_finger_states(
+        get_gripper_finger_states(gripper_type, 1.0, gripper_scale)
+    )
+
+    # Disassembly-phase state vectors built from the precomputed arm path
+    # and the disassembly part path.
+    arm_chain = get_arm_chain(base_pos=arm_pos, base_euler=arm_euler, scale=arm_scale)
+    gripper_base_name = get_gripper_base_name(gripper_type)
+    part_path_local = [sim.get_joint_q_from_qm(f'part{move_id}', np.asarray(qm, dtype=float)) for qm in part_path]
+    gripper_path = [get_gripper_qm_from_arm_q(arm_chain, q, gripper_type) for q in arm_path_full]
+    gripper_path_local = [sim.get_joint_q_from_qm(gripper_base_name, qm) for qm in gripper_path]
+    # Pad / truncate gripper path to match part path length (rare mismatch
+    # when the path got re-interpolated).
+    n_steps = min(len(part_path_local), len(arm_path_full), len(gripper_path_local))
+    states_disassembly = []
+    for k in range(n_steps):
+        arm_active = arm_path_full[k][1:]
+        states_disassembly.append(np.concatenate([
+            part_path_local[k], gripper_path_local[k], finger_grasp_state, arm_active,
+        ]))
+
+    # Inbound / outbound transitions: arm moves with no part held. Part stays
+    # parked at its first / last disassembly state respectively; fingers open.
+    states_in = []
+    if transition_in_path:
+        first_part_state = part_path_local[0]
+        states_in = _states_from_arm_path(
+            sim, gripper_type, gripper_scale, arm_chain,
+            [np.array(q, dtype=float) for q in transition_in_path],
+            fixed_part_local=first_part_state,
+            gripper_base_name=gripper_base_name,
+            finger_open_state=finger_open_state,
+        )
+
+    states_out = []
+    if transition_out_path:
+        last_part_state = part_path_local[-1]
+        states_out = _states_from_arm_path(
+            sim, gripper_type, gripper_scale, arm_chain,
+            [np.array(q, dtype=float) for q in transition_out_path],
+            fixed_part_local=last_part_state,
+            gripper_base_name=gripper_base_name,
+            finger_open_state=finger_open_state,
+        )
+
+    states = states_in + states_disassembly + states_out
+    if reverse:
+        states = states[::-1]
+    sim.set_state_his(states, [np.zeros_like(states[0]) for _ in range(len(states))])
+
+    SimRenderer.replay(sim, record=record_path is not None,
+                       record_path=record_path, make_video=make_video)
+    return sim.export_replay_matrices()
 
 
 def render_path_with_grasp_and_arm(asset_folder, assembly_dir, move_id, still_ids, removed_ids, pose, part_path, gripper_type, gripper_scale, grasp, optimizer,
@@ -367,7 +604,8 @@ def render_path_with_grasp_and_arm(asset_folder, assembly_dir, move_id, still_id
     part_path_local = [sim.get_joint_q_from_qm(f'part{move_id}', qm) for qm in part_path]
     gripper_base_name = get_gripper_base_name(gripper_type)
     gripper_path_local = [sim.get_joint_q_from_qm(gripper_base_name, qm) for qm in gripper_path]
-    finger_path_local = [np.concatenate(list(finger_states.values())) for _ in range(len(gripper_path_local))]
+    finger_flat = _flatten_finger_states(finger_states)
+    finger_path_local = [finger_flat for _ in range(len(gripper_path_local))]
 
     # get arm path
     arm_chain = get_arm_chain(base_pos=arm_pos, base_euler=arm_euler, scale=arm_scale)
@@ -396,8 +634,8 @@ def render_path_with_grasp_and_arm(asset_folder, assembly_dir, move_id, still_id
     arm_q_last_full = np.asarray(arm_path_full[-1], dtype=float)
     arm_q_first_active = arm_q_first_full[1:]
     arm_q_last_active = arm_q_last_full[1:]
-    finger_open_state = np.concatenate(
-        list(get_gripper_finger_states(gripper_type, 1.0, gripper_scale).values())
+    finger_open_state = _flatten_finger_states(
+        get_gripper_finger_states(gripper_type, 1.0, gripper_scale)
     )
     part_state_first = part_path_local[0]
     part_state_last = part_path_local[-1]

@@ -90,6 +90,19 @@ def get_robotiq_140_grasp_base_offset(open_ratio):
     return 1.5 + 3.8 + np.sin(0.8680 + (1 - open_ratio) * 0.8757) * 10 + 5.4905 + 0.5 # NOTE: extra 0.5 for the finger tip
 
 
+# Rod contact model: a single cylinder with the wrist at one end and the
+# contact point at the other. ROD_LENGTH / ROD_RADIUS are in the same
+# baseline units the gripper offsets use (cm at scale=1).
+ROD_LENGTH = 10.0
+ROD_RADIUS = 0.5
+
+
+def get_rod_grasp_base_offset(open_ratio):
+    # Wrist sits ROD_LENGTH back from the contact point along the rod axis.
+    # open_ratio is unused (no fingers), accepted only for API parity.
+    return ROD_LENGTH
+
+
 def get_gripper_grasp_base_offset(gripper_type, open_ratio):
     if gripper_type == 'panda':
         return get_panda_grasp_base_offset()
@@ -97,6 +110,8 @@ def get_gripper_grasp_base_offset(gripper_type, open_ratio):
         return get_robotiq_85_grasp_base_offset(open_ratio)
     elif gripper_type == 'robotiq-140':
         return get_robotiq_140_grasp_base_offset(open_ratio)
+    elif gripper_type == 'rod':
+        return get_rod_grasp_base_offset(open_ratio)
     else:
         raise NotImplementedError
 
@@ -113,6 +128,14 @@ def get_robotiq_140_basis_directions():
     return [0, 0, -1], [0, 1, 0]
 
 
+def get_rod_basis_directions():
+    # Local rod mesh: base at origin, tip at (0, 0, +ROD_LENGTH). The vector
+    # from contact (tip) back to wrist (base) is -z. The l2r vector is free
+    # (rotation around the rod axis doesn't change anything), so we pick +x
+    # arbitrarily.
+    return [0, 0, -1], [1, 0, 0]
+
+
 def get_gripper_basis_directions(gripper_type):
     if gripper_type == 'panda':
         return get_panda_basis_directions()
@@ -120,6 +143,8 @@ def get_gripper_basis_directions(gripper_type):
         return get_robotiq_85_basis_directions()
     elif gripper_type == 'robotiq-140':
         return get_robotiq_140_basis_directions()
+    elif gripper_type == 'rod':
+        return get_rod_basis_directions()
     else:
         raise NotImplementedError
 
@@ -177,6 +202,91 @@ def generate_gripper_states(gripper_type, antipodal_points, scale, open_ratio, s
     return pos_list, quat_list
 
 
+def generate_rod_contacts(part_mesh, disassembly_direction, scale,
+                          gripper_type='rod', sample_budget=100):
+    """Sample surface points on `part_mesh` and turn each into a single-rod
+    contact grasp. The rod approaches along the outward surface normal so its
+    tip lands exactly on the sampled point; the wrist sits ROD_LENGTH*scale
+    away from the surface along the normal.
+
+    Returns a list of Grasp(pos, quat, open_ratio=1.0) entries, sorted by
+    alignment of the surface normal with the disassembly direction (best
+    first). Candidates whose normal points opposite the disassembly
+    direction are dropped — the rod would have to come from "behind" the
+    part as it's being pulled, which the arm can't easily satisfy.
+    """
+    pts, face_idx = part_mesh.sample(sample_budget, return_index=True)
+    normals = part_mesh.face_normals[face_idx]
+
+    disassembly_dir = None
+    if disassembly_direction is not None:
+        disassembly_dir = np.array(disassembly_direction, dtype=float)
+        disassembly_dir /= max(np.linalg.norm(disassembly_dir), 1e-9)
+
+    candidates = []  # (alignment, pt, normal)
+    for pt, n in zip(pts, normals):
+        n_norm = np.linalg.norm(n)
+        if n_norm < 1e-9:
+            continue
+        normal = np.array(n, dtype=float) / n_norm
+        align = 0.0
+        if disassembly_dir is not None:
+            align = float(np.dot(normal, disassembly_dir))
+            if align < 0:
+                continue
+        candidates.append((align, np.array(pt, dtype=float), normal))
+
+    # Best-aligned first (more likely to be reachable by the arm).
+    candidates.sort(key=lambda x: -x[0])
+
+    grasps = []
+    for _, pt, normal in candidates:
+        # l2r is arbitrary perpendicular axis — rotation around the rod is
+        # a symmetry, so this choice doesn't change feasibility.
+        if abs(normal[2]) < 0.99:
+            l2r = np.cross(normal, [0.0, 0.0, 1.0])
+        else:
+            l2r = np.cross(normal, [1.0, 0.0, 0.0])
+        l2r_norm = np.linalg.norm(l2r)
+        if l2r_norm < 1e-9:
+            continue
+        l2r = l2r / l2r_norm
+        pos, quat = get_gripper_pos_quat(gripper_type, pt, normal, l2r,
+                                          open_ratio=1.0, scale=scale)
+        grasps.append(Grasp(pos, quat, open_ratio=1.0))
+    return grasps
+
+
+def check_rod_feasible(rod_meshes, still_mesh, verbose=False):
+    """Per-waypoint feasibility check for the rod model. Two failure modes:
+
+      1. rod-vs-ground — any rod vertex below z=0.
+      2. rod-vs-still parts — trimesh collision check.
+
+    There is no rod-vs-move check: by construction the rod approaches along
+    the outward normal and extends AWAY from the part, so it can only touch
+    the moving part at the single contact point.
+
+    rod_meshes: dict of {name: trimesh.Trimesh} from
+                transform_gripper_meshes('rod', ...). One entry: 'rod_base'.
+    """
+    import trimesh as _trimesh
+    rod_mesh = next(iter(rod_meshes.values()))
+
+    if rod_mesh.vertices[:, 2].min() <= 0.0:
+        if verbose:
+            print('[check_rod_feasible] rod-ground collision')
+        return False
+
+    manager = _trimesh.collision.CollisionManager()
+    manager.add_object('rod', rod_mesh)
+    if manager.in_collision_single(still_mesh):
+        if verbose:
+            print('[check_rod_feasible] rod-still part collision')
+        return False
+    return True
+
+
 def get_panda_open_ratio(antipodal_points, scale):
     antipodal_points = np.array(antipodal_points, dtype=float)
     antipodal_width = np.linalg.norm(antipodal_points[1] - antipodal_points[0])
@@ -212,6 +322,11 @@ def get_gripper_open_ratio(gripper_type, antipodal_points, scale):
         return get_robotiq_85_open_ratio(antipodal_points, scale)
     elif gripper_type == 'robotiq-140':
         return get_robotiq_140_open_ratio(antipodal_points, scale)
+    elif gripper_type == 'rod':
+        # Rod has no opening — always 1.0. The antipodal_points are unused
+        # in the rod plan path; this returns 1.0 only when something
+        # generically asks for an open_ratio.
+        return 1.0
     else:
         raise NotImplementedError
 
@@ -253,6 +368,9 @@ def get_gripper_finger_states(gripper_type, open_ratio, gripper_scale, suffix=No
         finger_states = get_robotiq_85_finger_states(open_ratio)
     elif gripper_type == 'robotiq-140':
         finger_states = get_robotiq_140_finger_states(open_ratio)
+    elif gripper_type == 'rod':
+        # Rod has no fingers.
+        finger_states = {}
     else:
         raise NotImplementedError
     if suffix is not None:
@@ -265,6 +383,8 @@ def get_gripper_base_name(gripper_type, suffix=None):
         name = 'panda_hand'
     elif gripper_type in ['robotiq-85', 'robotiq-140']:
         name = 'robotiq_base'
+    elif gripper_type == 'rod':
+        name = 'rod_base'
     else:
         raise NotImplementedError
     if suffix is not None:
@@ -290,6 +410,8 @@ def get_gripper_hand_names(gripper_type, suffix=None):
                 for link in ['knuckle', 'finger']:
                     name = f'{side_i}_{side_j}_{link}'
                     names.append(f'robotiq_{name}')
+    elif gripper_type == 'rod':
+        names = ['rod_base']
     else:
         raise NotImplementedError
     if suffix is not None:

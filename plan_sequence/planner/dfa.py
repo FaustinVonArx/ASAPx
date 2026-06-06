@@ -205,14 +205,22 @@ class DFASequencePlanner(SequencePlanner):
         return [G_prime for G_prime, _, _ in feasible_children[:max_frontier]]
 
     def _print_candidate_summary(self, iter_idx, parents, received_by_parent,
-                                 cand_dbg, next_frontier):
+                                 cand_dbg, next_frontier, tree=None):
         """Compact per-frontier debug overview. One small table per parent;
         rows are the parent's evaluated children (one per pose, since the
         same part with different poses runs as separate sim tasks).
         Columns: part, asm time, stab time, stability outcome, score.
-        Score = cumulative path cost from `_cum_cost` when the planner
-        populates it (heuristic / preference / llm / comparison); otherwise
-        "—". '★' marks children that survived into the next frontier.
+
+        Score = the planner's per-edge cost computed live via _cost_child when
+        the planner exposes that hook (HeuristicDFASequencePlanner and its
+        subclasses — preference, comparison, llm). Falling back to the planner's
+        `_cum_cost` table (which holds cumulative path cost when present), and
+        finally to "—" for planners with no cost function. Per-edge cost is
+        what's shown so each candidate row carries a meaningful number even
+        when a subclass overrode _select_next_frontier without touching
+        `_cum_cost` (the original failure mode this debug aid was missing).
+
+        '★' marks children that survived into the next frontier.
         """
         def _fmt_t(dt):
             return f'{dt:.2f}s' if isinstance(dt, (int, float)) else '  —  '
@@ -239,6 +247,16 @@ class DFASequencePlanner(SequencePlanner):
         cum = getattr(self, '_cum_cost', None) or {}
         next_set = {tuple(g) for g in (next_frontier or [])}
 
+        # Load weights once per iteration when the planner has a cost function.
+        # `_cost_child` is defined on HeuristicDFASequencePlanner and inherited
+        # by preference/comparison/llm; plain DFA / random don't have it.
+        weights = None
+        if hasattr(self, '_cost_child') and hasattr(self, '_load_weights'):
+            try:
+                weights = self._load_weights()
+            except Exception:
+                weights = None
+
         print(f'\n[DFA.frontier iter={iter_idx}] candidates ({len(parents)} parent(s)):')
         for i, G in enumerate(parents):
             rows = received_by_parent.get(i, [])
@@ -246,6 +264,14 @@ class DFASequencePlanner(SequencePlanner):
             print(f'  parent[{i}] {label}  ({len(rows)} child eval(s))')
             print(f'    {"part":<20}  {"asm":>7}  {"stab":>7}  {"stability":<22}  {"score":>9}  next')
             print(f'    {"-"*20}  {"-"*7}  {"-"*7}  {"-"*22}  {"-"*9}  ----')
+
+            # parent_pose drives the pose_change feature inside _cost_child.
+            # Looked up via _parent_pose_for when the live tree was threaded
+            # in by the caller; falls back to None for planners / tests that
+            # don't pass tree. With parent_pose=None, the pose_change feature
+            # is 0 (inert) — score reflects the other features only.
+            parent_pose = self._parent_pose_for(tree, G) if tree is not None else None
+
             for sim_info, real_arg in rows:
                 dbg = cand_dbg.get(id(sim_info), {})
                 part = dbg.get('part', sim_info.get('part_move', '?'))
@@ -253,7 +279,22 @@ class DFASequencePlanner(SequencePlanner):
                 dt_s = _fmt_t(dbg.get('dt_stab'))
                 stab = _stab_outcome(sim_info)
                 g_prime_key = tuple(real_arg[5])
-                score = cum.get(g_prime_key)
+
+                score = None
+                # Primary: compute the per-edge cost live. Robust to subclasses
+                # that override _select_next_frontier without writing _cum_cost.
+                if weights is not None:
+                    try:
+                        score = float(self._cost_child(
+                            weights, list(real_arg[5]), sim_info, list(G),
+                            parent_pose=parent_pose,
+                        ))
+                    except Exception:
+                        score = None
+                # Secondary: cumulative cost from _cum_cost (heuristic populates this).
+                if score is None:
+                    score = cum.get(g_prime_key)
+
                 score_str = f'{score:9.3f}' if isinstance(score, (int, float)) else '    —    '
                 mark = ' ★' if g_prime_key in next_set else '  '
                 print(f'    {str(part):<20}  {dt_p:>7}  {dt_s:>7}  {stab:<22}  {score_str}  {mark}')
@@ -275,6 +316,23 @@ class DFASequencePlanner(SequencePlanner):
         if parent_pose is not None and len(fresh) > 1:
             fresh = self._sort_poses_by_proximity(fresh, parent_pose)
         poses.extend(fresh)
+        # Add the parent step's pose as an extra candidate (one more than
+        # max_poses by design). The robot otherwise has to re-orient between
+        # consecutive steps whenever the trimesh stable-pose list for this
+        # subassembly doesn't happen to land on the parent's orientation;
+        # explicitly probing the parent pose lets the planner keep the
+        # assembly stationary when assemblability + stability still hold for
+        # the child. Inserted at the front so per-edge sort orders (which
+        # break ties by proximity to parent_pose) pick it first when feasible.
+        # Deduped against existing candidates by a small angular tolerance.
+        if parent_pose is not None:
+            eps = 1e-3
+            already_present = any(
+                self._rotation_angle_between(parent_pose, p) < eps
+                for p in poses if p is not None
+            )
+            if not already_present:
+                poses.insert(0, parent_pose)
         if not poses:
             poses = [None]
         return poses
@@ -672,7 +730,7 @@ class DFASequencePlanner(SequencePlanner):
                 # show "—".
                 self._print_candidate_summary(
                     iter_idx, live, received_by_parent, _cand_dbg,
-                    next_frontier=self.frontier,
+                    next_frontier=self.frontier, tree=tree,
                 )
 
                 self._iter_timings.append((iter_idx, len(live), len(received), time() - iter_start))
