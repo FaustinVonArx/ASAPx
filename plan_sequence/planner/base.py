@@ -94,19 +94,28 @@ def _simulate_standalone(asset_folder, assembly_dir, save_sdf, base_part,
         )
         dt_stab = time() - _t0
 
+    # `tools` may be either a flat list (legacy) or a per-part dict produced
+    # by the analyze_assembly_tools pipeline: {part_id: [chosen_tool] or []}.
+    # An empty list means the VLM decided no tool is needed for this part —
+    # tool check should not gate feasibility.
+    if isinstance(tools, dict):
+        effective_tools = tools.get(str(part_move), [])
+    else:
+        effective_tools = tools
+
     tool_result = None
     dt_tool = None
     diag_tool = {}
-    if tools and action is not None and parts_fix is not None:
+    if effective_tools and action is not None and parts_fix is not None:
         _t0 = time()
         tool_result = check_tool(
             asset_folder=asset_folder, assembly_dir=assembly_dir,
-            parts_fix=parts_rest, part_move=part_move, tools=tools, debug=debug,
+            parts_fix=parts_rest, part_move=part_move, tools=effective_tools, debug=debug,
             diagnostics=diag_tool,
         )
         dt_tool = time() - _t0
 
-    tool_required = tools is not None and len(tools) > 0
+    tool_required = effective_tools is not None and len(effective_tools) > 0
     feasible = action is not None and parts_fix is not None and (not tool_required or tool_result is not None)
     if feasible:
         fail_reason = None
@@ -328,7 +337,14 @@ class SequencePlanner:
         falling parts; ties are broken by trimesh's own probability ordering
         (lower pose_idx = higher prob). Falls back to `initial_poses`
         unchanged when `per_pose` is unavailable (e.g. the 'skip' branch
-        skipped the gravity check entirely)."""
+        skipped the gravity check entirely).
+
+        Crucially, when NO candidate is verified-stable and the user asked
+        the planner to abort on that condition (no_stable_pose_action='exit'),
+        we return `initial_poses` (which is the empty verified-stable list)
+        so the exit gate in plan() triggers. Falling back to the 'least bad'
+        unstable pose would silently override the user's setting.
+        """
         if not per_pose:
             return initial_poses
         # Sort by (fallen_count, pose_idx). Success poses (empty fallen) come first,
@@ -336,6 +352,13 @@ class SequencePlanner:
         ranked = sorted(per_pose, key=lambda e: (len(e.get('fallen') or []), e['pose_idx']))
         best = ranked[0]
         n_fallen = len(best.get('fallen') or [])
+        action = getattr(settings, 'no_stable_pose_action', 'exit')
+        # Only accept an unstable fallback when the user explicitly opted in.
+        if not best['success'] and action not in ('continue', 'ignore_unstable'):
+            print(f"[init_pose] auto-pick: no verified-stable pose; respecting "
+                  f"settings.no_stable_pose_action={action!r} (will trigger the "
+                  f"plan() exit gate).")
+            return initial_poses
         marker = 'verified-stable' if best['success'] else f'{n_fallen} fallen'
         print(f"[init_pose] auto-picked pose [{best['pose_idx']}] "
               f"({marker}; trimesh rank {best['pose_idx']} of {len(per_pose)}).")
@@ -403,13 +426,20 @@ class SequencePlanner:
         else:
             grasps = None
 
+        # Resolve per-part tool decision when self.tools is a dict (see
+        # _simulate_standalone for the format); otherwise treat as flat list.
+        if isinstance(self.tools, dict):
+            effective_tools = self.tools.get(str(part_move), [])
+        else:
+            effective_tools = self.tools
+
         tool_result = None
         diag_tool = {}
-        if feasible and self.tools:
+        if feasible and effective_tools:
             _t0 = time()
             tool_result = check_tool(
                 asset_folder=self.asset_folder, assembly_dir=self.assembly_dir,
-                parts_fix=parts_rest, part_move=part_move, tools=self.tools, debug=debug,
+                parts_fix=parts_rest, part_move=part_move, tools=effective_tools, debug=debug,
                 diagnostics=diag_tool,
             )
             self._timing['tool_check'] += time() - _t0
@@ -426,7 +456,7 @@ class SequencePlanner:
         elif parts_fix is None:
             fail_reason = 'stability'
             fail_evidence = diag_stability or None
-        elif self.tools and tool_result is None:
+        elif effective_tools and tool_result is None:
             fail_reason = 'tool'
             fail_evidence = diag_tool or None
         else:
@@ -582,6 +612,45 @@ class SequencePlanner:
                 self.stop_msg = 'no self-stable initial pose'
                 print('[planner.base.plan] aborting: no self-stable initial pose found '
                       "(settings.no_stable_pose_action='exit')")
+
+                # Persist a precheck-stability failures.json so downstream
+                # feedback (Feedback.generate_failure_feedback) can still
+                # surface "these parts fall" diagnostics even though no
+                # part-removal was attempted. Pairs with the
+                # precheck_unstable_XX.png files written above.
+                if log_dir is not None and observed_fallen:
+                    try:
+                        import json as _json
+                        import os as _os
+                        fallen_sorted = sorted(observed_fallen)
+                        subject = fallen_sorted[0]
+                        evidence = None
+                        if _per_pose:
+                            for _e in _per_pose:
+                                if _e.get('success') or not _e.get('fallen'):
+                                    continue
+                                png = f"precheck_unstable_{_e['pose_idx']:02d}.png"
+                                if _os.path.exists(_os.path.join(log_dir, png)):
+                                    evidence = png
+                                    break
+                        payload = {
+                            'depth': 0,
+                            'deepest_nodes': [list(G0)],
+                            'failures': [{
+                                'child_part': subject,
+                                'fail_reason': 'stability',
+                                'evidence_image': evidence,
+                                'unstable_parts': fallen_sorted,
+                            }],
+                        }
+                        with open(_os.path.join(log_dir, 'failures.json'), 'w') as fp:
+                            _json.dump(payload, fp, indent=2)
+                        print(f"[planner.base.plan] wrote precheck-stability "
+                              f"failures.json: {len(fallen_sorted)} unstable "
+                              f"part(s), evidence={evidence}")
+                    except Exception as _e:
+                        print(f"[planner.base.plan] failed to persist precheck "
+                              f"failures.json: {_e}")
                 return tree
             elif action == 'ignore_unstable':
                 self._ignored_unstable_parts = frozenset(observed_fallen)

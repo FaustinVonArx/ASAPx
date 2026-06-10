@@ -1,8 +1,19 @@
+import json
+import os
+
 import networkx as nx
 import numpy as np
 
 from .dfa import DFASequencePlanner
 from plan_sequence.physics_planner import get_contact_graph, CONTACT_EPS
+
+
+# Where Optuna-trained weights live on disk. Read at plan time when
+# settings.heuristic_weights_source == "optuna" (a separate file from
+# settings.heuristic_weights so the two can be compared head-to-head).
+# Override per-call via settings.heuristic_weights_optuna_path if you need a
+# different location.
+_OPTUNA_WEIGHTS_DEFAULT_PATH = os.path.join('assets', 'heuristic_weights_optuna.json')
 
 
 # Canonical feature ordering for the linear cost `cost = w · phi`. The weight
@@ -16,10 +27,13 @@ class HeuristicDFASequencePlanner(DFASequencePlanner):
     """DFA variant that ranks frontier candidates by a weighted COST it
     MINIMISES. Each term is a non-negative cost where 0 is ideal:
 
-      1. `contact_distance` — shortest contact-graph distance (hops) from the
-         candidate part to any already-removed part. 0 when nothing is removed
-         yet; large when the candidate is disconnected. Lower = adjacent to the
-         already-removed cluster = cheaper.
+      1. `contact_distance` — natural log of (shortest contact-graph distance
+         from the candidate part to any already-removed part) + 1, i.e.
+         ``ln(d+1)``. 0 when ``d=0`` (adjacent to the removed cluster) and
+         grows sub-linearly, so distant candidates are penalised but not as
+         harshly as a raw-hop metric. ``d`` itself is 0 when nothing is removed
+         yet, and is set to the full part count when the candidate is
+         disconnected from every already-removed part.
       2. `free_dof` — number of BLOCKED axes (out of 6) the candidate part has
          in the current subassembly, i.e. `len(dof) - sum(dof)`, read from the
          per-edge DoF probe. 0 = fully free part (cheapest), so we prefer
@@ -52,21 +66,51 @@ class HeuristicDFASequencePlanner(DFASequencePlanner):
     """
 
     DEFAULT_WEIGHTS = {
-        'contact_distance': 0.8,
-        'free_dof': 0.4,
-        'z_alignment': 1.0,
-        'pose_change': 1.0,
+        'contact_distance': 1.0,
+        'free_dof': 0.6,
+        'z_alignment': 2.0,
+        'pose_change': 2.0,
         'hold_count': 3.0,
     }
 
     def _load_weights(self):
-        cfg = None
+        # Source selection: settings.heuristic_weights_source controls whether
+        # we read settings.heuristic_weights (default) or the on-disk Optuna-
+        # trained weights file. The two are kept separate so you can compare
+        # default vs trained weights head-to-head without losing either set.
+        source = 'default'
+        optuna_path = _OPTUNA_WEIGHTS_DEFAULT_PATH
         try:
             import settings as user_settings  # project-root settings.py
-            cfg = getattr(user_settings, 'heuristic_weights', None)
+            source = getattr(user_settings, 'heuristic_weights_source', 'default')
+            optuna_path = getattr(user_settings, 'heuristic_weights_optuna_path',
+                                  _OPTUNA_WEIGHTS_DEFAULT_PATH)
         except ImportError:
-            pass
+            user_settings = None
+
         weights = dict(self.DEFAULT_WEIGHTS)
+
+        if source == 'optuna':
+            if os.path.exists(optuna_path):
+                try:
+                    with open(optuna_path) as _f:
+                        cfg = json.load(_f)
+                    if isinstance(cfg, dict):
+                        for k, v in cfg.items():
+                            if k in weights:
+                                weights[k] = float(v)
+                    return weights
+                except (OSError, json.JSONDecodeError, TypeError, ValueError) as _e:
+                    print(f"[heuristic] WARN failed to load optuna weights from "
+                          f"{optuna_path} ({_e}); falling back to settings.heuristic_weights")
+            else:
+                print(f"[heuristic] WARN heuristic_weights_source='optuna' but "
+                      f"{optuna_path} does not exist; falling back to settings.heuristic_weights")
+
+        # Default path: settings.heuristic_weights (manually-set or hard-coded).
+        cfg = None
+        if user_settings is not None:
+            cfg = getattr(user_settings, 'heuristic_weights', None)
         if isinstance(cfg, dict):
             for k, v in cfg.items():
                 if k in weights:
@@ -102,26 +146,28 @@ class HeuristicDFASequencePlanner(DFASequencePlanner):
         candidate = moved[0]
         already_removed = set(self.parts) - set(parent_G)
 
-        # Feature 1 (contact_distance): shortest contact-graph distance (hops)
-        # from the candidate to any already-removed part. 0 when nothing removed
-        # yet; large when the candidate is disconnected. Lower = adjacent to the
-        # removed cluster = better.
+        # Feature 1 (contact_distance): ln(d+1) where d is the shortest
+        # contact-graph distance (hops) from the candidate to any already-
+        # removed part. d=0 when nothing is removed yet (→ ln(1)=0); d is set
+        # to the full part count when the candidate is disconnected. The log
+        # softens the penalty for distant candidates compared to a raw-hop cost.
         if not already_removed:
-            c1 = 0.0
+            d = 0.0
         elif not cg.has_node(candidate):
-            c1 = float(len(self.parts))
+            d = float(len(self.parts))
         else:
             best = None
             for p in already_removed:
                 if not cg.has_node(p):
                     continue
                 try:
-                    d = nx.shortest_path_length(cg, candidate, p)
+                    dist = nx.shortest_path_length(cg, candidate, p)
                 except nx.NetworkXNoPath:
                     continue
-                if best is None or d < best:
-                    best = d
-            c1 = float(best if best is not None else len(self.parts))
+                if best is None or dist < best:
+                    best = dist
+            d = float(best if best is not None else len(self.parts))
+        c1 = float(np.log(d + 1.0))
 
         # Feature 2 (free_dof): blocked DoF of the candidate part in the current
         # subassembly. sim_info['dof'] is a length-6 {0,1} array (1 = part can

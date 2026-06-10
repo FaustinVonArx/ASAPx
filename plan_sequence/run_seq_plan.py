@@ -111,12 +111,19 @@ def _dump_failure_evidence(tree, asset_folder, assembly_dir, base_part, tools, s
                     entry['colliding_parts'] = evidence.get('colliding_parts', [])
                     entry['tried_tools'] = evidence.get('tried_tools', [])
                     if render:
+                        # Resolve per-part decided tools (if tools is a dict).
+                        if isinstance(tools, dict):
+                            _tools_for_part = tools.get(str(part_move), [])
+                        else:
+                            _tools_for_part = tools
+                        if not _tools_for_part:
+                            continue
                         fail_dir = os.path.join(failures_dir, f'{part_move}_tool')
                         diag2 = {}
                         try:
                             check_tool(
                                 asset_folder=asset_folder, assembly_dir=assembly_dir,
-                                parts_fix=parts_rest, part_move=part_move, tools=tools,
+                                parts_fix=parts_rest, part_move=part_move, tools=_tools_for_part,
                                 diagnostics=diag2, failure_record_dir=fail_dir,
                             )
                         except Exception as _e:
@@ -244,14 +251,27 @@ def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc,
                     _render_failures = bool(getattr(_user_settings, 'render_sequence', True))
                 except ImportError:
                     _render_failures = True
-                try:
-                    _dump_failure_evidence(
-                        tree, asset_folder, assembly_dir, base_part, tools, save_sdf, log_dir,
-                        render=_render_failures,
-                    )
-                except Exception as _e:
-                    print(f'[seq_plan] failure-evidence dump aborted: {_e}')
-                    print(traceback.format_exc())
+                # When the planner aborted at the precheck stage
+                # (no_stable_pose_action='exit') it has already written a
+                # failures.json populated from observed_fallen + the
+                # precheck_unstable_XX.png renders. Skip the regular dump so
+                # we don't overwrite it with an empty placeholder.
+                _stop_msg = getattr(planner, 'stop_msg', None)
+                _precheck_abort = (_stop_msg == 'no self-stable initial pose')
+                if not _precheck_abort:
+                    try:
+                        _dump_failure_evidence(
+                            tree, asset_folder, assembly_dir, base_part, tools, save_sdf, log_dir,
+                            render=_render_failures,
+                        )
+                    except Exception as _e:
+                        print(f'[seq_plan] failure-evidence dump aborted: {_e}')
+                        print(traceback.format_exc())
+                else:
+                    print(f'[seq_plan] precheck abort detected '
+                          f'(stop_msg={_stop_msg!r}); keeping the '
+                          f'precheck-stability failures.json the planner '
+                          f'already wrote.')
 
         if debug:
             print(f'[seq_plan] stats: {stats}')

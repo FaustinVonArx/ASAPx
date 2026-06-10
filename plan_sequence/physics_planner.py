@@ -25,12 +25,19 @@ from utils.renderer import SimRenderer
 
 FORCE_MAG = 1e2
 FRAME_SKIP = 100
-MAX_TIME = 60
+MAX_TIME = 180
 CONTACT_EPS = 1e-1
-POS_FAR_THRESHOLD = 0.2
-POS_NEAR_THRESHOLD = 0.05
-NEAR_STEP = 100
-MAX_STEP = 200
+# Both thresholds are now FRACTIONS of the assembly's initial bounding-box
+# diagonal (computed once at t=0 over the bbox of all part centroids — moving
+# and fixed). A part is flagged as fallen if its COG-relative displacement
+# exceeds `POS_FAR_THRESHOLD × initial_diag`; it counts as settled when the
+# last `NEAR_STEP` frames stay within a `POS_NEAR_THRESHOLD × initial_diag`
+# band. Was previously in absolute world-units (m) which only made sense for
+# assemblies near one scale.
+POS_FAR_THRESHOLD = 0.4
+POS_NEAR_THRESHOLD = 0.03
+NEAR_STEP = 20
+MAX_STEP = 100
 CHECK_FREQ = 20
 COL_TH_PATH = 0.01
 COL_TH_STABLE = 0.00
@@ -365,10 +372,91 @@ class StabilityChecker:
         self.pos_his_map = None
         self.dist_his_map = None
         self.n_step = 0
+        # When set by the caller, every check_fallen_parts invocation appends a
+        # diagnostic line to this file: live contact graph edges, parts_move /
+        # parts_fix, and per-part fall reason (distance-threshold or
+        # contact-lost). See MultiPartStabilityPlanner.check_success for where
+        # this gets populated from record_path.
+        self.log_path = None
         if allow_gap:
             self.pos_far_threshold = np.inf
 
+    def _log(self, msg):
+        if not self.log_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+            with open(self.log_path, 'a') as fp:
+                fp.write(msg + '\n')
+        except OSError:
+            pass  # silently drop log writes if filesystem is being uncooperative
+
+    def _render_contact_graph(self, live_G, parts_fallen, fall_reasons):
+        """Save a PNG of the live contact graph alongside self.log_path:
+        <log_stem>_check{step:04d}.png. parts_fix shown in dark gray, fallen
+        parts in red, the rest of parts_move in sky blue. Layout is
+        deterministic (spring with fixed seed) so successive frames are
+        visually comparable."""
+        if not self.log_path or live_G is None:
+            return
+        try:
+            stem, _ = os.path.splitext(self.log_path)
+            png_path = f'{stem}_check{self.n_step:04d}.png'
+            os.makedirs(os.path.dirname(png_path), exist_ok=True)
+
+            fixed_set = self._fixed_set
+            fallen_set = set(parts_fallen)
+            node_colors = []
+            for n in live_G.nodes():
+                if n in fixed_set:
+                    node_colors.append('#404040')          # dark gray: held
+                elif n in fallen_set:
+                    node_colors.append('#d62728')          # red: fallen
+                else:
+                    node_colors.append('#7fb3d5')          # sky blue: moving + OK
+
+            pos = nx.spring_layout(live_G, seed=0)
+            fig, ax = plt.subplots(figsize=(6, 6))
+            nx.draw(
+                live_G, pos, ax=ax, with_labels=True,
+                node_color=node_colors, edge_color='#999999',
+                node_size=550, font_size=8, font_color='white',
+            )
+            title = (f'step={self.n_step}   '
+                     f'|move|={len(self.parts_move)}   '
+                     f'|fix|={len(self.parts_fix)}   '
+                     f'|fall|={len(parts_fallen)}')
+            if fall_reasons:
+                # Compact one-line summary of why each part was flagged.
+                reasons = '  '.join(f'{p}:{r}' for p, r in fall_reasons.items())
+                title += f'\n{reasons}'
+            ax.set_title(title, fontsize=9)
+            fig.tight_layout()
+            fig.savefig(png_path, dpi=120, bbox_inches='tight')
+            plt.close(fig)
+        except Exception as _e:
+            # Don't kill a real run for a viz hiccup.
+            try:
+                self._log(f'[step={self.n_step}] WARN graph render failed: {_e}')
+            except Exception:
+                pass
+
     def get_part_pos(self, part):
+        return self.sim.get_joint_qm(f'part{part}')[:3]
+
+    def _get_any_part_pos(self, part):
+        """World position for a part regardless of joint type.
+
+        `get_joint_qm` works only for free-DoF joints (free3d-exp on
+        `parts_move`); on fixed-DoF joints (`parts_fix`) the C++ binding
+        prints `[Error] get_joint_qm: joint ndof not supported: 0` to stderr
+        before raising. We route by membership in `_fixed_set` (populated in
+        update_sim) so the C++ error path is never reached. Fixed parts use
+        the body-to-world transform's translation column instead, which is
+        defined for all bodies regardless of joint DoF."""
+        if part in self._fixed_set:
+            E0j = np.asarray(self.sim.get_body_E0j(f'part{part}'))
+            return E0j[:3, 3].copy()
         return self.sim.get_joint_qm(f'part{part}')[:3]
 
     def derive_contact_graph(self):
@@ -389,17 +477,90 @@ class StabilityChecker:
         self.sim = sim
         self.parts_move = parts_move
         self.parts_fix = parts_fix
+        # Frozen set for fast O(1) membership lookup in `_get_any_part_pos`,
+        # which routes the position fetch to `get_body_E0j` (works on fixed
+        # joints) vs `get_joint_qm` (free joints only). Rebuilt each
+        # update_sim call since the adaptive planner shifts parts move→fix.
+        self._fixed_set = frozenset(parts_fix)
         self.G = self.derive_contact_graph()
+        # Mass-weighted COG frame: pull each body's mass once (gravity-dependent
+        # cost on sim init, but a no-op afterwards). Cover both `parts_move`
+        # and `parts_fix` so the COG includes the (stationary) held parts as an
+        # anchor — without them the COG can drift away with a falling cluster.
+        if not hasattr(self, '_mass_map') or self._mass_map is None:
+            self._mass_map = {}
+        for p in list(self.parts_move) + list(self.parts_fix):
+            if p not in self._mass_map:
+                self._mass_map[p] = float(self.sim.get_body_mass(f'part{p}'))
+        # Reference geometry, taken once at the first update_sim call (= sim
+        # t=0). Later update_sim calls (e.g., the adaptive planner shifting
+        # parts move→fix mid-run) intentionally keep the same reference so
+        # the metric stays "displacement vs t=0," not "displacement vs the
+        # most recent re-init."
         if self.pos_his_map is None:
             self.pos_his_map = {part: [self.get_part_pos(part)] for part in self.parts_move}
+            self._cog_initial = self._compute_cog()
+            self._r_initial = {
+                p: float(np.linalg.norm(self.get_part_pos(p) - self._cog_initial))
+                for p in self.parts_move
+            }
+            # Initial bounding-box diagonal of the assembly (centroid AABB
+            # over parts_move + parts_fix at t=0). Used to scale the fall /
+            # settle thresholds so the same constants behave the same on a
+            # 0.1 m IKEA shelf and a 2 m chassis. Caveat: this is the AABB
+            # of part *centroids*, not full mesh extents — slightly
+            # underestimates true assembly size for parts with off-centre
+            # geometry. Adequate for threshold-scaling.
+            all_parts = list(self.parts_move) + list(self.parts_fix)
+            if all_parts:
+                positions = np.stack(
+                    [self._get_any_part_pos(p) for p in all_parts], axis=0,
+                )
+                diag = float(np.linalg.norm(
+                    positions.max(axis=0) - positions.min(axis=0)
+                ))
+            else:
+                diag = 0.0
+            # Guard against degenerate cases (single part / coincident
+            # centroids): falling back to 1.0 keeps the threshold equal to
+            # the raw constant, which is the closest analogue of the old
+            # absolute-units behaviour.
+            self._initial_diag = diag if diag > 1e-6 else 1.0
         if self.dist_his_map is None:
             self.dist_his_map = {part: [0.0] for part in self.parts_move}
 
+    def _compute_cog(self):
+        """Mass-weighted centre of gravity over `parts_move + parts_fix`.
+        Uses `_get_any_part_pos` so fixed (0-DoF) parts are included via
+        their body-to-world transform rather than via `get_joint_qm`."""
+        weighted = np.zeros(3, dtype=float)
+        total_mass = 0.0
+        for p in self.parts_move:
+            m = self._mass_map.get(p, 0.0)
+            weighted += m * self._get_any_part_pos(p)
+            total_mass += m
+        for p in self.parts_fix:
+            m = self._mass_map.get(p, 0.0)
+            weighted += m * self._get_any_part_pos(p)
+            total_mass += m
+        if total_mass <= 0.0:
+            return weighted  # degenerate; preserve zero vector
+        return weighted / total_mass
+
     def update_status(self):
+        # COG-relative L2 metric: each moving part's distance to the CURRENT
+        # mass-weighted COG, compared (absolute Δ) to its initial distance to
+        # the t=0 COG. Rigid-body motion of the whole assembly preserves
+        # ||pos − cog|| → Δ ≈ 0 → won't trip the fall/stability thresholds.
+        # An outlier part drifting away from the bulk has its ||pos − cog||
+        # grow, so |Δ| crosses the threshold while the bulk parts don't.
+        cog_now = self._compute_cog()
         for part_move in self.parts_move:
             pos = self.get_part_pos(part_move)
             self.pos_his_map[part_move].append(pos)
-            self.dist_his_map[part_move].append(np.linalg.norm(pos - self.pos_his_map[part_move][0]))
+            r_now = float(np.linalg.norm(pos - cog_now))
+            delta_r = abs(r_now - self._r_initial[part_move])
+            self.dist_his_map[part_move].append(delta_r)
         self.n_step += 1
 
     def check_disconnected_parts(self):
@@ -410,16 +571,37 @@ class StabilityChecker:
         return parts_disconnected
     
     def check_fallen_parts(self, group=True):
+        # Live contact graph + per-part fall reasons. Render the graph as a
+        # PNG sidecar next to the GIF so the connectivity is actually
+        # inspectable; the .log file gets a one-line per-check summary with
+        # the fall reasons only (the human-readable bit). Both emitted only
+        # when self.log_path is set (= caller supplied a record_path).
+        live_G = self.derive_contact_graph() if self.log_path else None
+
+        # Diagonal-scaled fall threshold. allow_gap sets
+        # pos_far_threshold = inf, which survives the multiplication.
+        far_abs = self.pos_far_threshold * self._initial_diag
         parts_fallen = []
+        fall_reasons = {}
         for part_move in self.parts_move:
-            if self.dist_his_map[part_move][-1] > self.pos_far_threshold: # check distance
+            if self.dist_his_map[part_move][-1] > far_abs: # check distance
                 parts_fallen.append(part_move)
+                fall_reasons[part_move] = (
+                    f'distance({self.dist_his_map[part_move][-1]:.3f}'
+                    f' > {far_abs:.3f}'
+                    f' = {self.pos_far_threshold:g}×diag)'
+                )
                 continue
             for part_other in self.G.neighbors(part_move): # check connectivity
                 in_contact = self.sim.body_in_contact(f'part{part_other}', f'part{part_move}', self.contact_eps)
                 if not in_contact:
                     parts_fallen.append(part_move)
+                    fall_reasons[part_move] = f'contact_lost:{part_other}'
                     break
+
+        if self.log_path:
+            self._log(f'[step={self.n_step}] fallen={fall_reasons}')
+            self._render_contact_graph(live_G, parts_fallen, fall_reasons)
         if group and len(parts_fallen) > 1:
             parts_fallen_grouped = []
             G = self.derive_contact_graph()
@@ -436,11 +618,13 @@ class StabilityChecker:
             return parts_fallen
 
     def check_stable_parts(self):
+        # Diagonal-scaled settle band, matching the fall check.
+        near_abs = self.pos_near_threshold * self._initial_diag
         parts_stable = []
         if self.n_step >= self.near_step:
             for part_move in self.parts_move:
                 dist_interval = self.dist_his_map[part_move][self.n_step - self.near_step:self.n_step]
-                if np.max(dist_interval) - np.min(dist_interval) < self.pos_near_threshold:
+                if np.max(dist_interval) - np.min(dist_interval) < near_abs:
                     parts_stable.append(part_move)
         return parts_stable
 
@@ -496,6 +680,12 @@ class MultiPartStabilityPlanner:
         # initialize sim and stability checker
         self.sim.reset()
         checker = StabilityChecker(self.allow_gap)
+        # Route the per-check diagnostic to a sidecar log next to the would-be
+        # GIF (e.g. <step_label>_fix0.gif → <step_label>_fix0.log). Decoupled
+        # from `do_record` so logs are always written when the caller supplied
+        # a record_path, regardless of whether GIF rendering is enabled.
+        if record_path is not None:
+            checker.log_path = os.path.splitext(record_path)[0] + '.log'
         checker.update_sim(self.sim, self.parts_move, self.parts_fix)
 
         # check initial connectivity
@@ -517,8 +707,13 @@ class MultiPartStabilityPlanner:
             checker.update_status()
 
             if (i + 1) % CHECK_FREQ == 0:
-                # check fallen parts
-                parts_fall = checker.check_fallen_parts()
+                # Check fallen parts. group=False returns ALL fallen parts (not
+                # just one representative per contact-connected cluster), so the
+                # greedy `get_stable_plan_1pose_serial` adds the whole cluster
+                # to `parts_fix` in a single iteration instead of peeling it off
+                # one rep per iteration (which inflates max_fix usage on
+                # multi-part tumbles).
+                parts_fall = checker.check_fallen_parts(group=False)
                 if self.ignore_unstable:
                     parts_fall = [p for p in parts_fall if p not in self.ignore_unstable]
                 if len(parts_fall) > 0:

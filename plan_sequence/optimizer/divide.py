@@ -239,7 +239,9 @@ class DivideOptimizer(BaseSequenceOptimizer):
     def find_locally_free_subassemblies(self, timeout=100,
                                         balance_weight=BALANCE_WEIGHT,
                                         contact_weight=CONTACT_WEIGHT,
-                                        fragmentation_weight=FRAGMENTATION_WEIGHT):
+                                        fragmentation_weight=FRAGMENTATION_WEIGHT,
+                                        propagate=True,
+                                        disassembly_sequence=None):
         '''
         DFS over partitions (S, R). Children of a state are single-part additions
         r ∈ S that are in contact (per the contact graph) with the current R, or
@@ -269,6 +271,18 @@ class DivideOptimizer(BaseSequenceOptimizer):
         subgraph induced by X. The fragmentation term is zero when both sides
         are each a single connected piece (the physical ideal) and grows as
         either side breaks into more components.
+
+        Propagation (when ``propagate=True``, default): in addition to the
+        initial-state splits, propagate each initial (S, R) along a
+        representative disassembly sequence — at step k, remove the
+        disassembled part from whichever side contains it and drop the split
+        if either side becomes size ≤ 1. The resulting "diminished" splits
+        at every step are pooled into the same result list (deduplicated by
+        canonical key frozenset({S, R})) and scored with the same cut_score.
+        normalization stays w.r.t. full ``n_parts`` so bigger early splits
+        outrank equally-shaped smaller late ones. If
+        ``disassembly_sequence`` is None, a representative sequence is taken
+        from ``BaseSequenceOptimizer(self.tree).optimize()``.
 
         Returns: list of (S, R, score) tuples sorted by score descending. Also
         stored on self.locally_free. Times out after `timeout` seconds.
@@ -385,10 +399,23 @@ class DivideOptimizer(BaseSequenceOptimizer):
 
         elapsed = time.time() - t_start
         suffix = ' (TIMED OUT)' if timed_out else ''
+        n_initial = len(results)
+
+        if propagate:
+            n_added, n_steps = self._propagate_to_subsequent_steps(
+                results, disassembly_sequence, cut_score,
+            )
+        else:
+            n_added, n_steps = 0, 0
+
         results.sort(key=lambda t: t[2], reverse=True)
+
         print(f'[DivideOptimizer] find_locally_free_subassemblies: '
-              f'{len(results)} free partitions via DFS over {len(visited)} states, '
+              f'{n_initial} initial free partitions via DFS over {len(visited)} states, '
               f'elapsed {elapsed:.2f}s{suffix}')
+        if propagate:
+            print(f'[DivideOptimizer]   + {n_added} diminished splits propagated over '
+                  f'{n_steps} sequence steps (total: {len(results)})')
 
         def _fmt(idx, entry):
             S_, R_, s_ = entry
@@ -409,6 +436,86 @@ class DivideOptimizer(BaseSequenceOptimizer):
 
         self.locally_free = results
         return results
+
+    def _propagate_to_subsequent_steps(self, results, disassembly_sequence, cut_score):
+        '''
+        Extend `results` with diminished splits derived by walking a
+        disassembly sequence. At each step, every split in the current set
+        loses the disassembled part from whichever side contains it; sides
+        that shrink to size ≤ 1 are dropped. New splits (deduplicated by
+        canonical key frozenset({S, R})) are appended to `results` with the
+        same cut_score.
+
+        Returns (n_added, n_steps).
+        '''
+        if not results:
+            return 0, 0
+
+        if disassembly_sequence is None:
+            from .base import BaseSequenceOptimizer
+            try:
+                disassembly_sequence = BaseSequenceOptimizer(self.tree).optimize()
+            except Exception as e:
+                print(f'[DivideOptimizer] propagate: BaseSequenceOptimizer error: {e}')
+                disassembly_sequence = None
+        if not disassembly_sequence:
+            print('[DivideOptimizer] propagate: no valid disassembly sequence; skipping.')
+            return 0, 0
+
+        parts_idx = self.obstruction_graph.graph['parts_idx']
+
+        def split_key(S, R):
+            return frozenset((frozenset(S), frozenset(R)))
+
+        seen = set(split_key(S, R) for S, R, _ in results)
+
+        # Seed propagation from every non-trivial initial split (both sides ≥ 2).
+        current = []
+        current_keys = set()
+        for S, R, _ in results:
+            if len(S) <= 1 or len(R) <= 1:
+                continue
+            key = split_key(S, R)
+            if key in current_keys:
+                continue
+            current_keys.add(key)
+            current.append((frozenset(S), frozenset(R)))
+
+        n_added = 0
+        n_steps = 0
+        for p in disassembly_sequence:
+            if p not in parts_idx:
+                continue
+            n_steps += 1
+            next_set = []
+            next_keys = set()
+            for S, R in current:
+                if p in S:
+                    new_S = S - {p}
+                    new_R = R
+                elif p in R:
+                    new_S = S
+                    new_R = R - {p}
+                else:
+                    # part p already gone from this split's tracked parts;
+                    # shouldn't happen if all splits share the same step.
+                    continue
+                if len(new_S) <= 1 or len(new_R) <= 1:
+                    continue
+                key = split_key(new_S, new_R)
+                if key in next_keys:
+                    continue
+                next_keys.add(key)
+                next_set.append((new_S, new_R))
+                if key not in seen:
+                    seen.add(key)
+                    results.append((new_S, new_R, cut_score(new_S, new_R)))
+                    n_added += 1
+            current = next_set
+            if not current:
+                break
+
+        return n_added, n_steps
 
     def verify_locally_free(self, top_k=10, num_proc=1, save_sdf=False, max_time=30, force_mag=None):
         '''
