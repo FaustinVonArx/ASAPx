@@ -457,6 +457,14 @@ class DFASequencePlanner(SequencePlanner):
                 self.stop_msg = 'no self-stable initial pose'
                 print('[DFA.plan] aborting: no self-stable initial pose found '
                       "(settings.no_stable_pose_action='exit')")
+                # Persist precheck failures.json so downstream feedback
+                # (Feedback.generate_failure_feedback) can surface "these
+                # parts fall" diagnostics. Shared writer with base.plan() —
+                # without this call, failure_feedback.json comes out as `[]`
+                # for any DFA-planner run that exits at precheck.
+                self._write_precheck_failures_json(
+                    log_dir, G0, observed_fallen, _per_pose,
+                )
                 return tree
             elif action == 'ignore_unstable':
                 self._ignored_unstable_parts = frozenset(observed_fallen)

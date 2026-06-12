@@ -193,6 +193,60 @@ class SequencePlanner:
         torch.manual_seed(seed)
 
     @staticmethod
+    def _write_precheck_failures_json(log_dir, G0, observed_fallen, per_pose):
+        """Write a `<log_dir>/failures.json` for the precheck-abort path
+        (settings.no_stable_pose_action='exit', no self-stable initial
+        pose found). Mirrors the schema downstream `PlanningFailures`
+        / `Feedback.generate_failure_feedback` expect, so they can surface
+        "these parts fall" diagnostics even though no part-removal was ever
+        attempted.
+
+        Lives on the base class so the parallel DFA branch (which does NOT
+        call `super().plan()`, see the comment in `DFASequencePlanner.plan`)
+        can persist the same evidence without duplicating the writer. The
+        old inline duplicate in dfa.py drifted into a no-op silently and
+        caused empty `failure_feedback.json` for precheck-abort assemblies.
+
+        Returns True on success, False on early-return / write failure (the
+        log already includes the reason in both cases)."""
+        if log_dir is None or not observed_fallen:
+            return False
+        try:
+            import json as _json
+            import os as _os
+            fallen_sorted = sorted(observed_fallen)
+            subject = fallen_sorted[0]
+            evidence = None
+            if per_pose:
+                for _e in per_pose:
+                    if _e.get('success') or not _e.get('fallen'):
+                        continue
+                    png = f"precheck_unstable_{_e['pose_idx']:02d}.png"
+                    if _os.path.exists(_os.path.join(log_dir, png)):
+                        evidence = png
+                        break
+            payload = {
+                'depth': 0,
+                'deepest_nodes': [list(G0)],
+                'failures': [{
+                    'child_part': subject,
+                    'fail_reason': 'stability',
+                    'evidence_image': evidence,
+                    'unstable_parts': fallen_sorted,
+                }],
+            }
+            with open(_os.path.join(log_dir, 'failures.json'), 'w') as fp:
+                _json.dump(payload, fp, indent=2)
+            print(f"[planner.precheck] wrote precheck-stability "
+                  f"failures.json: {len(fallen_sorted)} unstable "
+                  f"part(s), evidence={evidence}")
+            return True
+        except Exception as _e:
+            print(f"[planner.precheck] failed to persist precheck "
+                  f"failures.json: {_e}")
+            return False
+
+    @staticmethod
     def _parent_pose_for(tree, parent_G):
         """Look up the pose used to reach `parent_G` from its tree predecessor.
         Returns None for the root (no in-edge) or when the in-edge has no
@@ -612,45 +666,10 @@ class SequencePlanner:
                 self.stop_msg = 'no self-stable initial pose'
                 print('[planner.base.plan] aborting: no self-stable initial pose found '
                       "(settings.no_stable_pose_action='exit')")
-
-                # Persist a precheck-stability failures.json so downstream
-                # feedback (Feedback.generate_failure_feedback) can still
-                # surface "these parts fall" diagnostics even though no
-                # part-removal was attempted. Pairs with the
-                # precheck_unstable_XX.png files written above.
-                if log_dir is not None and observed_fallen:
-                    try:
-                        import json as _json
-                        import os as _os
-                        fallen_sorted = sorted(observed_fallen)
-                        subject = fallen_sorted[0]
-                        evidence = None
-                        if _per_pose:
-                            for _e in _per_pose:
-                                if _e.get('success') or not _e.get('fallen'):
-                                    continue
-                                png = f"precheck_unstable_{_e['pose_idx']:02d}.png"
-                                if _os.path.exists(_os.path.join(log_dir, png)):
-                                    evidence = png
-                                    break
-                        payload = {
-                            'depth': 0,
-                            'deepest_nodes': [list(G0)],
-                            'failures': [{
-                                'child_part': subject,
-                                'fail_reason': 'stability',
-                                'evidence_image': evidence,
-                                'unstable_parts': fallen_sorted,
-                            }],
-                        }
-                        with open(_os.path.join(log_dir, 'failures.json'), 'w') as fp:
-                            _json.dump(payload, fp, indent=2)
-                        print(f"[planner.base.plan] wrote precheck-stability "
-                              f"failures.json: {len(fallen_sorted)} unstable "
-                              f"part(s), evidence={evidence}")
-                    except Exception as _e:
-                        print(f"[planner.base.plan] failed to persist precheck "
-                              f"failures.json: {_e}")
+                # Persist precheck failures.json (shared with DFA branch).
+                self._write_precheck_failures_json(
+                    log_dir, G0, observed_fallen, _per_pose,
+                )
                 return tree
             elif action == 'ignore_unstable':
                 self._ignored_unstable_parts = frozenset(observed_fallen)
