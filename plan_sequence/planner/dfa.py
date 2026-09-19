@@ -376,6 +376,8 @@ class DFASequencePlanner(SequencePlanner):
         self.stop_msg = None
         self._timing = defaultdict(float)
         self._timing_counts = defaultdict(int)
+        self._timing_by_part = defaultdict(float)
+        self._timing_by_part_counts = defaultdict(int)
         # Stash log_dir on self so overridable hooks (e.g. LLM frontier selection)
         # can write caches / decision logs alongside the planner output.
         self.log_dir = log_dir
@@ -419,7 +421,12 @@ class DFASequencePlanner(SequencePlanner):
                       f"{len(initial_poses)} trimesh stable pose(s) on root node")
             observed_fallen = frozenset()
         else:
+            _t_pre = time()
             initial_poses, observed_fallen, _per_pose = self._initial_stable_poses(G0, max_poses, log_dir=log_dir)
+            # Wall-clock, not worker CPU: the precheck is its own phase and was
+            # previously invisible, silently inflating the other buckets.
+            self._timing['initial_precheck'] += time() - _t_pre
+            self._timing_counts['initial_precheck'] += 1
             # Render one PNG per attempted pose (precheck_unstable_<i>.png)
             # in that pose's orientation with that pose's fallen parts
             # highlighted, instead of a single union image that hid the
@@ -452,6 +459,19 @@ class DFASequencePlanner(SequencePlanner):
         )
         tree.add_node(tuple(G0), n_eval=0, n_gripper=1, poses=initial_poses)
 
+        if self.base_part is None and not initial_poses and action != 'skip':
+            # Budgeted relaxation first (shared with the serial branch): a pose
+            # needing <= max_initial_held_parts held parts is usable, so only
+            # fall through to no_stable_pose_action when even that fails.
+            _max_held = int(getattr(settings, 'max_initial_held_parts', 0) or 0)
+            _relaxed, _held = self._relax_initial_pose_by_held_parts(_per_pose, _max_held)
+            if _relaxed:
+                initial_poses = _relaxed
+                self._ignored_unstable_parts = frozenset(_held)
+                tree.nodes[tuple(G0)]['poses'] = initial_poses
+                print(f'[DFA.plan] no fully self-stable pose; accepting a pose that '
+                      f'needs {len(_held)} part(s) held: {sorted(_held)} '
+                      f'(settings.max_initial_held_parts={_max_held})')
         if self.base_part is None and not initial_poses and action != 'skip':
             if action == 'exit':
                 self.stop_msg = 'no self-stable initial pose'
@@ -622,6 +642,22 @@ class DFASequencePlanner(SequencePlanner):
                         self._timing_counts['path_finding'] += 1
                     dt_stab = sim_info.pop('_dt_stab', None)
                     dt_tool = sim_info.pop('_dt_tool', None)
+                    dt_build = sim_info.pop('_dt_build', None)
+                    dt_dof = sim_info.pop('_dt_dof', None)
+                    for _dt, _bucket in ((dt_build, 'sim_build'), (dt_dof, 'dof')):
+                        if _dt is not None:
+                            self._timing[_bucket] += _dt
+                            self._timing_counts[_bucket] += 1
+                    # Attribute the whole worker cost of this candidate to the
+                    # part it tried to remove.
+                    _part = str(sim_info.get('part_move'))
+                    _cost = sum(
+                        float(x)
+                        for x in (dt_path, dt_stab, dt_tool, dt_build, dt_dof)
+                        if x is not None
+                    )
+                    self._timing_by_part[_part] += _cost
+                    self._timing_by_part_counts[_part] += 1
                     if sim_info['action'] is not None:
                         self._n_assembly_success += 1
                         self._n_stability_checks += 1

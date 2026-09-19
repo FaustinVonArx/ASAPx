@@ -71,6 +71,13 @@ def _simulate_standalone(asset_folder, assembly_dir, save_sdf, base_part,
         )
         dof = None
     dt_path = time() - _t0
+    # Peel the sub-phases out so `path_finding` means the action probes only.
+    dt_build = diag_assembly.pop('dt_build', None)
+    dt_dof = diag_assembly.pop('dt_dof', None)
+    for _sub in (dt_build, dt_dof):
+        if _sub is not None:
+            dt_path -= _sub
+    dt_path = max(0.0, dt_path)
 
     if action is not None and settings.filter_below_ground and _below_ground_after_disassembly(assembly_dir, part_move, pose, path):
         action = None
@@ -145,6 +152,8 @@ def _simulate_standalone(asset_folder, assembly_dir, save_sdf, base_part,
         '_dt_path': dt_path,
         '_dt_stab': dt_stab,
         '_dt_tool': dt_tool,
+        '_dt_build': dt_build,
+        '_dt_dof': dt_dof,
     }
 
 
@@ -186,6 +195,11 @@ class SequencePlanner:
         self.stop_msg = None
         self._timing = defaultdict(float)
         self._timing_counts = defaultdict(int)
+        # Per-part simulation cost: part_move id -> seconds / call count. Lets
+        # callers ask whether one stubborn part dominates a sequence's cost or
+        # whether the work is spread evenly across candidates.
+        self._timing_by_part = defaultdict(float)
+        self._timing_by_part_counts = defaultdict(int)
 
     def seed(self, seed):
         random.seed(seed)
@@ -245,6 +259,32 @@ class SequencePlanner:
             print(f"[planner.precheck] failed to persist precheck "
                   f"failures.json: {_e}")
             return False
+
+    def _relax_initial_pose_by_held_parts(self, per_pose, max_held):
+        """Fallback for the initial-pose precheck: accept the best candidate
+        pose that needs at most `max_held` parts held.
+
+        The strict precheck demands a fully self-supporting pose (parts_fix=[]).
+        Most real assemblies miss that on only one or two parts, which is a
+        pose an operator could steady by hand. This picks the candidate with
+        the fewest falling parts among those within budget (ties break by
+        trimesh's own probability ordering, i.e. pose_idx).
+
+        Returns (poses, held_parts): a single-element pose list plus the parts
+        that must be held, or ([], frozenset()) when nothing qualifies.
+        Shared by both plan() branches -- the serial one here and the parallel
+        DFA override -- so the two can't drift apart.
+        """
+        if not per_pose or max_held <= 0:
+            return [], frozenset()
+        candidates = [
+            e for e in per_pose
+            if not e.get('success') and 0 < len(e.get('fallen') or []) <= max_held
+        ]
+        if not candidates:
+            return [], frozenset()
+        best = min(candidates, key=lambda e: (len(e['fallen']), e['pose_idx']))
+        return [best['pose']], frozenset(best['fallen'])
 
     @staticmethod
     def _parent_pose_for(tree, parent_G):
@@ -622,7 +662,12 @@ class SequencePlanner:
                       f"trimesh stable pose(s) on root node")
             observed_fallen = frozenset()
         else:
+            _t_pre = time()
             initial_poses, observed_fallen, _per_pose = self._initial_stable_poses(G0, max_poses, log_dir=log_dir)
+            # Wall-clock, not worker CPU: the precheck is its own phase and was
+            # previously invisible, silently inflating the other buckets.
+            self._timing['initial_precheck'] += time() - _t_pre
+            self._timing_counts['initial_precheck'] += 1
             # When the precheck rejected every candidate AND observed parts
             # falling, render one PNG per attempted pose (precheck_unstable_<i>.png),
             # each rendered in that pose's orientation with that pose's fallen
@@ -661,6 +706,19 @@ class SequencePlanner:
         )
         tree.add_node(tuple(G0), n_eval=0, n_gripper=1, poses=initial_poses)
 
+        if self.base_part is None and not initial_poses and action != 'skip':
+            # Budgeted relaxation first: a pose needing <= max_initial_held_parts
+            # held parts is usable, so only fall through to no_stable_pose_action
+            # when even that fails.
+            _max_held = int(getattr(settings, 'max_initial_held_parts', 0) or 0)
+            _relaxed, _held = self._relax_initial_pose_by_held_parts(_per_pose, _max_held)
+            if _relaxed:
+                initial_poses = _relaxed
+                self._ignored_unstable_parts = frozenset(_held)
+                tree.nodes[tuple(G0)]['poses'] = initial_poses
+                print(f'[planner.base.plan] no fully self-stable pose; accepting a pose '
+                      f'that needs {len(_held)} part(s) held: {sorted(_held)} '
+                      f'(settings.max_initial_held_parts={_max_held})')
         if self.base_part is None and not initial_poses and action != 'skip':
             if action == 'exit':
                 self.stop_msg = 'no self-stable initial pose'
@@ -1114,6 +1172,18 @@ class SequencePlanner:
         stats['time'] = round(t_plan, 2)
         stats['total_n_eval'] = self.n_eval
         stats['stop_msg'] = self.stop_msg
+        # Where the planning time went, persisted alongside the tree so
+        # downstream runtime benchmarks don't have to scrape stdout. NOTE:
+        # `_timing` accumulates worker-side durations, so with num_proc > 1
+        # the components are CPU-seconds and sum to more than `time`.
+        stats['timing_breakdown'] = {k: round(float(v), 4) for k, v in sorted(self._timing.items())}
+        stats['timing_counts'] = {k: int(self._timing_counts[k]) for k in sorted(self._timing)}
+        stats['timing_by_part'] = {
+            k: round(float(v), 4) for k, v in sorted(self._timing_by_part.items())
+        }
+        stats['timing_by_part_counts'] = {
+            k: int(self._timing_by_part_counts[k]) for k in sorted(self._timing_by_part)
+        }
 
         os.makedirs(log_dir, exist_ok=True)
         with open(os.path.join(log_dir, 'tree.pkl'), 'wb') as fp:

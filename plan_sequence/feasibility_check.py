@@ -70,9 +70,20 @@ def check_assemblable(asset_folder, assembly_dir, parts_fix, part_move, pose=Non
         {'directions': [{'action': [..], 'success': bool, 'path_len': int}, ...]}
         capturing per-axis probe results that would otherwise be discarded.
     '''
+    # Sub-timings surface through `diagnostics` so callers can bucket sim
+    # construction (which builds/loads SDFs) and the DoF probe separately from
+    # the actual path search -- lumping all three under "path finding" hid
+    # where the time really goes.
+    _t_build = time()
     planner = MultiPartPathPlanner(asset_folder, assembly_dir, parts_fix, part_move, pose=pose, save_sdf=save_sdf)
+    _dt_build = time() - _t_build
 
+    _t_dof = time()
     dof = planner.compute_dof() if get_dof else None
+    _dt_dof = time() - _t_dof
+    if diagnostics is not None:
+        diagnostics['dt_build'] = _dt_build
+        diagnostics['dt_dof'] = _dt_dof
 
     # Probe along assembly-local axes: rotate the world-frame 6 unit actions by pose.
     R = pose[:3, :3] if pose is not None else np.eye(3)
