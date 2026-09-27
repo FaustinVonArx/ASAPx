@@ -3,16 +3,22 @@ written incrementally by ``weight_trainer.train_heuristic_weights``).
 
 Produces a single figure with three sections:
 
-1. **Convergence curve** — per-trial mean_total_s as a scatter plus a
+1. **Convergence curve** — per-trial objective as a scatter plus a
    running best-so-far line. Quickly answers "is training improving the
-   objective?"
+   objective?" Pruned trials (a partial estimate) are drawn hollow and
+   failing ones as red crosses; only fully evaluated trials count as best.
 2. **Per-weight sensitivity** — one scatter per weight (weight value vs
-   mean_total_s), with marker color scaling from old (light) to new (dark)
+   objective), with marker color scaling from old (light) to new (dark)
    trials. Reveals which weights actually move the objective and roughly
    where the optimum sits.
 3. **Per-assembly trajectory** — one faint line per training assembly
    across trials. Shows whether gains are broad-spectrum or carried by a
    few assemblies (and flags any assembly that consistently fails).
+
+The objective is the geometric-mean time ratio against the baseline
+(``geomean_ratio``, per assembly ``per_assembly_ratio``). History files
+written before the trainer had a baseline carry ``mean_total_s`` /
+``per_assembly_total_s`` instead, and are plotted in seconds.
 
 Use either programmatically::
 
@@ -63,6 +69,21 @@ def _running_min(xs):
     return out
 
 
+def _objective(entries):
+    """Per-entry objective values plus how to label them: the time ratio
+    against the baseline when the history has one, seconds otherwise."""
+    if any('geomean_ratio' in e for e in entries):
+        return ([e.get('geomean_ratio') for e in entries], 'per_assembly_ratio',
+                'time vs baseline (geometric mean)', 'time vs baseline', '{:.3f}x')
+    return ([e.get('mean_total_s') for e in entries], 'per_assembly_total_s',
+            'mean total assembly time (s)', 'per-assembly total_s', '{:.2f}s')
+
+
+def _is_complete(e):
+    # Legacy entries have no outcome; every one of them was fully evaluated.
+    return e.get('outcome', 'complete') == 'complete'
+
+
 def plot_weight_history(history, save_path=None, show=False, title_suffix=''):
     """Render the training history as a 3-section diagnostic figure.
 
@@ -81,18 +102,20 @@ def plot_weight_history(history, save_path=None, show=False, title_suffix=''):
         raise ValueError("history is empty")
 
     trials = np.array([e.get('trial', i) for i, e in enumerate(entries)])
-    means = [e.get('mean_total_s') for e in entries]
+    means, per_key, y_label, per_label, fmt = _objective(entries)
     finite_mask = np.array([m is not None and math.isfinite(m) for m in means])
     means_arr = np.array([m if (m is not None and math.isfinite(m)) else np.nan
                           for m in means])
+    complete_mask = finite_mask & np.array([_is_complete(e) for e in entries])
+    pruned_mask = finite_mask & ~complete_mask
+    complete_arr = np.where(complete_mask, means_arr, np.nan)
 
-    best_so_far = _running_min([m if (m is not None and math.isfinite(m)) else None
-                                for m in means])
+    best_so_far = _running_min([m if c else None for m, c in zip(means, complete_mask)])
     best_so_far_arr = np.array([b if b is not None else np.nan for b in best_so_far])
 
-    # Identify best trial overall.
-    if finite_mask.any():
-        best_idx = int(np.nanargmin(means_arr))
+    # Identify best trial overall (fully evaluated trials only).
+    if complete_mask.any():
+        best_idx = int(np.nanargmin(complete_arr))
         best_trial_num = int(trials[best_idx])
         best_value = float(means_arr[best_idx])
     else:
@@ -103,7 +126,7 @@ def plot_weight_history(history, save_path=None, show=False, title_suffix=''):
     # Collect per-assembly time series.
     assembly_ids = set()
     for e in entries:
-        per = e.get('per_assembly_total_s') or {}
+        per = e.get(per_key) or {}
         assembly_ids.update(per.keys())
     assembly_ids = sorted(assembly_ids)
 
@@ -118,8 +141,12 @@ def plot_weight_history(history, save_path=None, show=False, title_suffix=''):
 
     # ---- Section 1: convergence ----
     ax_conv = fig.add_subplot(gs[0, :])
-    ax_conv.scatter(trials[finite_mask], means_arr[finite_mask],
-                    s=25, alpha=0.55, color='steelblue', label='per-trial mean')
+    ax_conv.scatter(trials[complete_mask], means_arr[complete_mask],
+                    s=25, alpha=0.55, color='steelblue', label='per-trial objective')
+    if pruned_mask.any():
+        ax_conv.scatter(trials[pruned_mask], means_arr[pruned_mask],
+                        s=25, alpha=0.55, facecolors='none', edgecolors='steelblue',
+                        label='pruned (partial estimate)')
     bad = ~finite_mask
     if bad.any():
         ymin = float(np.nanmin(means_arr)) if finite_mask.any() else 0.0
@@ -130,9 +157,9 @@ def plot_weight_history(history, save_path=None, show=False, title_suffix=''):
     if best_idx is not None:
         ax_conv.scatter([best_trial_num], [best_value], marker='*', s=220,
                         color='darkorange', edgecolor='black', zorder=5,
-                        label=f'best (trial {best_trial_num}, {best_value:.2f}s)')
+                        label=f'best (trial {best_trial_num}, {fmt.format(best_value)})')
     ax_conv.set_xlabel('trial number')
-    ax_conv.set_ylabel('mean total assembly time (s)')
+    ax_conv.set_ylabel(y_label)
     ax_conv.set_title('Convergence')
     ax_conv.legend(loc='upper right', fontsize=8)
     ax_conv.grid(alpha=0.3)
@@ -144,8 +171,17 @@ def plot_weight_history(history, save_path=None, show=False, title_suffix=''):
         cmap = plt.get_cmap('viridis')
     for col, key in enumerate(WEIGHT_KEYS):
         ax = fig.add_subplot(gs[1, col])
-        values = np.array([(e.get('weights') or {}).get(key, np.nan) for e in entries])
+        values = np.array([(e.get('weights') or {}).get(key, np.nan) for e in entries],
+                          dtype=float)
         v_mask = finite_mask & ~np.isnan(values)
+        # Log-uniform search: spread the axis the way it was sampled. A weight
+        # held fixed is a single value; say so instead of plotting a column.
+        v_seen = values[~np.isnan(values)]
+        fixed = v_seen.size > 0 and np.all(v_seen == v_seen[0])
+        if fixed:
+            ax.set_title(f'fixed at {v_seen[0]:.3g}', fontsize=8)
+        elif v_seen.size and v_seen.min() > 0 and v_seen.max() / v_seen.min() > 20:
+            ax.set_xscale('log')
         if v_mask.any():
             ax.scatter(values[v_mask], means_arr[v_mask],
                        c=trials[v_mask], cmap=cmap, norm=norm,
@@ -155,7 +191,7 @@ def plot_weight_history(history, save_path=None, show=False, title_suffix=''):
                            s=160, color='darkorange', edgecolor='black', zorder=5)
         ax.set_xlabel(key, fontsize=9)
         if col == 0:
-            ax.set_ylabel('mean total time (s)')
+            ax.set_ylabel(y_label, fontsize=8)
         ax.grid(alpha=0.3)
         ax.tick_params(labelsize=8)
     # Colorbar for the row (anchored on the last weight axis).
@@ -174,7 +210,7 @@ def plot_weight_history(history, save_path=None, show=False, title_suffix=''):
         for aid in assembly_ids:
             ys = []
             for e in entries:
-                per = e.get('per_assembly_total_s') or {}
+                per = e.get(per_key) or {}
                 v = per.get(aid)
                 ys.append(v if (v is not None and math.isfinite(v)) else np.nan)
             ax_per.plot(trials, ys, marker='.', ms=4, alpha=0.55, lw=0.8,
@@ -182,7 +218,7 @@ def plot_weight_history(history, save_path=None, show=False, title_suffix=''):
         # Mean line (over assemblies present per trial), bold on top.
         mean_per_trial = []
         for e in entries:
-            per = e.get('per_assembly_total_s') or {}
+            per = e.get(per_key) or {}
             vals = [v for v in per.values()
                     if v is not None and math.isfinite(v)]
             mean_per_trial.append(sum(vals) / len(vals) if vals else np.nan)
@@ -194,15 +230,17 @@ def plot_weight_history(history, save_path=None, show=False, title_suffix=''):
         else:
             ax_per.legend(['mean across assemblies'], loc='upper right',
                           fontsize=8)
+    if per_key == 'per_assembly_ratio':
+        ax_per.axhline(1.0, color='grey', lw=1, ls='--')
     ax_per.set_xlabel('trial number')
-    ax_per.set_ylabel('per-assembly total_s')
+    ax_per.set_ylabel(per_label)
     ax_per.set_title(f'Per-assembly trajectory ({len(assembly_ids)} assemblies)')
     ax_per.grid(alpha=0.3)
 
     n_total = len(entries)
-    n_ok = int(finite_mask.sum())
-    suptitle = (f'Optuna weight training — {n_ok}/{n_total} successful trials'
-                + (f'  ·  best: {best_value:.2f}s (trial {best_trial_num})'
+    n_ok = int(complete_mask.sum())
+    suptitle = (f'Optuna weight training — {n_ok}/{n_total} fully evaluated trials'
+                + (f'  ·  best: {fmt.format(best_value)} (trial {best_trial_num})'
                    if best_value is not None else ''))
     if title_suffix:
         suptitle += f'  ·  {title_suffix}'
