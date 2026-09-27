@@ -528,24 +528,28 @@ def plan_arm_sequence(asset_folder, assembly_dir, sequence, tree,
     print(f'[arm_pipeline] ============================================================', flush=True)
 
     # ─────────── Simplification mode (read first so prep can short-circuit) ───────────
-    # When simplified mode is on AND grasp checking is off, no downstream
-    # consumer in this pipeline needs the disassembly path — distance comes
-    # from a deterministic mesh-based proxy. Skip the physics-replay path
-    # replanning entirely. This is the only "still touching the planner" step
-    # otherwise; without it the pipeline is closed-form and instant.
+    # Simplified mode needs the physics-replayed disassembly path for the
+    # distance d in its cost (and for the grasp check, when on). With
+    # arm_simplified_replan_paths off and the grasp check off, nothing needs
+    # it: d falls back to the part's bbox diagonal and the replay is skipped,
+    # which makes the pipeline closed-form and instant.
     simplified_mode = False
     k_dist = 1.0
     k_vol = 0.01
-    simplified_check_grasp = True
+    simplified_check_grasp = False
+    simplified_replan_paths = True
+    simplified_clip_path = True
     try:
         import settings as _settings_simp
         simplified_mode = bool(getattr(_settings_simp, 'arm_simplified_mode', False))
         k_dist = float(getattr(_settings_simp, 'arm_simplified_k_dist', 1.0))
         k_vol = float(getattr(_settings_simp, 'arm_simplified_k_vol', 0.01))
-        simplified_check_grasp = bool(getattr(_settings_simp, 'arm_simplified_check_grasp', True))
+        simplified_check_grasp = bool(getattr(_settings_simp, 'arm_simplified_check_grasp', False))
+        simplified_replan_paths = bool(getattr(_settings_simp, 'arm_simplified_replan_paths', True))
+        simplified_clip_path = bool(getattr(_settings_simp, 'arm_simplified_clip_path', True))
     except ImportError:
         pass
-    need_paths = (not simplified_mode) or simplified_check_grasp
+    need_paths = (not simplified_mode) or simplified_check_grasp or simplified_replan_paths
 
     # ─────────── Step info + path replanning ───────────
     print(f'[arm_pipeline:prep] preparing step infos for {len(sequence)} step(s) '
@@ -588,6 +592,7 @@ def plan_arm_sequence(asset_folder, assembly_dir, sequence, tree,
             k_dist=k_dist, k_vol=k_vol,
             fail_multiplier=fail_multiplier,
             check_grasp=simplified_check_grasp,
+            clip_path=simplified_clip_path,
         )
         _log_stage1_summary(stage1_results, t_s1)
     else:
@@ -863,20 +868,25 @@ def _extract_step_infos(asset_folder, assembly_dir, sequence, tree, num_proc,
         _removed.append(part_move)
 
     # Parallel path replanning. Skipped when the caller passes
-    # replan_paths=False (e.g. simplified mode with grasp check off — no
-    # downstream consumer needs the path then, and the physics replay is the
-    # only heavy step in this function).
+    # replan_paths=False (simplified mode with arm_simplified_replan_paths and
+    # the grasp check both off — no downstream consumer needs the path then,
+    # and the physics replay is the only heavy step in this function).
     if replan_paths:
         worker_args = [(asset_folder, assembly_dir, sa) for sa in step_args]
         if num_proc > 1 and len(worker_args) > 1:
-            results = list(parallel_execute(
-                _path_worker, worker_args, num_proc=num_proc,
-                show_progress=True, desc='arm_pipeline paths',
-            ))
+            # parallel_execute yields in completion order; match each path to
+            # its step by index, or steps get each other's paths (and with
+            # them each other's distance d and grasp check).
+            path_by_step = {
+                wa[2]['i']: path for path, wa in parallel_execute(
+                    _path_worker, worker_args, num_proc=num_proc,
+                    show_progress=True, desc='arm_pipeline paths', return_args=True,
+                )
+            }
         else:
-            results = [_path_worker(*wa) for wa in worker_args]
-        for sa, path in zip(step_args, results):
-            sa['path'] = path  # list of 6-vectors (qm), or None if replan failed
+            path_by_step = {wa[2]['i']: _path_worker(*wa) for wa in worker_args}
+        for sa in step_args:
+            sa['path'] = path_by_step.get(sa['i'])  # list of 6-vectors (qm), or None if replan failed
     else:
         for sa in step_args:
             sa['path'] = None
@@ -981,10 +991,12 @@ def _run_stage1(asset_folder, assembly_dir, step_infos,
 def _run_stage1_simplified(asset_folder, assembly_dir, step_infos,
                             gripper_type, gripper_scale, num_proc,
                             k_dist, k_vol, fail_multiplier,
-                            check_grasp=True):
+                            check_grasp=True, clip_path=True):
     """Lightweight stage-1 replacement used when settings.arm_simplified_mode
     is True. Per step:
-      - measures cartesian path length d of the disassembly motion
+      - measures cartesian path length d of the disassembly motion, capped
+        at the straight pull that clears the part (`clip_path`, see
+        _straight_pull_distance)
       - measures part mesh volume V
       - optionally runs a rod-grasp feasibility check (no IK, no RRT) when
         `check_grasp` is True; skipped entirely when False, in which case
@@ -1001,7 +1013,7 @@ def _run_stage1_simplified(asset_folder, assembly_dir, step_infos,
     worker_args = [
         (asset_folder, assembly_dir, sa, gripper_type, gripper_scale,
          float(k_dist), float(k_vol), float(fail_multiplier),
-         bool(check_grasp))
+         bool(check_grasp), bool(clip_path))
         for sa in step_infos
     ]
     if num_proc > 1 and len(worker_args) > 1:
@@ -1016,10 +1028,43 @@ def _run_stage1_simplified(asset_folder, assembly_dir, step_infos,
             for i in range(len(step_infos))]
 
 
+def _straight_pull_distance(assembly_dir, part_move, parts_rest, pose, action):
+    """How far the part must be pulled straight along the step's world-frame
+    action before it is clear of the rest by the physics separation margin
+    (physics_planner.MIN_SEP): its extent projected on the pull direction
+    lies past the rest's. A straight extraction never needs to travel
+    further.
+
+    The physics replay can run much longer: it pushes the part with a fixed
+    force and checks separation only every FRAME_SKIP steps, zeroing the
+    velocity in between, so each check covers a mass-dependent distance. A
+    normal part moves ~0.5 cm per check (the steps d takes, which overshoot
+    the clear point by up to one), a very light one tumbles away and can log
+    hundreds of cm on a 10 cm assembly before the check fires.
+
+    None when there is no action to pull along."""
+    from plan_sequence.physics_planner import MIN_SEP
+    from plan_sequence.stable_pose import get_combined_mesh as _gcm
+
+    if action is None or not parts_rest:
+        return None
+    u = np.asarray(action, dtype=float)
+    norm = float(np.linalg.norm(u))
+    if norm < 1e-9:
+        return None
+    u = u / norm
+    R = np.asarray(pose, dtype=float)[:3, :3] if pose is not None else np.eye(3)
+    part = _gcm(assembly_dir, [part_move])
+    rest = _gcm(assembly_dir, list(parts_rest))
+    clearance = float(((np.asarray(rest.vertices) @ R.T) @ u).max()
+                      - ((np.asarray(part.vertices) @ R.T) @ u).min())
+    return max(clearance, 0.0) + MIN_SEP
+
+
 def _stage1_simplified_worker(asset_folder, assembly_dir, sa,
                                gripper_type, gripper_scale,
                                k_dist, k_vol, fail_multiplier,
-                               check_grasp=True):
+                               check_grasp=True, clip_path=True):
     """Picklable simplified stage-1 worker. See _run_stage1_simplified."""
     i = sa['i']
     part_move = sa['part_move']
@@ -1065,10 +1110,9 @@ def _stage1_simplified_worker(asset_folder, assembly_dir, sa,
     # Cartesian path length:
     #   - When the physics-replanned path is available, sum its cartesian
     #     waypoint distances (faithful to the actual extraction trajectory).
-    #   - When it isn't (replan_paths=False, e.g. simplified mode with grasp
-    #     check off), fall back to the part's bbox diagonal — a deterministic
-    #     mesh-only proxy for "how far does the part have to travel to clear
-    #     its neighbours".
+    #   - When it isn't (replan_paths=False, or the replay failed), fall back
+    #     to the part's bbox diagonal — a deterministic mesh-only proxy for
+    #     "how far does the part have to travel to clear its neighbours".
     path = None
     d_cart = 0.0
     d_source = 'bbox_diag'
@@ -1077,17 +1121,29 @@ def _stage1_simplified_worker(asset_folder, assembly_dir, sa,
         for j in range(1, len(path)):
             d_cart += float(np.linalg.norm(path[j][:3] - path[j - 1][:3]))
         d_source = 'physics_path'
+    # The replay can only overestimate a straight extraction (see
+    # _straight_pull_distance), so d never exceeds the straight pull.
+    d_raw = d_cart
+    if clip_path and d_source == 'physics_path':
+        try:
+            d_pull = _straight_pull_distance(assembly_dir, part_move, sa['parts_rest'],
+                                             sa.get('pose'), sa.get('action'))
+        except Exception as e:
+            print(f'[arm_pipeline:stage1_simp] step {i} ({part_move}): '
+                  f'straight-pull clip skipped: {e}', flush=True)
+            d_pull = None
+        if d_pull is not None and d_pull < d_cart:
+            d_cart = d_pull
+            d_source = 'straight_pull'
     if d_cart <= 0.0:
         d_cart = bbox_diag
         d_source = 'bbox_diag'
 
     # Rod grasp feasibility: reuse GraspPlanner (no IK/RRT). Returns a list
     # of feasible grasps along the path — non-empty = success. Skipped
-    # entirely when `check_grasp` is False; in that case every step is
-    # treated as feasible and the bare closed-form cost is returned.
-    # Rod grasp feasibility: only meaningful when we actually have a path to
-    # check against. When path is None (replan was skipped because grasp
-    # checking is also off), we definitionally don't run the check.
+    # entirely when `check_grasp` is False (the default); in that case every
+    # step is treated as feasible and the bare closed-form cost is returned.
+    # Only meaningful when we actually have a path to check against.
     grasp_checked = bool(check_grasp) and (path is not None)
     if grasp_checked:
         grasp_feasible = False
@@ -1127,6 +1183,7 @@ def _stage1_simplified_worker(asset_folder, assembly_dir, sa,
         'grasp_checked': grasp_checked,
         'path_distance_cartesian': d_cart,
         'path_distance_source': d_source,
+        'path_distance_raw': d_raw,
         'part_volume': V,
         'duration_s': duration_s,
         'path_distance_rad': 0.0,
