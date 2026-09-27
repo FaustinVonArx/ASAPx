@@ -23,6 +23,7 @@ class BaseSequenceOptimizer:
     def __init__(self, tree):
         self.tree = tree
         self.root = self._find_root(tree)
+        self._valid_sequences = None
 
     @staticmethod
     def _find_root(tree):
@@ -31,13 +32,21 @@ class BaseSequenceOptimizer:
                 return node
         raise ValueError('[optimizer] tree has no root')
 
-    def find_valid_sequences(self):
+    def find_valid_sequences(self, refresh=False):
         '''
         Enumerate every root-to-leaf path through feasible edges whose leaf is a
         valid terminal node (single remaining part with n_gripper is not None).
 
+        The result is memoised on the instance: the tree is immutable once
+        planning is done, and both optimize_scored and optimize_constrained walk
+        the same enumeration, so a single divide run pays for it once. Pass
+        ``refresh=True`` to force a re-walk.
+
         Returns: list[list[part_id]] - each inner list is one sequence in removal order.
         '''
+        if not refresh and self._valid_sequences is not None:
+            return self._valid_sequences
+
         sequences = []
         path = []
 
@@ -55,6 +64,7 @@ class BaseSequenceOptimizer:
                 path.pop()
 
         dfs(self.root)
+        self._valid_sequences = sequences
         return sequences
 
     def optimize(self):
@@ -101,6 +111,40 @@ class BaseSequenceOptimizer:
             total += c
             node = child
         return total, per_edge
+
+    def optimize_constrained(self, is_allowed, cost_fn=None):
+        '''
+        Lowest-cost valid sequence that ALSO satisfies ``is_allowed(seq) -> bool``.
+
+        This is how a subassembly plan is turned into a real disassembly order:
+        the plan defines a block ordering (prefix before the split, S before R,
+        recursively) and ``is_allowed`` rejects every enumerated sequence that
+        violates it. Because the result is still a root-to-leaf path of THIS
+        tree, every downstream consumer (renderer, per-step poses, tool
+        decisions, arm pipeline) keeps working unchanged — only the order
+        differs. See optimizer/split_plan.py.
+
+        Returns (sequence, cost). ``cost`` is None when no cost_fn was given or
+        no constrained sequence could be costed. Returns (None, None) when no
+        valid sequence satisfies the constraint — the caller should then fall
+        back to the unconstrained pick.
+        '''
+        candidates = [seq for seq in self.find_valid_sequences() if is_allowed(seq)]
+        if not candidates:
+            return None, None
+        if cost_fn is None:
+            return candidates[0], None
+
+        best_seq, best_cost = None, None
+        for seq in candidates:
+            total, _ = self.cost_sequence(seq, cost_fn)
+            if total is None:
+                continue
+            if best_cost is None or total < best_cost:
+                best_seq, best_cost = seq, total
+        if best_seq is None:
+            return candidates[0], None
+        return best_seq, best_cost
 
     def optimize_scored(self, cost_fn=None, divide_optimizer=None,
                         threshold=0.1, debug=0):

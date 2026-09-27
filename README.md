@@ -1,7 +1,7 @@
 # ASAPx
 
 ASAPx is a fork of [ASAP](http://asap.csail.mit.edu) that serves as the active
-sequence-planning backend of [AssemblyEval](../README.md). It keeps ASAP's
+sequence-planning backend of [AssembleX](../README.md). It keeps ASAP's
 physics-based assembly-by-disassembly core (the RedMax simulator, the search
 tree, and the geometric and learned generators) and adds:
 
@@ -15,12 +15,12 @@ tree, and the geometric and learned generators) and adds:
   assembly into independently planned subassemblies, alongside cost-comparison
   and weight-training utilities.
 
-See the [main AssemblyEval README](../README.md) for setup, usage, and how
+See the [main AssembleX README](../README.md) for setup, usage, and how
 ASAPx fits into the wider pipeline.
 
 The original ASAP README is preserved below for reference. Not all of it still
 applies: installation, dataset, and command-line instructions have changed in
-ASAPx, so follow the main AssemblyEval README for anything operational.
+ASAPx, so follow the main AssembleX README for anything operational.
 
 ---
 

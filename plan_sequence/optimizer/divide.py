@@ -241,7 +241,10 @@ class DivideOptimizer(BaseSequenceOptimizer):
                                         contact_weight=CONTACT_WEIGHT,
                                         fragmentation_weight=FRAGMENTATION_WEIGHT,
                                         propagate=True,
-                                        disassembly_sequence=None):
+                                        disassembly_sequence=None,
+                                        restrict_parts=None,
+                                        score_scope=None,
+                                        verbose=True):
         '''
         DFS over partitions (S, R). Children of a state are single-part additions
         r ∈ S that are in contact (per the contact graph) with the current R, or
@@ -284,6 +287,23 @@ class DivideOptimizer(BaseSequenceOptimizer):
         ``disassembly_sequence`` is None, a representative sequence is taken
         from ``BaseSequenceOptimizer(self.tree).optimize()``.
 
+        Restriction (``restrict_parts``): when given, the search universe is
+        that subset instead of the whole assembly. Everything outside it is
+        treated as already removed — it can neither block a candidate nor
+        contribute contacts to the cut score. This is what lets the recursive
+        split planner cut a subassembly that is itself one side of an earlier
+        cut (see ``optimizer/split_plan.py``).
+
+        Scoring basis (``score_scope``): the part set the score is normalised
+        against, defaulting to the search universe. It only differs when
+        pooling cuts found at DIFFERENT states (see ``sweep_sequence_states``):
+        balance and fragmentation divide by the universe size, so the same cut
+        shape scores higher the smaller the state it was found in, and raw
+        scores from different states are not comparable. Fixing the basis to
+        the block's full part set makes them comparable — and, usefully, makes
+        a cut that only frees up once most parts are off score low on balance
+        by construction, which is exactly how such a cut should rank.
+
         Returns: list of (S, R, score) tuples sorted by score descending. Also
         stored on self.locally_free. Times out after `timeout` seconds.
         '''
@@ -293,17 +313,40 @@ class DivideOptimizer(BaseSequenceOptimizer):
 
         graph = self.obstruction_graph
         parts_idx = graph.graph['parts_idx']
-        n_parts = len(parts_idx)
-        parts_list = [None] * n_parts
+        # Row count of the obstruction matrices: always the FULL part set, since
+        # that is what build_obstruction_graph sized them to. Kept separate from
+        # n_parts (the search universe) so a restricted search still indexes
+        # attribution rows correctly.
+        n_rows = len(parts_idx)
+        parts_list = [None] * n_rows
         for p, i in parts_idx.items():
             parts_list[i] = p
+
+        if restrict_parts is None:
+            universe = set(parts_idx)
+        else:
+            universe = {p for p in restrict_parts if p in parts_idx}
+            if len(universe) < 2:
+                self.locally_free = []
+                return []
+        # Contacts, components and adjacency are all evaluated on the induced
+        # subgraph so a restricted search never sees an already-removed part.
+        sub_graph = graph.subgraph(universe)
+
+        if score_scope is None:
+            n_parts = len(universe)
+            score_graph = sub_graph
+        else:
+            scope = {p for p in score_scope if p in parts_idx} or universe
+            n_parts = len(scope)
+            score_graph = graph.subgraph(scope)
 
         def part_blocks_S(part_id, S):
             M = graph.nodes[part_id]['obstruction']
             attributions = M[:-1]
             contrib = np.zeros(N_DOF, dtype=bool)
             for d in range(N_DOF):
-                known = [parts_list[i] for i in range(n_parts) if attributions[i, d]]
+                known = [parts_list[i] for i in range(n_rows) if attributions[i, d]]
                 if any(b in S for b in known):
                     contrib[d ^ 1] = True
             return contrib
@@ -316,19 +359,19 @@ class DivideOptimizer(BaseSequenceOptimizer):
 
         def cut_contacts(S, R):
             n = 0
-            for u, v in graph.edges():
+            for u, v in sub_graph.edges():
                 if (u in S and v in R) or (u in R and v in S):
                     n += 1
             return n
 
-        n_edges_total = graph.number_of_edges()
+        n_edges_total = score_graph.number_of_edges()
         edge_norm = max(n_edges_total, 1)
         frag_norm = max(n_parts - 2, 1)
 
         def induced_components(parts):
             if not parts:
                 return 0
-            return nx.number_connected_components(graph.subgraph(parts))
+            return nx.number_connected_components(sub_graph.subgraph(parts))
 
         def cut_score(S, R):
             balance = min(len(S), len(R)) / n_parts
@@ -339,7 +382,7 @@ class DivideOptimizer(BaseSequenceOptimizer):
                     - contact_weight * contacts
                     - fragmentation_weight * fragmentation)
 
-        S0 = frozenset(parts_idx)
+        S0 = frozenset(universe)
         R0 = frozenset()
         blocked0 = state_blocked(S0, R0)
 
@@ -375,7 +418,7 @@ class DivideOptimizer(BaseSequenceOptimizer):
                 continue
 
             if R:
-                candidates = [r for r in S if any(graph.has_edge(r, q) for q in R)]
+                candidates = [r for r in S if any(sub_graph.has_edge(r, q) for q in R)]
             else:
                 candidates = list(S)
             if not candidates:
@@ -403,19 +446,22 @@ class DivideOptimizer(BaseSequenceOptimizer):
 
         if propagate:
             n_added, n_steps = self._propagate_to_subsequent_steps(
-                results, disassembly_sequence, cut_score,
+                results, disassembly_sequence, cut_score, universe=universe,
             )
         else:
             n_added, n_steps = 0, 0
 
         results.sort(key=lambda t: t[2], reverse=True)
 
-        print(f'[DivideOptimizer] find_locally_free_subassemblies: '
-              f'{n_initial} initial free partitions via DFS over {len(visited)} states, '
-              f'elapsed {elapsed:.2f}s{suffix}')
-        if propagate:
-            print(f'[DivideOptimizer]   + {n_added} diminished splits propagated over '
-                  f'{n_steps} sequence steps (total: {len(results)})')
+        if verbose:
+            scope = ('full assembly' if restrict_parts is None
+                     else f'{len(universe)}-part block')
+            print(f'[DivideOptimizer] find_locally_free_subassemblies ({scope}): '
+                  f'{n_initial} initial free partitions via DFS over {len(visited)} states, '
+                  f'elapsed {elapsed:.2f}s{suffix}')
+            if propagate:
+                print(f'[DivideOptimizer]   + {n_added} diminished splits propagated over '
+                      f'{n_steps} sequence steps (total: {len(results)})')
 
         def _fmt(idx, entry):
             S_, R_, s_ = entry
@@ -423,7 +469,7 @@ class DivideOptimizer(BaseSequenceOptimizer):
                     f'|S|={len(S_)}  |R|={len(R_)}  '
                     f'S={sorted(S_)}  R={sorted(R_)}')
 
-        if results:
+        if results and verbose:
             top_n = min(10, len(results))
             print(f'top {top_n} by score:')
             for i in range(top_n):
@@ -437,7 +483,115 @@ class DivideOptimizer(BaseSequenceOptimizer):
         self.locally_free = results
         return results
 
-    def _propagate_to_subsequent_steps(self, results, disassembly_sequence, cut_score):
+    def sweep_sequence_states(self, disassembly_sequence, restrict_parts=None,
+                              timeout=100, min_block_parts=4, max_states=None,
+                              verbose=True):
+        '''
+        Run the cut DFS at EVERY prefix state of `disassembly_sequence`, not
+        just the initial one, and pool the results on a common score basis.
+
+        Why this is not what ``_propagate_to_subsequent_steps`` already does:
+        propagation seeds only from the initial-state DFS output and then does
+        set subtraction, so every split it emits has a shape inherited from a
+        split that was already free in the full block. A split that is fully
+        blocked initially is dropped by the DFS (``if blocked.all(): continue``)
+        before propagation can ever see it. This method re-derives the shapes at
+        each state instead, which is what finds a subassembly that only becomes
+        separable once some obstructing part is gone — "locked inside the full
+        assembly".
+
+        The two are complementary and both are pooled here: propagation runs at
+        the initial state (exactly as before, so today's candidates are a
+        subset of the result) and the DFS re-runs at each later state. Note the
+        DFS at a state always partitions that whole state, so a split with a
+        non-empty in-state prefix still comes only from propagation.
+
+        Cost: the obstruction graph is built once and shared, so each extra
+        state is pure graph work on a shrinking universe — measured at well
+        under a second total for a 17-part assembly, against ~12 minutes of
+        sequence planning. The physics is untouched: ``verify_separation``
+        depends only on (S, R), never on the state a cut was found in, so
+        verifying the pooled top-k costs exactly what verifying the
+        initial-state top-k costs.
+
+        Returns the pooled list of (S, R, score) sorted by score descending,
+        also stored on ``self.locally_free``. `min_block_parts` stops the walk
+        once the state is too small to hold two real sides.
+        '''
+        if self.obstruction_graph is None:
+            print('[DivideOptimizer] obstruction graph not built; call build_obstruction_graph() first.')
+            return None
+
+        parts_idx = self.obstruction_graph.graph['parts_idx']
+        if restrict_parts is None:
+            universe = set(parts_idx)
+        else:
+            universe = {p for p in restrict_parts if p in parts_idx}
+        if len(universe) < min_block_parts:
+            self.locally_free = []
+            return []
+
+        order = [p for p in (disassembly_sequence or []) if p in universe]
+
+        # Prefix states of the block, largest first.
+        states = []
+        remaining = set(universe)
+        for k in range(len(order) + 1):
+            if len(remaining) < min_block_parts:
+                break
+            states.append((k, frozenset(remaining)))
+            if k >= len(order):
+                break
+            remaining = remaining - {order[k]}
+        if max_states is not None:
+            states = states[:max_states]
+
+        pooled = {}
+        saved = self.locally_free
+        t_start = time.time()
+        try:
+            for k, state in states:
+                res = self.find_locally_free_subassemblies(
+                    timeout=timeout,
+                    restrict_parts=state,
+                    # Propagation only makes sense from the full block; later
+                    # states are reached by the walk itself.
+                    propagate=(k == 0),
+                    disassembly_sequence=order,
+                    # Fixed basis so scores from different states compare.
+                    score_scope=universe,
+                    verbose=False,
+                ) or []
+                for S, R, score in res:
+                    key = frozenset((frozenset(S), frozenset(R)))
+                    prev = pooled.get(key)
+                    if prev is None or score > prev[2]:
+                        pooled[key] = (S, R, score, k)
+        finally:
+            self.locally_free = saved
+
+        results = sorted(
+            ((S, R, score) for S, R, score, _ in pooled.values()),
+            key=lambda t: t[2], reverse=True,
+        )
+        # Which state each pooled cut was first seen free in, for diagnostics.
+        self.locally_free_state = {
+            frozenset((frozenset(S), frozenset(R))): k
+            for S, R, _, k in pooled.values()
+        }
+        self.locally_free = results
+
+        if verbose:
+            n_late = sum(1 for _, _, _, k in pooled.values() if k > 0)
+            print(f'[DivideOptimizer] sweep_sequence_states '
+                  f'({len(universe)}-part block, {len(states)} states): '
+                  f'{len(results)} pooled cuts '
+                  f'({n_late} first free only after a removal), '
+                  f'elapsed {time.time() - t_start:.2f}s')
+        return results
+
+    def _propagate_to_subsequent_steps(self, results, disassembly_sequence, cut_score,
+                                       universe=None):
         '''
         Extend `results` with diminished splits derived by walking a
         disassembly sequence. At each step, every split in the current set
@@ -445,6 +599,10 @@ class DivideOptimizer(BaseSequenceOptimizer):
         that shrink to size ≤ 1 are dropped. New splits (deduplicated by
         canonical key frozenset({S, R})) are appended to `results` with the
         same cut_score.
+
+        ``universe``, when given, is the restricted search universe: sequence
+        entries outside it are skipped, because those parts are already gone
+        before this block's cut is made.
 
         Returns (n_added, n_steps).
         '''
@@ -462,7 +620,8 @@ class DivideOptimizer(BaseSequenceOptimizer):
             print('[DivideOptimizer] propagate: no valid disassembly sequence; skipping.')
             return 0, 0
 
-        parts_idx = self.obstruction_graph.graph['parts_idx']
+        tracked = universe if universe is not None else set(
+            self.obstruction_graph.graph['parts_idx'])
 
         def split_key(S, R):
             return frozenset((frozenset(S), frozenset(R)))
@@ -484,7 +643,7 @@ class DivideOptimizer(BaseSequenceOptimizer):
         n_added = 0
         n_steps = 0
         for p in disassembly_sequence:
-            if p not in parts_idx:
+            if p not in tracked:
                 continue
             n_steps += 1
             next_set = []
@@ -517,7 +676,8 @@ class DivideOptimizer(BaseSequenceOptimizer):
 
         return n_added, n_steps
 
-    def verify_locally_free(self, top_k=10, num_proc=1, save_sdf=False, max_time=30, force_mag=None):
+    def verify_locally_free(self, top_k=10, num_proc=1, save_sdf=False, max_time=30,
+                            force_mag=None, verbose=True):
         '''
         Physically verify the top-k locally-free partitions by combining each
         side's parts into a single rigid mesh and running a path-planning
@@ -531,7 +691,8 @@ class DivideOptimizer(BaseSequenceOptimizer):
         Returns: list of (S, R, score) tuples that passed verification.
         '''
         if not self.locally_free:
-            print('[DivideOptimizer] no partitions to verify; call find_locally_free_subassemblies() first.')
+            if verbose:
+                print('[DivideOptimizer] no partitions to verify; call find_locally_free_subassemblies() first.')
             return None
         if self.asset_folder is None or self.assembly_dir is None:
             print('[DivideOptimizer] asset_folder/assembly_dir not set; cannot run physics verification.')
@@ -566,11 +727,12 @@ class DivideOptimizer(BaseSequenceOptimizer):
                 verified.append((S, R, score))
 
         self.verified_locally_free = verified
-        print(f'[DivideOptimizer] verify_locally_free: '
-              f'{len(verified)}/{len(to_verify)} partitions verified separable')
-        for i, (S, R, s) in enumerate(verified):
-            print(f'  [{i:>3}] score={s:.4f}  |S|={len(S)}  |R|={len(R)}  '
-                  f'S={sorted(S)}  R={sorted(R)}')
+        if verbose:
+            print(f'[DivideOptimizer] verify_locally_free: '
+                  f'{len(verified)}/{len(to_verify)} partitions verified separable')
+            for i, (S, R, s) in enumerate(verified):
+                print(f'  [{i:>3}] score={s:.4f}  |S|={len(S)}  |R|={len(R)}  '
+                      f'S={sorted(S)}  R={sorted(R)}')
         return verified
 
     def find_symmetric_additions(self):

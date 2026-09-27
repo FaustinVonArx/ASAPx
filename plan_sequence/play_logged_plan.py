@@ -696,6 +696,43 @@ def play_subassembly_split(asset_folder, assembly_dir, split, sequence, tree, re
                                  result_dir, options, label='R')
 
 
+def play_split_plan(asset_folder, assembly_dir, plan, sequence, tree, result_dir,
+                    save_sdf=False, make_video=False, reverse=False, connect_path=False,
+                    camera_pos=None, camera_lookat=None):
+    """Render every level of a recursive subassembly plan.
+
+    `plan` is the nested block dict persisted as stats['split_plan'] (see
+    ASAPx/plan_sequence/optimizer/split_plan.py). Each split block gets its own
+    directory under `result_dir` -- 'root' for the top level, then 'root.S',
+    'root.S.R' and so on -- holding that block's unified-split clip plus the
+    internal disassembly of each side.
+
+    This is the recursive counterpart of play_subassembly_split, which renders a
+    single flat (S, R) cut. Both are kept: a run with only stats['divide_split']
+    still goes through the flat one."""
+    if not plan or plan.get('kind') != 'split':
+        print('[play_split_plan] no recursive split plan to render')
+        return
+
+    def walk(block):
+        label = '.'.join(['root'] + list(block.get('path') or []))
+        split = block['split']
+        print(f'[play_split_plan] rendering block {label}')
+        play_subassembly_split(
+            asset_folder, assembly_dir, split, sequence, tree,
+            result_dir=os.path.join(result_dir, label),
+            save_sdf=save_sdf, make_video=make_video, reverse=reverse,
+            connect_path=connect_path, camera_pos=camera_pos,
+            camera_lookat=camera_lookat,
+        )
+        for side in ('S', 'R'):
+            child = block.get(side)
+            if child and child.get('kind') == 'split':
+                walk(child)
+
+    walk(plan)
+
+
 if __name__ == '__main__':
     from argparse import ArgumentParser
 

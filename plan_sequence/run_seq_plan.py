@@ -148,6 +148,146 @@ def _dump_failure_evidence(tree, asset_folder, assembly_dir, base_part, tools, s
     return payload
 
 
+def _build_subassembly_plan(stats, tree, opt, div, asset_folder, assembly_dir,
+                            cost_fn=None, threshold=0.1, num_proc=1, debug=0):
+    """Build the recursive prefix -> unified split -> S -> R plan and, when one
+    exists, re-pick the disassembly sequence so its ORDER respects it.
+
+    Writes into `stats`:
+        split_plan       nested block dict (see optimizer/split_plan.py)
+        split_steps      flattened step list, including the non-tree join steps
+        split_sequence   the plan's disassembly order over every part
+        split_sequence_source
+                         'tree' when the order is a real root-to-leaf path of
+                         this tree, 'derived' when it was assembled from the
+                         plan because no path respected the block order
+        flat_sequence    the unconstrained sequence, when `sequence` replaced it
+
+    `stats['sequence']` — what the renderer and the arm pipeline consume — is
+    only overwritten in the 'tree' case, where the new order is still a valid
+    path. In the 'derived' case it is left exactly as it was, so everything
+    downstream of it is untouched and only the manual reads the split order.
+    Never raises: a subassembly plan is an enhancement, not a precondition for a
+    usable sequence."""
+    try:
+        import settings as _user_settings
+    except ImportError:
+        _user_settings = None
+
+    if not bool(getattr(_user_settings, 'subassembly_plan', True)):
+        return
+    if div is None or not getattr(div, 'verified_locally_free', None):
+        return
+    if not stats.get('sequence'):
+        # optimize_scored found nothing to adopt; there is no order to respect.
+        return
+
+    from plan_sequence.optimizer.split_plan import (build_split_plan,
+                                                    derive_split_sequence,
+                                                    describe_split_plan,
+                                                    flatten_split_plan,
+                                                    retarget_split_plan,
+                                                    split_direction,
+                                                    split_order_constraint)
+
+    try:
+        plan = build_split_plan(
+            tree, asset_folder, assembly_dir,
+            sequence=stats['sequence'],
+            divide_optimizer=div,
+            root_split=stats.get('divide_split'),
+            threshold=threshold,
+            max_depth=int(getattr(_user_settings, 'subassembly_max_depth', 2)),
+            min_parts=int(getattr(_user_settings, 'subassembly_min_parts', 4)),
+            timeout=float(getattr(_user_settings, 'subassembly_search_timeout', 100)),
+            top_k=int(getattr(_user_settings, 'subassembly_verify_top_k', 10)),
+            num_proc=num_proc,
+            sweep_states=bool(
+                getattr(_user_settings, 'subassembly_sweep_states', True)),
+            sweep_max_states=getattr(
+                _user_settings, 'subassembly_sweep_max_states', None),
+            debug=debug,
+        )
+    except Exception as e:
+        print(f'[seq_plan] subassembly plan error: {e}')
+        return
+
+    if plan is None:
+        if debug > 0:
+            print('[seq_plan] no recursive subassembly plan found; keeping flat sequence')
+        return
+
+    try:
+        constrained, cost = opt.optimize_constrained(
+            split_order_constraint(plan), cost_fn=cost_fn,
+        )
+    except Exception as e:
+        print(f'[seq_plan] constrained sequence search error: {e}')
+        return
+
+    if constrained is not None:
+        # Best case: the block order is itself a valid path, so the renderer,
+        # the per-step poses and the arm pipeline all follow the same order the
+        # manual tells.
+        source = 'tree'
+        order = list(constrained)
+        stats['flat_sequence'] = list(stats['sequence'])
+        stats['sequence'] = list(constrained)
+    else:
+        # A block ordering is a narrow slice of all orderings, and the search is
+        # budget-limited, so the tree usually holds no path that respects it.
+        # Derive the order from the plan instead and leave stats['sequence']
+        # alone: the renderer keeps following a real tree path while the manual
+        # follows the subassembly narrative.
+        source = 'derived'
+        order = derive_split_sequence(plan, stats['sequence'])
+
+    plan = retarget_split_plan(plan, order)
+    steps = flatten_split_plan(plan, order)
+
+    # Attach the verified separation axis to each join step. This is plan
+    # metadata describing the join, not something the manual draws: its join
+    # page deliberately shows only the seated result (a pre-assembly ghost of a
+    # whole subassembly read as a third body rather than as "R, before it goes
+    # on"). Kept because "which way do these two come apart" is the defining
+    # fact about a join, and stats.json is the interchange format.
+    #
+    # Also record how many contact edges cross the cut. The cut score REWARDS
+    # few crossings, so a split whose sides never touch scores well and is
+    # common -- and for such a split there is no mating at all: the two sides
+    # are independent sub-builds that later parts bridge. The manual needs to
+    # say that rather than instruct the reader to seat one onto the other.
+    # obstruction_graph is built from get_contact_graph, so its edges are
+    # contacts and this costs nothing.
+    contact_graph = getattr(div, 'obstruction_graph', None)
+    for entry in steps:
+        if entry['kind'] != 'join':
+            continue
+        entry['direction'] = split_direction(
+            asset_folder, assembly_dir, entry['S'], entry['R'],
+        )
+        if contact_graph is None:
+            entry['contact_edges'] = None
+            continue
+        S, R = set(entry['S']), set(entry['R'])
+        entry['contact_edges'] = sum(
+            1 for u, v in contact_graph.edges()
+            if (u in S and v in R) or (u in R and v in S)
+        )
+
+    stats['split_plan'] = plan
+    stats['split_steps'] = steps
+    stats['split_sequence'] = [e['part'] for e in steps if e['kind'] == 'remove']
+    stats['split_sequence_source'] = source
+
+    n_joins = sum(1 for e in steps if e['kind'] == 'join')
+    print(f'[seq_plan] subassembly plan adopted: {n_joins} split(s), '
+          f'order from {source}'
+          + (f', cost {cost:.4f}' if cost is not None else ''))
+    if debug > 0:
+        print(describe_split_plan(plan))
+
+
 def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc, seed, budget, max_gripper, max_pose, pose_reuse, early_term, timeout, base_part,
     save_sdf, clear_sdf, plan_grasp, plan_arm, gripper_type, gripper_scale, optimizer, debug, render, record_dir, log_dir, allow_gap=False, n_success_term=1, connect_path=False, get_dof=False, tools=None, skip_stability=False, max_frontier=4, seq_optimizer=None):
 
@@ -237,6 +377,15 @@ def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc,
                 }
                 if debug > 0:
                     print(f'[seq_plan] persisted divide_split: S={sorted(S)}  R={sorted(R)}  score={score:.4f}')
+
+            # Recursive subassembly plan. Runs alongside everything above: the
+            # flat sequence has already been chosen and divide_split already
+            # persisted, so a failure here leaves the run exactly as it was.
+            _build_subassembly_plan(
+                stats, tree, opt, div, asset_folder, assembly_dir,
+                cost_fn=_cost_fn, threshold=_threshold, num_proc=num_proc,
+                debug=debug,
+            )
 
         if log_dir is not None:
             planner.log(tree, stats, log_dir)
