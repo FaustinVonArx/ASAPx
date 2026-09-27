@@ -6,7 +6,6 @@ sys.path.append(project_base_dir)
 
 import numpy as np
 import random
-import torch
 import json
 import pickle
 import networkx as nx
@@ -204,7 +203,14 @@ class SequencePlanner:
     def seed(self, seed):
         random.seed(seed)
         np.random.seed(seed)
-        torch.manual_seed(seed)
+        # Seed torch only when something has already imported it -- in practice
+        # the `learn` generator, the one consumer of it. Importing it here
+        # would undo the lazy import in plan_sequence.generator and put torch
+        # back into every run; a generator that never touches torch has no
+        # torch RNG to seed, so this is a no-op rather than a gap.
+        torch = sys.modules.get('torch')
+        if torch is not None:
+            torch.manual_seed(seed)
 
     @staticmethod
     def _write_precheck_failures_json(log_dir, G0, observed_fallen, per_pose):
