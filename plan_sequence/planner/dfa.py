@@ -16,6 +16,12 @@ class DFASequencePlanner(SequencePlanner):
 
     G_path = None
 
+    # Root of the persistent candidate-check cache (see sim_cache.py), set by
+    # seq_plan. None keeps the cache off. `sim_cache_summary` holds the last
+    # plan's hit/miss counts when it was on.
+    sim_cache_dir = None
+    sim_cache_summary = None
+
     # Edge / node colors keyed by simulation outcome. Failure reasons are split
     # so the tree shows *why* an edge is infeasible (assembly vs. stability vs.
     # tool) rather than a single red.
@@ -228,8 +234,11 @@ class DFASequencePlanner(SequencePlanner):
         def _stab_outcome(sim_info):
             # 'parts_fix' is None when the stability sim never ran (assembly
             # failed first) OR when it ran and rejected the action. The two
-            # are disambiguated by whether _dt_stab was captured.
-            ran_stab = cand_dbg.get(id(sim_info), {}).get('dt_stab') is not None
+            # are disambiguated by whether _dt_stab was captured -- or, for a
+            # result replayed from the sim cache (no timings), by whether the
+            # assembly check found an action with stability enabled.
+            ran_stab = (cand_dbg.get(id(sim_info), {}).get('dt_stab') is not None
+                        or (sim_info.get('action') is not None and not self.skip_stability))
             if not ran_stab:
                 return 'skipped'
             if sim_info.get('parts_fix') is not None:
@@ -430,12 +439,14 @@ class DFASequencePlanner(SequencePlanner):
             # Render one PNG per attempted pose (precheck_unstable_<i>.png)
             # in that pose's orientation with that pose's fallen parts
             # highlighted, instead of a single union image that hid the
-            # per-pose breakdown. Gated by render_sequence; the textual ID
-            # list still prints regardless.
+            # per-pose breakdown. Gated by render_sequence and render_gifs (a
+            # timing-only run renders nothing, e.g. on a display-less cluster
+            # node); the textual ID list still prints regardless.
             if not initial_poses and observed_fallen:
                 print(f"[DFA.plan] precheck observed {len(observed_fallen)} "
                       f"part(s) falling: {sorted(observed_fallen)}")
-                if getattr(settings, 'render_sequence', True):
+                if (getattr(settings, 'render_sequence', True)
+                        and getattr(settings, 'render_gifs', True)):
                     _save_dir = _Path(log_dir) if log_dir else _Path('/tmp')
                     for _entry in _per_pose:
                         if _entry['success'] or not _entry['fallen']:
@@ -505,6 +516,27 @@ class DFASequencePlanner(SequencePlanner):
             else:
                 print('[DFA.plan] all parts have at least one contact neighbour')
 
+        # Candidate-check cache. Created only now, once the precheck has fixed
+        # _ignored_unstable_parts (part of the cache's config). Replaying is exact
+        # only when a check's result does not depend on timing or on side outputs,
+        # so it stays off with a timeout, a per-parent success quota (which tasks
+        # finish before the quota trips depends on timing), tools or rendering.
+        sim_cache = None
+        self.sim_cache_summary = None
+        if self.sim_cache_dir is not None:
+            if timeout is None and n_success_term is None and not self.tools and not render:
+                from .sim_cache import SimCache
+                sim_cache = SimCache(
+                    self.sim_cache_dir, self.assembly_dir, self.base_part, max_grippers,
+                    optimizer, self.allow_gap, self.get_dof, self.skip_stability,
+                    self._ignored_unstable_parts,
+                )
+                print(f'[DFA.plan] sim cache: {sim_cache.dir} '
+                      f'({sim_cache.summary()["entries_loaded"]} entries)')
+            else:
+                print('[DFA.plan] sim cache requested but left off '
+                      '(needs timeout=None, n_success_term=None, no tools, render=False)')
+
         # Multi-parent frontier: each iteration expands up to `max_frontier` parents
         # in one pooled batch, then derives the next frontier from feasible children.
         # max_frontier=1 collapses to single-parent DFS.
@@ -549,9 +581,9 @@ class DFASequencePlanner(SequencePlanner):
                 self.frontier = list(live)
 
                 # Build the pooled task list across all live parents. Each task carries
-                # parent_idx as its final positional arg; the wrapper strips it before
-                # calling _simulate_standalone and re-attaches it to the sim_info dict
-                # so the per-parent terminate callback can see it.
+                # a (parent_idx, task_idx) tag as its final positional arg; the wrapper
+                # strips it before calling _simulate_standalone and re-attaches it to
+                # the sim_info dict so the per-parent terminate callback can see it.
                 per_parent_sim_tasks = {i: [] for i in range(len(live))}
                 worker_args = []
                 for i, G in enumerate(live):
@@ -578,7 +610,7 @@ class DFASequencePlanner(SequencePlanner):
                             p, G_prime, parts_removed_G, pose, max_grippers,
                             remaining_timeout, optimizer, max(debug - 2, 0), render, self.allow_gap, self.get_dof,
                             self.tools, self.skip_stability, self._ignored_unstable_parts,
-                            i,  # parent_idx tag — stripped by _simulate_standalone_tagged
+                            (i, len(worker_args)),  # (parent_idx, task_idx) tag — stripped by _simulate_standalone_tagged
                         ))
 
                 if not worker_args:
@@ -593,25 +625,54 @@ class DFASequencePlanner(SequencePlanner):
                 # validity info.
                 per_parent_success = defaultdict(int)
                 def _terminate(sim_info):
-                    pi = sim_info.get('_parent_idx')
-                    if pi is None:
+                    tag = sim_info.get('_task_tag')
+                    if tag is None:
                         return False
+                    pi = tag[0]
                     if sim_info['feasible']:
                         per_parent_success[pi] += 1
                     if n_success_term is None:
                         return False
                     return all(per_parent_success[j] >= n_success_term for j in range(len(live)))
 
-                received = []  # (sim_info, real_arg_tuple, parent_idx)
+                # Workers finish in whatever order they are scheduled. Put the results
+                # back in submission order, so they no longer depend on num_proc or
+                # machine load, before anything reads them: tree insertion order, the
+                # frontier's tie-breaks (heuristic costs tie often, e.g. at the root,
+                # where contact_distance and pose_change are 0 for every candidate),
+                # the pose picked among equally close ones and the leaf get_stats
+                # reports all follow this list. In completion order, the same weights
+                # could plan different sequences from one run to the next. (With
+                # n_success_term set, which tasks arrive before the quota stops the
+                # pool still depends on timing.)
+                arrivals = []  # (task_idx, (sim_info, real_arg_tuple, parent_idx))
+                pending = worker_args
+                task_keys = None
+                if sim_cache is not None:
+                    # Cached checks skip the pool; they still count toward n_eval
+                    # below, so the budget stops a cached plan exactly where a cold
+                    # one stops.
+                    task_keys = [sim_cache.key(a[4], a[5], a[7]) for a in worker_args]
+                    pending = []
+                    for a, key in zip(worker_args, task_keys):
+                        cached = sim_cache.get(key)
+                        if cached is None:
+                            pending.append(a)
+                        else:
+                            parent_idx, task_idx = a[-1]
+                            arrivals.append((task_idx, (cached, a[:-1], parent_idx)))
                 for sim_info, arg in parallel_execute(
-                    _simulate_standalone_tagged, worker_args, self.num_proc,
+                    _simulate_standalone_tagged, pending, self.num_proc,
                     show_progress=debug > 0, desc='DFA parallel sim', return_args=True,
                     terminate_func=_terminate,
                 ):
-                    parent_idx = arg[-1]
+                    parent_idx, task_idx = arg[-1]
                     real_arg = arg[:-1]
-                    sim_info.pop('_parent_idx', None)
-                    received.append((sim_info, real_arg, parent_idx))
+                    sim_info.pop('_task_tag', None)
+                    if sim_cache is not None:
+                        sim_cache.put(task_keys[task_idx], sim_info)
+                    arrivals.append((task_idx, (sim_info, real_arg, parent_idx)))
+                received = [entry for _, entry in sorted(arrivals, key=lambda a: a[0])]
 
                 if debug > 0:
                     early_stopped = len(received) < len(worker_args)
@@ -709,9 +770,9 @@ class DFASequencePlanner(SequencePlanner):
                         # sim_info['pose'] to parent_pose (smaller rotation
                         # angle wins). Infeasible entries are sorted to the
                         # end so we still fall back to one of them when no
-                        # pose was feasible. Stable sort; ties (same proximity
-                        # or both None) preserve completion order, which is
-                        # the prior behaviour.
+                        # pose was feasible. Stable sort; ties (same proximity,
+                        # or no parent pose at the root) keep submission order,
+                        # i.e. the candidate order from _compute_poses.
                         edge_results.sort(key=lambda r: (
                             not r[0].get('feasible', False),
                             self._rotation_angle_between(parent_pose, r[0].get('pose')),
@@ -798,6 +859,11 @@ class DFASequencePlanner(SequencePlanner):
                 self.stop_msg = 'exception'
             print(e, f'from {self.assembly_dir}')
             print(traceback.format_exc())
+        finally:
+            if sim_cache is not None:
+                sim_cache.close()
+                self.sim_cache_summary = sim_cache.summary()
+                print(f'[DFA.plan] sim cache: {sim_cache.hits} hits, {sim_cache.misses} simulated')
 
         assert self.stop_msg is not None, '[DFA.plan] bug: unexpectedly stopped'
         if debug > 0:

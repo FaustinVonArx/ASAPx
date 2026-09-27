@@ -289,7 +289,8 @@ def _build_subassembly_plan(stats, tree, opt, div, asset_folder, assembly_dir,
 
 
 def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc, seed, budget, max_gripper, max_pose, pose_reuse, early_term, timeout, base_part,
-    save_sdf, clear_sdf, plan_grasp, plan_arm, gripper_type, gripper_scale, optimizer, debug, render, record_dir, log_dir, allow_gap=False, n_success_term=1, connect_path=False, get_dof=False, tools=None, skip_stability=False, max_frontier=4, seq_optimizer=None):
+    save_sdf, clear_sdf, plan_grasp, plan_arm, gripper_type, gripper_scale, optimizer, debug, render, record_dir, log_dir, allow_gap=False, n_success_term=1, connect_path=False, get_dof=False, tools=None, skip_stability=False, max_frontier=4, seq_optimizer=None,
+    sim_cache_dir=None):
 
     try:
         generator_cls = generators[generator_name]
@@ -297,6 +298,9 @@ def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc,
         planner_cls = planners[planner_name]
         planner = planner_cls(generator, num_proc, save_sdf=save_sdf, allow_gap=allow_gap, get_dof=get_dof, tools=tools, skip_stability=skip_stability)
         planner.seed(seed)
+        # Candidate-check cache root (plan_sequence/planner/sim_cache.py); only
+        # the DFA planners read it. None keeps it off.
+        planner.sim_cache_dir = sim_cache_dir
 
         setup = {
             'budget': budget, 'max_grippers': max_gripper, 'max_poses': max_pose, 'pose_reuse': pose_reuse, 'early_term': early_term, 'timeout': timeout,
@@ -306,6 +310,8 @@ def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc,
         tree = planner.plan(**setup, debug=debug - 1, render=False, log_dir=log_dir)
 
         stats = planner.get_stats(tree)
+        if getattr(planner, 'sim_cache_summary', None):
+            stats['sim_cache'] = planner.sim_cache_summary
 
         # Integrated sequence selection + divide-optimizer split probe.
         # The chosen sequence replaces stats['sequence']; the split is purely
@@ -392,12 +398,14 @@ def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc,
             with open(os.path.join(log_dir, 'setup.json'), 'w') as fp:
                 json.dump(setup, fp)
             if not stats.get('success'):
-                # render_sequence gates both the successful-sequence GIFs and
-                # the failed-children evidence renders; metadata (failures.json)
+                # render_sequence (and render_gifs, off in timing-only runs)
+                # gates both the successful-sequence GIFs and the
+                # failed-children evidence renders; metadata (failures.json)
                 # is cheap and always emitted regardless.
                 try:
                     import settings as _user_settings
-                    _render_failures = bool(getattr(_user_settings, 'render_sequence', True))
+                    _render_failures = (bool(getattr(_user_settings, 'render_sequence', True))
+                                        and bool(getattr(_user_settings, 'render_gifs', True)))
                 except ImportError:
                     _render_failures = True
                 # When the planner aborted at the precheck stage

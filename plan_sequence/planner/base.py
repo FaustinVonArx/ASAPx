@@ -157,13 +157,15 @@ def _simulate_standalone(asset_folder, assembly_dir, save_sdf, base_part,
 
 
 def _simulate_standalone_tagged(*args):
-    """Variant of `_simulate_standalone` whose last positional arg is a parent_idx
-    tag. The tag is stripped before the real call and re-attached on the returned
-    sim_info dict as `_parent_idx`. Used by the multi-frontier DFA loop so the
-    termination callback (which only sees sim_info) can track per-parent quotas."""
-    parent_idx = args[-1]
+    """Variant of `_simulate_standalone` whose last positional arg is a tag. The
+    tag is stripped before the real call and re-attached on the returned sim_info
+    dict as `_task_tag`. The multi-frontier DFA loop tags each task with
+    (parent_idx, task_idx), so the termination callback (which only sees
+    sim_info) can track per-parent quotas and the results can be put back in
+    submission order."""
+    tag = args[-1]
     sim_info = _simulate_standalone(*args[:-1])
-    sim_info['_parent_idx'] = parent_idx
+    sim_info['_task_tag'] = tag
     return sim_info
 
 
