@@ -150,6 +150,22 @@ def _shortest_angle_delta(a, b):
     return float(abs(d))
 
 
+def _arc_travel(c_prev, c_cur, center):
+    """(arc, |dtheta|) swept around `center` on the circle of average radius
+    between two horizontal centroids: the base-travel distance of the timing
+    model. (0, 0) when either centroid sits on the center (the angle is then
+    undefined, but the radius, hence the arc, is ~0)."""
+    v_prev = np.asarray(c_prev, dtype=float)[:2] - np.asarray(center, dtype=float)[:2]
+    v_cur = np.asarray(c_cur, dtype=float)[:2] - np.asarray(center, dtype=float)[:2]
+    ang_prev = _horizontal_angle(c_prev[:2], center[:2])
+    ang_cur = _horizontal_angle(c_cur[:2], center[:2])
+    if ang_prev is None or ang_cur is None:
+        return 0.0, 0.0
+    delta = _shortest_angle_delta(ang_prev, ang_cur)
+    r_avg = 0.5 * (float(np.linalg.norm(v_prev)) + float(np.linalg.norm(v_cur)))
+    return float(r_avg * delta), float(delta)
+
+
 def _pose_rotation_angle(pose_a, pose_b):
     """Magnitude (rad) of the relative rotation that takes the assembly from
     pose_a to pose_b. Either may be None / identity. Translation is ignored."""
@@ -188,7 +204,11 @@ def _build_timing_overview(stage1_results, transitions, step_infos, sequence,
                               defined regardless of arm planner outcome. 0 for
                               k=0 and whenever either centroid is unknown.
       reorientation_s[k]      rotation_angle(pose_{k-1}, pose_k) / velocity.
-                              0 for k=0.
+                              0 for k=0. A step can name the orientation
+                              it starts from instead ('reorient_from_pose'):
+                              in a subassembly plan the first step of an R
+                              block turns R from its orientation at the join,
+                              not from wherever the S block ended.
       hold_s[k]               len(step_infos[k]['parts_fix']) *
                               time_per_held_part_s. 0 when parts_fix is None
                               or empty.
@@ -281,25 +301,11 @@ def _build_timing_overview(stage1_results, transitions, step_infos, sequence,
         if c_prev is None or c_cur is None:
             base_was_failure[k] = True
             continue
-        v_prev = c_prev[:2] - asm_center[:2]
-        v_cur = c_cur[:2] - asm_center[:2]
-        r_prev = float(np.linalg.norm(v_prev))
-        r_cur = float(np.linalg.norm(v_cur))
-        # Angle around the shared center. _horizontal_angle returns None when
-        # the part centroid coincides with the assembly center (r ≈ 0). In
-        # that case Δθ is undefined but r_avg ≈ 0 makes the arc trivially 0,
-        # so we treat the contribution as 0 rather than imputing.
-        ang_prev = _horizontal_angle(c_prev[:2], asm_center[:2])
-        ang_cur = _horizontal_angle(c_cur[:2], asm_center[:2])
-        if ang_prev is None or ang_cur is None:
-            base_arcs[k] = 0.0
-            base_thetas[k] = 0.0
-            continue
-        delta = _shortest_angle_delta(ang_prev, ang_cur)
-        r_avg = 0.5 * (r_prev + r_cur)
-        arc = r_avg * float(delta)
-        base_arcs[k] = float(arc)
-        base_thetas[k] = float(delta)
+        # Angle around the shared center (see _arc_travel; a centroid on the
+        # center contributes 0 rather than being imputed).
+        arc, delta = _arc_travel(c_prev, c_cur, asm_center)
+        base_arcs[k] = arc
+        base_thetas[k] = delta
         base_raw[k] = arc / base_velocity_linear
     base_median = _safe_median([v for k, v in enumerate(base_raw) if k > 0 and not base_was_failure[k]])
     base_fallback = base_median * float(fail_multiplier)
@@ -312,7 +318,8 @@ def _build_timing_overview(stage1_results, transitions, step_infos, sequence,
     reorient_raw = [0.0] * n
     reorient_angles = [0.0] * n
     for k in range(1, n):
-        pose_prev = step_infos[k - 1].get('pose')
+        pose_prev = (step_infos[k]['reorient_from_pose'] if 'reorient_from_pose' in step_infos[k]
+                     else step_infos[k - 1].get('pose'))
         pose_cur = step_infos[k].get('pose')
         angle = _pose_rotation_angle(pose_prev, pose_cur)
         reorient_angles[k] = angle
@@ -872,27 +879,33 @@ def _extract_step_infos(asset_folder, assembly_dir, sequence, tree, num_proc,
     # the grasp check both off — no downstream consumer needs the path then,
     # and the physics replay is the only heavy step in this function).
     if replan_paths:
-        worker_args = [(asset_folder, assembly_dir, sa) for sa in step_args]
-        if num_proc > 1 and len(worker_args) > 1:
-            # parallel_execute yields in completion order; match each path to
-            # its step by index, or steps get each other's paths (and with
-            # them each other's distance d and grasp check).
-            path_by_step = {
-                wa[2]['i']: path for path, wa in parallel_execute(
-                    _path_worker, worker_args, num_proc=num_proc,
-                    show_progress=True, desc='arm_pipeline paths', return_args=True,
-                )
-            }
-        else:
-            path_by_step = {wa[2]['i']: _path_worker(*wa) for wa in worker_args}
-        for sa in step_args:
-            sa['path'] = path_by_step.get(sa['i'])  # list of 6-vectors (qm), or None if replan failed
+        _replan_step_paths(asset_folder, assembly_dir, step_args, num_proc)
     else:
         for sa in step_args:
             sa['path'] = None
         print('[arm_pipeline:prep] path replanning skipped '
               '(replan_paths=False)', flush=True)
     return step_args
+
+
+def _replan_step_paths(asset_folder, assembly_dir, step_args, num_proc):
+    """Replay each step's disassembly in physics and store it as sa['path']
+    (a list of 6-vectors, or None when the replay failed). Steps are matched
+    by sa['i']: parallel_execute yields in completion order, and zipping the
+    results back in submission order gave steps each other's paths (and with
+    them each other's distance d and grasp check)."""
+    worker_args = [(asset_folder, assembly_dir, sa) for sa in step_args]
+    if num_proc > 1 and len(worker_args) > 1:
+        path_by_step = {
+            wa[2]['i']: path for path, wa in parallel_execute(
+                _path_worker, worker_args, num_proc=num_proc,
+                show_progress=True, desc='arm_pipeline paths', return_args=True,
+            )
+        }
+    else:
+        path_by_step = {wa[2]['i']: _path_worker(*wa) for wa in worker_args}
+    for sa in step_args:
+        sa['path'] = path_by_step.get(sa['i'])
 
 
 def _path_worker(asset_folder, assembly_dir, sa):
@@ -1191,6 +1204,125 @@ def _stage1_simplified_worker(asset_folder, assembly_dir, sa,
                           if sa.get('path') else None),
     })
     return base_failed
+
+
+def _timing_params():
+    """The simplified timing model's constants, from settings."""
+    params = {
+        'velocity_rad_s': 1.0, 'base_travel_velocity': 2.0,
+        'reorient_velocity_rad_s': 0.5, 'fail_multiplier': 1.5,
+        'time_per_held_part_s': 0.0, 'k_dist': 1.0, 'k_vol': 0.01,
+        'check_grasp': False, 'clip_path': True,
+    }
+    try:
+        import settings as _s
+    except ImportError:
+        return params
+    for key, name, cast in (
+        ('velocity_rad_s', 'arm_joint_velocity_rad_s', float),
+        ('base_travel_velocity', 'arm_base_travel_velocity', float),
+        ('reorient_velocity_rad_s', 'assembly_reorientation_velocity_rad_s', float),
+        ('fail_multiplier', 'failed_step_time_multiplier', float),
+        ('time_per_held_part_s', 'time_per_held_part_s', float),
+        ('k_dist', 'arm_simplified_k_dist', float),
+        ('k_vol', 'arm_simplified_k_vol', float),
+        ('check_grasp', 'arm_simplified_check_grasp', bool),
+        ('clip_path', 'arm_simplified_clip_path', bool),
+    ):
+        params[key] = cast(getattr(_s, name, params[key]))
+    return params
+
+
+def _join_pull(assembly_dir, parts_S, parts_R, direction):
+    """(d, V) of a join: how far unified R is pulled along `direction` (the
+    verified separation axis, assembly frame) before it clears unified S by
+    the separation margin, and R's volume. Without a direction, the world
+    axis that clears soonest."""
+    from plan_sequence.physics_planner import MIN_SEP, _VERIFY_DIRECTIONS
+    from plan_sequence.stable_pose import get_combined_mesh as _gcm
+
+    S = np.asarray(_gcm(assembly_dir, list(parts_S)).vertices, dtype=float)
+    R_mesh = _gcm(assembly_dir, list(parts_R))
+    R = np.asarray(R_mesh.vertices, dtype=float)
+
+    def pull(u):
+        u = np.asarray(u, dtype=float)
+        u = u / np.linalg.norm(u)
+        return max(float((S @ u).max() - (R @ u).min()), 0.0) + MIN_SEP
+
+    if direction is not None and np.linalg.norm(direction) > 1e-9:
+        d = pull(direction)
+    else:
+        d = min(pull(u) for u in _VERIFY_DIRECTIONS)
+    return d, float(abs(R_mesh.volume))
+
+
+def time_steps_simplified(asset_folder, assembly_dir, steps, gripper_type, gripper_scale,
+                          num_proc=1):
+    """Simplified-mode timing of a prepared step list, for sequences that are
+    not a path of the planning tree (a subassembly plan; see
+    plan_robot/split_timing.py). Each entry is a 'remove' step -- the same
+    fields _extract_step_infos builds: part_move, parts_rest, parts_removed,
+    action, pose, parts_fix, part_centroid_world -- or a 'join' step: unified
+    R pulled off unified S (S, R, direction, pose, part_centroid_world).
+    Either may carry 'reorient_from_pose' and a display 'label'. Returns the
+    timing overview, in the format of timing_overview.json."""
+    p = _timing_params()
+    removes = [dict(st, i=j) for j, st in enumerate(s_ for s_ in steps if s_['kind'] == 'remove')]
+    if removes:
+        _replan_step_paths(asset_folder, assembly_dir, removes, num_proc)
+        removed_results = _run_stage1_simplified(
+            asset_folder, assembly_dir, removes, gripper_type, gripper_scale,
+            num_proc=num_proc, k_dist=p['k_dist'], k_vol=p['k_vol'],
+            fail_multiplier=p['fail_multiplier'], check_grasp=p['check_grasp'],
+            clip_path=p['clip_path'],
+        )
+    else:
+        removed_results = []
+    results, labels, j = [], [], 0
+    for k, st in enumerate(steps):
+        if st['kind'] == 'remove':
+            r = dict(removed_results[j], step=k)
+            j += 1
+        else:
+            d, V = _join_pull(assembly_dir, st['S'], st['R'], st.get('direction'))
+            r = {
+                'step': k, 'part_move': st.get('label', 'join'), 'feasible': True,
+                'simplified': True, 'join': True,
+                'path_distance_cartesian': d, 'path_distance_source': 'straight_pull',
+                'part_volume': V,
+                'duration_s': p['k_dist'] * d * (1.0 + p['k_vol'] * V),
+                'path_distance_rad': 0.0,
+            }
+            print(f'[arm_pipeline:join] step {k}: R {st["R"]} off S {st["S"]}: '
+                  f'd={d:.3f}  V={V:.3f}  duration={r["duration_s"]:.3f}s', flush=True)
+        results.append(r)
+        labels.append(st.get('label', st.get('part_move')))
+
+    # The whole assembly, at the first step's pose: a first removal's parts
+    # plus the part, or a first join's two sides.
+    first = steps[0]
+    all_parts = set(first.get('parts_rest', [])) | set(first.get('S', [])) | set(first.get('R', []))
+    if first.get('part_move') is not None:
+        all_parts.add(first['part_move'])
+    all_parts = sorted(all_parts)
+    center, _ = _sequence_base_circle(
+        assembly_dir, None,
+        [{'parts_rest': all_parts[1:], 'part_move': all_parts[0], 'pose': steps[0].get('pose')}],
+        gripper_scale,
+    )
+    overview = _build_timing_overview(
+        results, [], steps, labels,
+        velocity_rad_s=p['velocity_rad_s'],
+        base_travel_velocity=p['base_travel_velocity'],
+        reorient_velocity_rad_s=p['reorient_velocity_rad_s'],
+        fail_multiplier=p['fail_multiplier'],
+        time_per_held_part_s=p['time_per_held_part_s'],
+        assembly_center=center,
+    )
+    for entry, st in zip(overview['per_step'], steps):
+        entry['kind'] = st['kind']
+    return overview
 
 
 def _stage1_failed(sa, reason='unknown'):
