@@ -60,15 +60,18 @@ Storage layout (paths relative to repo root, configurable via settings):
   `HeuristicDFASequencePlanner._load_weights` reads when
   ``settings.heuristic_weights_source == 'optuna'``. Candidates under
   evaluation are never written here.
-- ``assets/optuna_training/trial_<NNNN>/`` — one trial: ``weights.json``
-  (the candidate; ``settings.heuristic_weights_optuna_path`` points here
-  while the trial runs, so parallel trials never read each other's weights)
-  and one directory per assembly. Wiped when the trial starts.
-- ``assets/optuna_training/baselines/<id>.json`` — baseline records; the
-  planning output sits in ``<id>_run/``.
-- ``assets/optuna_training/sim_cache/`` — the planner's candidate-check
-  cache (plan_sequence/planner/sim_cache.py), shared by every trial and
-  worker when ``settings.sim_cache`` is on.
+- ``assets/optuna_store/`` (DEFAULT_STORE; ``--optuna-store``) — every
+  planned run, shared by all runs: ``runs/<geometry key>/<fingerprint
+  key>.json`` (the record), ``..._run/`` (planning output) and
+  ``....weights.json`` (the weights the planner read, via
+  ``settings.heuristic_weights_optuna_path``, so parallel trials never read
+  each other's), plus ``sim_cache/``, the candidate-check cache
+  (plan_sequence/planner/sim_cache.py). A later run -- more or other
+  assemblies, a new study -- reuses every run made under the same
+  fingerprint (see _ensure_runs); import_run_into_store brings in runs from
+  before the store.
+- ``assets/optuna_training/reference_check/`` — the reference trial's plans,
+  made afresh as the determinism / stale-store check.
 - ``assets/heuristic_weights_optuna_history.json`` — per-trial log rebuilt
   from the study after every trial, so parallel workers never drop each
   other's entries. A fresh study moves an existing file aside first.
@@ -76,12 +79,12 @@ Storage layout (paths relative to repo root, configurable via settings):
   Optuna journal storage. Safe on a shared filesystem, so several processes
   (e.g. cluster array jobs) can work on one study; ``n_trials`` is the
   study-wide total.
-- ``assets/optuna_training/eval_<label>/`` — `evaluate_heuristic_weights`:
-  the trained weights against the reference on held-out assemblies
-  (``runs/`` per assembly, ``summary.{json,txt}``).
+- ``assets/optuna_training/eval_<label>/summary.{json,txt}`` —
+  `evaluate_heuristic_weights`: the trained weights against the reference on
+  held-out assemblies.
 
-`main.py --optuna-dir DIR` moves all of it (weights and history included)
-into DIR, so a run on a cluster is self-contained.
+`main.py --optuna-dir DIR` moves the run's own files (weights, history,
+journal, summary) into DIR; planned runs stay in the store.
 
 Training / inference switch:
 - Training: ``python main.py train_heuristic_weights --id <range>``. The
@@ -93,6 +96,7 @@ Training / inference switch:
   weights are frozen.
 """
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -120,6 +124,7 @@ _TRAINING_DEFAULTS = {
     'render_gifs': False,
     'objectives': ('time',),
     'pareto_pick': 'no_worse_than_reference',
+    'warm_start_top': 10,
 }
 
 # What a trial can be scored on (settings.heuristic_training['objectives']),
@@ -503,14 +508,72 @@ class _LockHeartbeat:
         self._thread.join()
 
 
-def _ensure_runs(ass_list, args, run_root, weights, label, clear_sdf=False,
+# Every planned run (baselines, trials, evaluation) lives in a store shared
+# by all runs, keyed by the assembly's geometry and the run's fingerprint, so
+# a later run -- a larger or wider sample, a new study -- reuses whatever an
+# earlier one already planned under identical conditions.
+DEFAULT_STORE = 'assets/optuna_store'
+_geometry_keys = {}
+
+
+def _assembly_key(assembly_dir):
+    """Store key of an assembly: the hash of its OBJ files (the key the
+    candidate-check cache uses), so ids of different datasets never collide
+    and re-meshed parts never reuse old plans."""
+    from plan_sequence.planner.sim_cache import _geometry_hash
+    path = str(Path(assembly_dir).resolve())
+    if path not in _geometry_keys:
+        _geometry_keys[path] = _geometry_hash(assembly_dir)[:16]
+    return _geometry_keys[path]
+
+
+def _fingerprint_key(fingerprint):
+    return hashlib.sha1(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _store_paths(store, assembly_dir, fingerprint):
+    """Where one stored run lives:
+    <store>/runs/<geometry key>/<fingerprint key>{.json,_run/,.lock,.weights.json}."""
+    d = Path(store) / 'runs' / _assembly_key(assembly_dir)
+    k = _fingerprint_key(fingerprint)
+    return {'dir': d, 'record': d / f'{k}.json', 'run': d / f'{k}_run',
+            'lock': d / f'{k}.lock', 'weights': d / f'{k}.weights.json'}
+
+
+def _load_record(paths, fingerprint):
+    """The stored record at `paths`, or None. Records made before plan
+    metrics were stored get them added from their run directory."""
+    try:
+        with open(paths['record']) as _f:
+            record = json.load(_f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if record.get('fingerprint') != fingerprint:
+        return None  # a key collision; recompute
+    if record.get('status') == 'ok' and 'metrics' not in record and not record.get('split'):
+        record['metrics'] = _plan_metrics(paths['run'])
+        _write_json(paths['record'], record)
+    return record
+
+
+def _note_assembly(paths, ass):
+    """A readable note of which assembly a store directory belongs to."""
+    note = paths['dir'] / 'assembly.json'
+    if not note.exists():
+        _write_json(note, {'id': str(ass.id), 'assembly_dir': str(ass.assembly_dir),
+                           'n_parts': len(ass.objects)})
+
+
+def _ensure_runs(ass_list, args, store, weights, label, clear_sdf=False,
                  deadline=None, planner='heuristic', generator='rand', seq_optimizer=None,
                  wait=True):
     """One stored run per assembly with fixed `weights`, computing the missing
-    ones: records in `run_root/<id>.json`, planning output in
-    `run_root/<id>_run/`. Several processes can run this at once (e.g. the
-    workers of a job array): each assembly is computed by whichever process
-    takes its lock, and the others pick up the result.
+    ones into `store` (see _store_paths) and returning {id: record}. Several
+    processes can run this at once (e.g. the workers of a job array): each
+    run is computed by whichever process takes its lock, and the others pick
+    up the result. A record is reused by any later call, from any run, whose
+    fingerprint (_run_fingerprint: planner, weights, planning and timing
+    configuration) and assembly geometry match.
 
     `clear_sdf`: clear the assembly's SDF caches before planning, like a normal
     run does, so they are regenerated from the current meshes. Used for the
@@ -531,10 +594,7 @@ def _ensure_runs(ass_list, args, run_root, weights, label, clear_sdf=False,
     `wait=False`: compute what no other process holds and return without
     waiting for the rest, so a caller with several run sets can do all the
     work it can take before it waits on anyone."""
-    run_root = Path(run_root)
-    run_root.mkdir(parents=True, exist_ok=True)
     fingerprint = _run_fingerprint(args, weights, planner, generator, seq_optimizer)
-    _use_weights(weights, run_root / 'weights.json')
 
     records = {}
     pending = list(ass_list)
@@ -543,25 +603,28 @@ def _ensure_runs(ass_list, args, run_root, weights, label, clear_sdf=False,
         waiting = []
         for ass in pending:
             aid = str(ass.id)
-            record_path = run_root / f'{aid}.json'
-            try:
-                with open(record_path) as _f:
-                    record = json.load(_f)
-                if record.get('fingerprint') == fingerprint:
-                    records[aid] = record
-                    continue
-                print(f'[optuna] {label} {aid}: settings changed since it was computed; recomputing')
-            except (OSError, json.JSONDecodeError):
-                pass
+            paths = _store_paths(store, ass.assembly_dir, fingerprint)
+            record = _load_record(paths, fingerprint)
+            if record is not None:
+                records[aid] = record
+                continue
             if deadline is not None and time.time() > deadline:
                 print(f'[optuna] {label} {aid}: skipped, time budget used up')
                 continue
-            lock = _try_lock(run_root / f'{aid}.lock')
+            paths['dir'].mkdir(parents=True, exist_ok=True)
+            lock = _try_lock(paths['lock'])
             if lock is None:
                 waiting.append(ass)
                 continue
             heartbeat = _LockHeartbeat(lock)
             try:
+                # Another process may have finished it between the check and the lock.
+                record = _load_record(paths, fingerprint)
+                if record is not None:
+                    records[aid] = record
+                    continue
+                _note_assembly(paths, ass)
+                _use_weights(weights, paths['weights'])
                 _saved = (getattr(args, 'use_previous_sdf', False), args.planner,
                           args.generator, getattr(args, 'seq_optimizer', None))
                 if clear_sdf:
@@ -569,14 +632,20 @@ def _ensure_runs(ass_list, args, run_root, weights, label, clear_sdf=False,
                 args.planner, args.generator, args.seq_optimizer = planner, generator, seq_optimizer
                 try:
                     status, total, wall, components, extra = _run_assembly(
-                        ass, args, run_root / f'{aid}_run', split=(seq_optimizer == 'divide'))
+                        ass, args, paths['run'], split=(seq_optimizer == 'divide'))
                 finally:
                     (args.use_previous_sdf, args.planner, args.generator,
                      args.seq_optimizer) = _saved
                 record = {'id': aid, 'n_parts': len(ass.objects), 'status': status,
                           'total_s': total, 'components': components,
-                          'wall_s': wall, 'fingerprint': fingerprint, **extra}
-                _write_json(record_path, record)
+                          'wall_s': wall, 'label': label, 'created': time.time(),
+                          'assembly_dir': str(ass.assembly_dir),
+                          'fingerprint': fingerprint, **extra}
+                # Held parts / pull direction of the timed sequence; not for a
+                # split run, whose timed order is not stats['sequence'].
+                if status == 'ok' and seq_optimizer is None:
+                    record['metrics'] = _plan_metrics(paths['run'])
+                _write_json(paths['record'], record)
                 records[aid] = record
                 print(f'[optuna] {label} {aid}: {status}'
                       + (f'  total={total:.2f}s' if status == 'ok' else '')
@@ -591,7 +660,7 @@ def _ensure_runs(ass_list, args, run_root, weights, label, clear_sdf=False,
             ids = [str(a.id) for a in waiting]
             if ids != announced:
                 print(f'[optuna] waiting for {label} run(s) another process is computing: '
-                      f'{ids} (locks in {run_root}; delete a lock whose process is gone)')
+                      f'{ids} (locks under {Path(store) / "runs"})')
                 announced = ids
             if deadline is not None and time.time() > deadline:
                 print(f'[optuna] {label}: stopped waiting for {ids}, time budget used up')
@@ -601,13 +670,102 @@ def _ensure_runs(ass_list, args, run_root, weights, label, clear_sdf=False,
     return records
 
 
+def import_run_into_store(run_dir, dataset_dir, store=None):
+    """Copy the planned runs of a run directory from before the shared store
+    (``<run>/baselines``, ``heur-out``, ``eval_*/runs``, ``eval_*/split_runs``
+    and the trials' ``trial_NNNN/<id>``) into `store`, so later runs reuse
+    them. `dataset_dir` holds the assemblies (``<dataset_dir>/<id>/*.obj``),
+    whose geometry keys the store. Records keep their fingerprints, so an
+    imported run is reused only under the conditions it was made in. A trial
+    run has no record of its own: its fingerprint is its assembly's baseline
+    fingerprint with the trial's weights, and a run without stats (a trial
+    cut short) is left out. Existing store entries are never overwritten.
+    Returns {label: number imported}."""
+    import types
+    run_dir, dataset_dir = Path(run_dir), Path(dataset_dir)
+    store = Path(store or DEFAULT_STORE)
+    counts = {}
+
+    def put(aid, label, fingerprint, record, src_run):
+        assembly_dir = dataset_dir / aid
+        if not assembly_dir.is_dir():
+            print(f'[import] {label} {aid}: no {assembly_dir}; skipped')
+            return
+        paths = _store_paths(store, assembly_dir, fingerprint)
+        if paths['record'].exists():
+            return
+        paths['dir'].mkdir(parents=True, exist_ok=True)
+        _note_assembly(paths, types.SimpleNamespace(
+            id=aid, assembly_dir=assembly_dir,
+            objects={p.stem: None for p in assembly_dir.glob('*.obj')}))
+        if Path(src_run).is_dir():
+            shutil.copytree(str(src_run), str(paths['run']), dirs_exist_ok=True)
+        _write_json(paths['weights'], fingerprint.get('weights'))
+        record = dict(record, label=label, fingerprint=fingerprint,
+                      assembly_dir=str(assembly_dir), imported_from=str(run_dir))
+        if (record.get('status') == 'ok' and 'metrics' not in record
+                and fingerprint.get('seq_optimizer') is None):
+            record['metrics'] = _plan_metrics(paths['run'])
+        _write_json(paths['record'], record)
+        counts[label] = counts.get(label, 0) + 1
+
+    record_dirs = [('baseline', run_dir / 'baselines'), ('heur-out', run_dir / 'heur-out')]
+    for eval_dir in sorted(run_dir.glob('eval_*')):
+        record_dirs += [('trained', eval_dir / 'runs'), ('trained+split', eval_dir / 'split_runs')]
+    baseline_fp = {}
+    for label, d in record_dirs:
+        for rec_path in sorted(d.glob('*.json')):
+            if rec_path.name == 'weights.json':
+                continue
+            try:
+                with open(rec_path) as _f:
+                    record = json.load(_f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if 'fingerprint' not in record:
+                continue
+            aid = rec_path.stem
+            if label == 'baseline':
+                baseline_fp[aid] = record['fingerprint']
+            put(aid, label, record['fingerprint'], record, d / f'{aid}_run')
+
+    for trial_dir in sorted(run_dir.glob('trial_*')):
+        try:
+            with open(trial_dir / 'weights.json') as _f:
+                weights = json.load(_f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        for sub in sorted(p for p in trial_dir.iterdir() if p.is_dir()):
+            aid = sub.name
+            if aid not in baseline_fp:
+                continue
+            parts = {p.stem: None for p in (dataset_dir / aid).glob('*.obj')}
+            try:
+                status, total, components, _extra = _assess_run(
+                    sub, types.SimpleNamespace(id=aid, objects=parts))
+            except KeyboardInterrupt:
+                continue  # the plan was interrupted, not finished
+            if status == 'no_stats':
+                continue
+            fingerprint = json.loads(json.dumps(dict(baseline_fp[aid], weights=weights)))
+            put(aid, 'trial', fingerprint,
+                {'id': aid, 'n_parts': len(parts), 'status': status, 'total_s': total,
+                 'components': components, 'wall_s': None, 'trial': trial_dir.name}, sub)
+    # The candidate-check cache: its directories are keyed by geometry and
+    # configuration already, and shards are per process, so they merge by copy.
+    if (run_dir / 'sim_cache').is_dir():
+        shutil.copytree(str(run_dir / 'sim_cache'), str(store / 'sim_cache'), dirs_exist_ok=True)
+    print(f'[import] {run_dir} -> {store}: {counts}')
+    return counts
+
+
 @contextlib.contextmanager
-def _pipeline_environment(args, output_root, cfg):
+def _pipeline_environment(args, store, cfg):
     """Configuration shared by training and evaluation, restored on exit: the
     planner reads its weights from the file each run points
     heuristic_weights_optuna_path at; runs render no media (the arm pipeline
     still runs inside _render_plan, so render_sequence stays on), share the
-    candidate-check cache under `output_root` and reuse SDFs generated by an
+    candidate-check cache under `store` and reuse SDFs generated by an
     assembly's first (baseline) plan."""
     import settings
 
@@ -622,7 +780,7 @@ def _pipeline_environment(args, output_root, cfg):
     args.planner = 'heuristic'
     args.generator = 'rand'
     args.plan_arm = True
-    args.sim_cache_dir = (str(Path(output_root) / 'sim_cache')
+    args.sim_cache_dir = (str(Path(store) / 'sim_cache')
                           if getattr(settings, 'sim_cache', False) else None)
     args.use_previous_sdf = True
     try:
@@ -640,6 +798,40 @@ def _pipeline_environment(args, output_root, cfg):
 # ----------------------------------------------------------------------------
 # Study
 # ----------------------------------------------------------------------------
+
+def _warm_start_weights(sources, top):
+    """Weights worth re-evaluating from earlier runs: from each history
+    (a run directory's history.json, or the file itself), the `top` fully
+    evaluated trials without failures by time, plus that history's Pareto
+    front when it was a multi-objective study. Their values are not reused
+    -- a new study may train on other assemblies -- only the weights, and a
+    weight set's stored runs make it free on the assemblies it has seen."""
+    out, seen = [], set()
+    for src in sources:
+        path = Path(src)
+        path = path / 'history.json' if path.is_dir() else path
+        try:
+            with open(path) as _f:
+                history = json.load(_f)
+        except (OSError, json.JSONDecodeError) as _e:
+            print(f'[optuna] WARN warm start: cannot read {path} ({_e})')
+            continue
+        done = [e for e in history if e.get('outcome') == 'complete' and not e.get('n_failed')
+                and e.get('objective') is not None]
+        picked = sorted(done, key=lambda e: e['objective'])[:top]
+        with_obj = [e for e in done if e.get('objectives')]
+        if with_obj:
+            names = list(with_obj[0]['objectives'])
+            vals = [[e['objectives'][o] for o in names] for e in with_obj]
+            picked += [e for e, v in zip(with_obj, vals)
+                       if not any(all(x <= y for x, y in zip(w, v)) and w != v for w in vals)]
+        for e in picked:
+            key = json.dumps(e['weights'], sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                out.append({k: float(e['weights'][k]) for k in WEIGHT_KEYS})
+    return out
+
 
 def _constraints_func(trial):
     # Optuna constraint: <= 0 is feasible. A trial without the attribute (e.g.
@@ -667,7 +859,9 @@ def train_heuristic_weights(test_eval, args,
                             weights_path=None,
                             history_path=None,
                             persist_study=False,
-                            time_budget_s=None):
+                            time_budget_s=None,
+                            store=None,
+                            warm_start=None):
     """Run an Optuna study minimising the mean log time ratio against the
     baseline across `test_eval.assemblies`. `n_trials` is the study-wide
     number of trials, so a resumed study or several workers stop once it is
@@ -682,6 +876,14 @@ def train_heuristic_weights(test_eval, args,
 
     `search_space`: {weight: (low, high)} for the weights that are not fixed,
     sampled log-uniformly; defaults to settings.heuristic_training's bounds.
+
+    `store`: where every planned run is kept (default DEFAULT_STORE), shared
+    with other runs: a trial whose weights were already evaluated on an
+    assembly under the same conditions reuses that result.
+
+    `warm_start`: earlier run directories (or history files) whose best
+    weights are queued as the first trials (see _warm_start_weights); on the
+    assemblies they were evaluated on, they come from the store for free.
 
     Returns the `optuna.Study` so the caller can introspect.
     """
@@ -706,15 +908,17 @@ def train_heuristic_weights(test_eval, args,
     history_path = Path(history_path or 'assets/heuristic_weights_optuna_history.json')
     output_root = Path(output_root or 'assets/optuna_training')
     output_root.mkdir(parents=True, exist_ok=True)
+    store = Path(store or DEFAULT_STORE)
+    print(f'[optuna] store: {store}')
 
     study = None
-    env = _pipeline_environment(args, output_root, cfg)
+    env = _pipeline_environment(args, store, cfg)
     env.__enter__()
     try:
         # --- baselines (stage 0) ---
         reference = _pin(_reference_weights(), fixed)
         print(f'[optuna] reference weights (pinned): {reference}')
-        baselines = _ensure_runs(test_eval.assemblies, args, output_root / 'baselines',
+        baselines = _ensure_runs(test_eval.assemblies, args, store,
                                  reference, 'baseline', clear_sdf=True, deadline=deadline)
         train_ass = []
         for ass in test_eval.assemblies:
@@ -741,7 +945,7 @@ def train_heuristic_weights(test_eval, args,
         if extra_objectives:
             for ass in list(train_ass):
                 aid = str(ass.id)
-                m = _plan_metrics(output_root / 'baselines' / f'{aid}_run')
+                m = baselines[aid].get('metrics')
                 if m is None:
                     print(f'[optuna] {aid}: left out of training (baseline plan metrics unreadable)')
                     train_ass.remove(ass)
@@ -814,6 +1018,11 @@ def train_heuristic_weights(test_eval, args,
             study.enqueue_trial(reference_params, skip_if_exists=True)
         if cfg['enqueue_time_model_prior']:
             study.enqueue_trial(_free(_time_model_prior(fixed)), skip_if_exists=True)
+        if warm_start:
+            queued = _warm_start_weights(warm_start, cfg['warm_start_top'])
+            for w in queued:
+                study.enqueue_trial(_free(_pin(w, fixed)), skip_if_exists=True)
+            print(f'[optuna] warm start: {len(queued)} weight sets queued from {list(warm_start)}')
 
         stop_on_failure = bool(cfg['stop_on_failure'])
 
@@ -822,16 +1031,20 @@ def train_heuristic_weights(test_eval, args,
             weights = {k: float(params[k]) if k in params else fixed[k] for k in WEIGHT_KEYS}
             is_reference = params == reference_params
             trial_label = f'trial_{trial.number:04d}'
-            trial_dir = output_root / trial_label
-            if trial_dir.exists():
-                # Trial numbers restart at 0 in every study that isn't resumed.
-                shutil.rmtree(str(trial_dir))
-            _use_weights(weights, trial_dir / 'weights.json')
+            # The reference trial plans afresh instead of reading the stored
+            # baselines it would match: it is the check that the pipeline is
+            # deterministic, and that the stored runs still hold for the
+            # current code (the fingerprint does not cover code changes).
+            check_dir = output_root / 'reference_check'
+            if is_reference:
+                if check_dir.exists():
+                    shutil.rmtree(str(check_dir))
+                _use_weights(weights, check_dir / 'weights.json')
 
             order = list(train_ass)
             random.Random(trial.number).shuffle(order)
             t0 = time.time()
-            per_total, per_ratio, per_status, per_metrics = {}, {}, {}, {}
+            per_total, per_ratio, per_status, per_metrics, per_run = {}, {}, {}, {}, {}
             log_ratios = []
             n_failed = 0
             outcome = 'complete'
@@ -839,14 +1052,25 @@ def train_heuristic_weights(test_eval, args,
                 aid = str(ass.id)
                 # Planning with the cache is usually faster than the cold
                 # baseline, so 1.5x its wall time is a safe upper bound.
-                if deadline is not None and time.time() + 1.5 * baselines[aid]['wall_s'] > deadline:
+                fingerprint = _run_fingerprint(args, weights)
+                paths = _store_paths(store, ass.assembly_dir, fingerprint)
+                stored = None if is_reference else _load_record(paths, fingerprint)
+                if (stored is None and deadline is not None
+                        and time.time() + 1.5 * (baselines[aid]['wall_s'] or 0.0) > deadline):
                     outcome = 'deadline'
                     study.stop()
                     break
-                status, total, _wall, _components, _extra = _run_assembly(ass, args, trial_dir / aid)
+                if is_reference:
+                    status, total, _wall, _components, _extra = _run_assembly(ass, args, check_dir / aid)
+                    metrics = _plan_metrics(check_dir / aid) if status == 'ok' else None
+                else:
+                    rec = stored or _ensure_runs([ass], args, store, weights, trial_label).get(aid)
+                    status, total = (rec['status'], rec['total_s']) if rec else ('not_run', None)
+                    metrics = rec.get('metrics') if rec else None
+                    per_run[aid] = str(paths['record'])
                 if status == 'ok' and extra_objectives:
-                    per_metrics[aid] = _plan_metrics(trial_dir / aid)
-                    if per_metrics[aid] is None:
+                    per_metrics[aid] = metrics
+                    if metrics is None:
                         status = 'metrics_unreadable'
                 per_status[aid] = status
                 per_total[aid] = total
@@ -861,7 +1085,7 @@ def train_heuristic_weights(test_eval, args,
                 per_ratio[aid] = ratio
                 log_ratios.append(math.log(ratio))
                 print(f'[optuna] {trial_label} / {aid}: total={total:.2f}s  '
-                      f'x{ratio:.3f} of baseline'
+                      f'x{ratio:.3f} of baseline' + ('  (stored)' if stored else '')
                       + ''.join(f'  {o}={per_metrics[aid][o]:.3f} (baseline {baseline_metrics[aid][o]:.3f})'
                                 for o in extra_objectives))
                 if p_threshold is None:
@@ -895,6 +1119,7 @@ def train_heuristic_weights(test_eval, args,
                 'per_assembly_total_s': per_total,
                 'per_assembly_ratio': per_ratio,
                 'per_assembly_status': per_status,
+                'per_assembly_record': per_run,
                 'elapsed_s': elapsed,
             }
             if multi:
@@ -930,6 +1155,7 @@ def train_heuristic_weights(test_eval, args,
         print(f'[optuna] weights file:  {weights_path} (best trial so far)')
         print(f'[optuna] history file:  {history_path}')
         print(f'[optuna] output root:   {output_root}')
+        print(f'[optuna] store:         {store}')
         timeout = None if deadline is None else max(0.0, deadline - time.time())
         if timeout is not None:
             print(f'[optuna] time budget: {timeout / 3600:.2f} h left for trials')
@@ -1076,7 +1302,7 @@ _SPLIT_COMPARISONS = (('trained+split', 'trained'), ('trained+split', 'trained+d
 
 def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
                                label='trained', time_budget_s=None, reference_only=False,
-                               split=False):
+                               split=False, store=None):
     """Test the weights in `weights_path` on `test_eval.assemblies` (held out
     from training) against two baselines: the heuristic planner with the
     reference weights, and gen:heur-out. Every run is planned and arm-timed
@@ -1095,6 +1321,10 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
     this on wide workers while training is still going, so the evaluation
     proper only has the trained-weight runs left. Returns None.
 
+    Every run goes through the shared `store` (default DEFAULT_STORE): a run
+    any earlier training or evaluation made under the same conditions is
+    reused, so widening the test set plans only the new assemblies.
+
     `split`: also plan every assembly with the trained weights plus the
     recursive subassembly plan ('trained+split', in `eval_<label>/split_runs/`)
     and compare it with the other three. Its search replays the 'trained'
@@ -1104,10 +1334,11 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
     deadline = None if time_budget_s is None else time.time() + float(time_budget_s)
     cfg = _training_config()
     output_root = Path(output_root or 'assets/optuna_training')
+    store = Path(store or DEFAULT_STORE)
     reference = _pin(_reference_weights(), cfg['fixed_weights'])
     if reference_only:
         print(f'[eval] {len(test_eval.assemblies)} assemblies: reference and heur-out runs only')
-        with _pipeline_environment(args, output_root, cfg):
+        with _pipeline_environment(args, store, cfg):
             # First everything no other worker holds, then wait for the rest:
             # a worker must not sit on another's reference run while heur-out
             # runs are still unclaimed.
@@ -1115,8 +1346,7 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
                 for name, planner, generator, seq_opt, which, _what in _EVAL_RUNS:
                     if which != 'reference':
                         continue
-                    run_dir = output_root / ('baselines' if name == 'reference' else name)
-                    _ensure_runs(test_eval.assemblies, args, run_dir, reference, name,
+                    _ensure_runs(test_eval.assemblies, args, store, reference, name,
                                  clear_sdf=(name == 'reference'), deadline=deadline,
                                  planner=planner, generator=generator, seq_optimizer=seq_opt,
                                  wait=wait)
@@ -1131,8 +1361,6 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
     print(f'[eval] {len(test_eval.assemblies)} assemblies; reference {reference}; '
           f'{label} {weights} (from {weights_path})')
 
-    run_dirs = {'reference': output_root / 'baselines', 'trained': eval_dir / 'runs',
-                'heur-out': output_root / 'heur-out', 'trained+split': eval_dir / 'split_runs'}
     eval_runs = [r for r in _EVAL_RUNS if split or r[3] is None]
     # Reference first (an assembly's first plan regenerates its SDFs), then
     # the runs only this phase makes, then heur-out, which the reference-only
@@ -1141,18 +1369,18 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
     priority = ('reference', 'trained', 'trained+split', 'heur-out')
     ordered = sorted(eval_runs, key=lambda r: priority.index(r[0]))
     runsets = {}
-    with _pipeline_environment(args, output_root, cfg):
+    with _pipeline_environment(args, store, cfg):
         for wait in (False, True):
             for name, planner, generator, seq_opt, which, _what in ordered:
                 runsets[name] = _ensure_runs(
-                    test_eval.assemblies, args, run_dirs[name],
+                    test_eval.assemblies, args, store,
                     reference if which == 'reference' else weights, name,
                     clear_sdf=(name == 'reference'), deadline=deadline,
                     planner=planner, generator=generator, seq_optimizer=seq_opt,
                     wait=wait)
 
     summary = _summarize_evaluation(test_eval.assemblies, runsets, reference, weights,
-                                    str(weights_path), eval_runs, run_dirs)
+                                    str(weights_path), eval_runs)
     _write_json(eval_dir / 'summary.json', summary)
     text = _format_evaluation(summary)
     (eval_dir / 'summary.txt').write_text(text)
@@ -1227,8 +1455,7 @@ def _compare(rows, a, b):
     return out
 
 
-def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, eval_runs,
-                          run_dirs=None):
+def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, eval_runs):
     rows = []
     for ass in ass_list:
         aid = str(ass.id)
@@ -1237,10 +1464,8 @@ def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, e
             rec = runsets[name].get(aid) or {}
             runs[name] = {'status': rec.get('status'), 'total_s': rec.get('total_s'),
                           'components': rec.get('components')}
-            # Held parts / pull direction of the timed sequence; not for the
-            # split run, whose timed order is not stats['sequence'].
-            if run_dirs and seq_opt is None and rec.get('status') == 'ok':
-                runs[name]['metrics'] = _plan_metrics(Path(run_dirs[name]) / f'{aid}_run')
+            if seq_opt is None:
+                runs[name]['metrics'] = rec.get('metrics')
             if 'split' in rec:
                 runs[name].update({k: rec.get(k) for k in
                                    ('split', 'n_joins', 'flat_total_s', 'failure',
