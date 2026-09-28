@@ -41,6 +41,17 @@ trials can become the trained weights. With a time budget, a trial that
 would run past it ends the same way (outcome 'deadline') and the study
 stops.
 
+Several objectives (``settings.heuristic_training['objectives']``, e.g.
+``('time', 'held_parts', 'non_upward')``): the time model does not charge
+held parts or the pull direction, and a penalty in seconds for them would
+only fix their exchange rate in advance. Each is instead an objective of its
+own (see OBJECTIVES; read off the chosen sequence by _plan_metrics), the study
+finds the Pareto front, and the weights are picked from it by
+``pareto_pick`` -- by default the fastest trial no worse than the reference
+weights on the others. The front is written next to the weights file
+(``<weights>_pareto.json``) so another point can be chosen by hand. Optuna
+does not prune multi-objective studies, so every trial is a full pass.
+
 Storage layout (paths relative to repo root, configurable via settings):
 - ``assets/heuristic_weights_optuna.json`` — the trained weights (all five,
   fixed ones included): the best fully evaluated trial that planned every
@@ -106,7 +117,21 @@ _TRAINING_DEFAULTS = {
     'stop_on_failure': True,
     'pruner_p_threshold': 0.1,
     'render_gifs': False,
+    'objectives': ('time',),
+    'pareto_pick': 'no_worse_than_reference',
 }
+
+# What a trial can be scored on (settings.heuristic_training['objectives']),
+# all minimised. 'time' is the mean log time ratio against the baseline; the
+# others are plan properties the time model does not charge, read off the
+# chosen sequence's tree edges (_plan_metrics), as a per-step mean per
+# assembly averaged over the assemblies.
+OBJECTIVES = {
+    'time': 'mean log time ratio vs baseline',
+    'held_parts': 'mean extra parts held per step',
+    'non_upward': 'mean 1 - cos(angle of the pull to world up) per step (0 up, 1 sideways, 2 down)',
+}
+PARETO_PICKS = ('no_worse_than_reference', 'fastest')
 
 # stats['stop_msg'] of a plan aborted by the initial stable-pose precheck
 # (settings.no_stable_pose_action = 'exit').
@@ -166,6 +191,15 @@ def _training_config():
                 v = 1.0
         fixed[k] = float(v)
     cfg['fixed_weights'] = fixed
+    objectives = tuple(cfg.get('objectives') or ('time',))
+    unknown = [o for o in objectives if o not in OBJECTIVES]
+    if unknown or 'time' not in objectives or len(set(objectives)) != len(objectives):
+        raise ValueError(f'heuristic_training.objectives: {objectives!r}; distinct names from '
+                         f'{list(OBJECTIVES)}, including time')
+    cfg['objectives'] = objectives
+    if cfg.get('pareto_pick') not in PARETO_PICKS:
+        raise ValueError(f'heuristic_training.pareto_pick: {cfg.get("pareto_pick")!r}, '
+                         f'not one of {PARETO_PICKS}')
     return cfg
 
 
@@ -293,6 +327,44 @@ def _assess_run(storage_dir, ass, split=False):
     extra['split'] = 'used'
     extra['parallel_total_s'] = (split_timing.get('parallel') or {}).get('total_s')
     return 'ok', float(split_timing['totals']['total_s']), split_timing['totals'], extra
+
+
+def _plan_metrics(run_dir):
+    """The non-time objectives of one completed plan: per-step means, over
+    the chosen sequence (stats['sequence']), of the extra parts held
+    (len(parts_fix)) and of the pull's non-upwardness (1 - z of the unit
+    action, world frame), both read off the tree edges the sequence walks and
+    defined like the heuristic's hold_count and z_alignment features. None
+    when the tree does not contain the sequence."""
+    import pickle
+    log_dir = Path(run_dir) / 'log'
+    try:
+        with open(log_dir / 'stats.json') as _f:
+            sequence = json.load(_f).get('sequence') or []
+        with open(log_dir / 'tree.pkl', 'rb') as _f:
+            tree = pickle.load(_f)
+    except (OSError, json.JSONDecodeError, pickle.UnpicklingError, EOFError):
+        return None
+    if not sequence or not tree.number_of_nodes():
+        return None
+    by_set = {frozenset(n): n for n in tree.nodes}
+    node = max(tree.nodes, key=len)
+    held, non_upward = [], []
+    for part in sequence:
+        child = by_set.get(frozenset(node) - {part})
+        if child is None or not tree.has_edge(node, child):
+            return None
+        sim_info = tree.edges[node, child].get('sim_info') or {}
+        held.append(len(sim_info.get('parts_fix') or []))
+        action = sim_info.get('action')
+        if action is None:
+            non_upward.append(1.0)
+        else:
+            a = [float(x) for x in action]
+            n = math.sqrt(sum(x * x for x in a))
+            non_upward.append(1.0 - a[2] / n if n > 1e-9 else 1.0)
+        node = child
+    return {'held_parts': sum(held) / len(held), 'non_upward': sum(non_upward) / len(non_upward)}
 
 
 def _use_weights(weights, path):
@@ -621,6 +693,31 @@ def train_heuristic_weights(test_eval, args,
         step_of = {aid: i for i, aid in enumerate(sorted(str(a.id) for a in train_ass))}
         print(f'[optuna] training on {len(train_ass)} assemblies: {sorted(step_of)}')
 
+        objectives = cfg['objectives']
+        multi = len(objectives) > 1
+        extra_objectives = [o for o in objectives if o != 'time']
+        # The baseline's values of the other objectives: what the reference
+        # weights achieve, the bar of pareto_pick 'no_worse_than_reference'.
+        baseline_metrics = {}
+        if extra_objectives:
+            for ass in list(train_ass):
+                aid = str(ass.id)
+                m = _plan_metrics(output_root / 'baselines' / f'{aid}_run')
+                if m is None:
+                    print(f'[optuna] {aid}: left out of training (baseline plan metrics unreadable)')
+                    train_ass.remove(ass)
+                else:
+                    baseline_metrics[aid] = m
+            if not train_ass:
+                print('[optuna] no assembly left to train on')
+                return None
+        reference_values = {'time': 0.0}
+        for o in extra_objectives:
+            reference_values[o] = sum(m[o] for m in baseline_metrics.values()) / len(baseline_metrics)
+        if multi:
+            print(f'[optuna] multi-objective: {list(objectives)} (all minimised; no pruning); '
+                  f'reference weights score {reference_values}')
+
         # --- study ---
         storage = None
         if persist_study:
@@ -630,7 +727,8 @@ def train_heuristic_weights(test_eval, args,
         # Workers sharing a study (or a resumed one) must not replay the same
         # random start-up samples, so their seed also depends on the process.
         sampler_seed = seed if not persist_study else (seed * 1_000_003 + os.getpid()) % 2**32
-        p_threshold = cfg['pruner_p_threshold']
+        # Optuna prunes single-objective studies only.
+        p_threshold = None if multi else cfg['pruner_p_threshold']
         with warnings.catch_warnings():
             # multivariate / constant_liar / constraints_func and WilcoxonPruner
             # are flagged experimental; the warnings are noise here.
@@ -648,7 +746,7 @@ def train_heuristic_weights(test_eval, args,
                       if p_threshold is not None else optuna.pruners.NopPruner())
         study = optuna.create_study(
             study_name='heuristic_weights',
-            direction='minimize',
+            directions=['minimize'] * len(objectives),
             sampler=sampler,
             pruner=pruner,
             storage=storage,
@@ -694,7 +792,7 @@ def train_heuristic_weights(test_eval, args,
             order = list(train_ass)
             random.Random(trial.number).shuffle(order)
             t0 = time.time()
-            per_total, per_ratio, per_status = {}, {}, {}
+            per_total, per_ratio, per_status, per_metrics = {}, {}, {}, {}
             log_ratios = []
             n_failed = 0
             outcome = 'complete'
@@ -707,6 +805,10 @@ def train_heuristic_weights(test_eval, args,
                     study.stop()
                     break
                 status, total, _wall, _components, _extra = _run_assembly(ass, args, trial_dir / aid)
+                if status == 'ok' and extra_objectives:
+                    per_metrics[aid] = _plan_metrics(trial_dir / aid)
+                    if per_metrics[aid] is None:
+                        status = 'metrics_unreadable'
                 per_status[aid] = status
                 per_total[aid] = total
                 if status != 'ok':
@@ -720,15 +822,23 @@ def train_heuristic_weights(test_eval, args,
                 per_ratio[aid] = ratio
                 log_ratios.append(math.log(ratio))
                 print(f'[optuna] {trial_label} / {aid}: total={total:.2f}s  '
-                      f'x{ratio:.3f} of baseline')
+                      f'x{ratio:.3f} of baseline'
+                      + ''.join(f'  {o}={per_metrics[aid][o]:.3f} (baseline {baseline_metrics[aid][o]:.3f})'
+                                for o in extra_objectives))
+                if p_threshold is None:
+                    continue
                 trial.report(math.log(ratio), step_of[aid])
-                if p_threshold is not None and trial.should_prune():
+                if trial.should_prune():
                     outcome = 'pruned'
                     break
             elapsed = time.time() - t0
 
             mean_log = sum(log_ratios) / len(log_ratios) if log_ratios else None
             value = float('inf') if n_failed or mean_log is None else mean_log
+            values = {'time': value}
+            for o in extra_objectives:
+                values[o] = (float('inf') if value == float('inf')
+                             else sum(m[o] for m in per_metrics.values()) / len(per_metrics))
             trial.set_user_attr('n_failed', n_failed)  # read by _constraints_func
             trial.set_user_attr('outcome', outcome)
             entry = {
@@ -748,11 +858,16 @@ def train_heuristic_weights(test_eval, args,
                 'per_assembly_status': per_status,
                 'elapsed_s': elapsed,
             }
+            if multi:
+                entry['objectives'] = {o: (None if v == float('inf') else v)
+                                       for o, v in values.items()}
+                entry['per_assembly_metrics'] = per_metrics
             trial.set_user_attr('entry', entry)
             _write_history(study, history_path)
             # Best so far after every trial, so a job killed at its time limit
             # still leaves its result behind.
-            _write_best(study, weights_path, final=False)
+            _write_best(study, weights_path, final=False, objectives=objectives,
+                        reference_values=reference_values, pick=cfg['pareto_pick'])
 
             if is_reference and outcome == 'complete':
                 drift = max((abs(math.log(r)) for r in per_ratio.values()), default=0.0)
@@ -763,9 +878,11 @@ def train_heuristic_weights(test_eval, args,
                           f'difference between trials is noise')
             score = (f'geomean x{math.exp(value):.4f}' if value != float('inf')
                      else f'failed {n_failed}')
+            if value != float('inf'):
+                score += ''.join(f'  {o}={values[o]:.3f}' for o in extra_objectives)
             print(f'[optuna] trial {trial.number} {outcome}: {score}  '
                   f'elapsed={elapsed:.0f}s  weights={weights}')
-            return value
+            return tuple(values[o] for o in objectives) if multi else value
 
         n_complete = len([t for t in study.trials
                           if t.state == optuna.trial.TrialState.COMPLETE])
@@ -791,34 +908,88 @@ def train_heuristic_weights(test_eval, args,
     finally:
         if study is not None and study.trials:
             _write_history(study, history_path)
-            _write_best(study, weights_path)
+            _write_best(study, weights_path, objectives=objectives,
+                        reference_values=reference_values, pick=cfg['pareto_pick'])
         env.__exit__(None, None, None)
 
     return study
 
 
-def _write_best(study, weights_path, final=True):
+def pareto_path_for(weights_path):
+    """Where a multi-objective study writes its Pareto front."""
+    weights_path = Path(weights_path)
+    return weights_path.with_name(f'{weights_path.stem}_pareto.json')
+
+
+def _pareto_front(trials, objectives):
+    """The trials no other trial dominates (<= on every objective, < on one)."""
+    vals = [[t.user_attrs['entry']['objectives'][o] for o in objectives] for t in trials]
+    return [t for t, v in zip(trials, vals)
+            if not any(all(x <= y for x, y in zip(w, v)) and w != v for w in vals)]
+
+
+def _write_best(study, weights_path, final=True, objectives=('time',),
+                reference_values=None, pick='no_worse_than_reference'):
     """The trained weights are the best trial that evaluated every assembly
     and failed none; pruned, deadline and failing trials never qualify.
-    `final=False` (after each trial) writes quietly."""
+    `final=False` (after each trial) writes quietly.
+
+    With several objectives, 'best' is picked from the Pareto front of the
+    qualifying trials by `pick`: 'no_worse_than_reference' is the fastest
+    trial that is at most as bad as the reference weights (`reference_values`)
+    on every other objective (the queued reference trial always is, so this
+    falls back to 'fastest' only when that trial never completed); 'fastest'
+    ignores the other objectives. The front itself goes to
+    pareto_path_for(weights_path), so another point can be chosen by hand."""
     import optuna
+
+    def time_of(t):
+        return t.values[0] if t.values else None
 
     qualified = [t for t in study.trials
                  if t.state == optuna.trial.TrialState.COMPLETE
                  and t.user_attrs.get('outcome') == 'complete'
                  and t.user_attrs.get('n_failed') == 0
-                 and t.value is not None and math.isfinite(t.value)]
+                 and t.values is not None and all(math.isfinite(v) for v in t.values)]
     if not qualified:
         if final:
             print('[optuna] WARN no trial completed every assembly; weights file left as-is')
         return
-    best = min(qualified, key=lambda t: t.value)
+    multi = len(objectives) > 1
+    if multi:
+        front = sorted(_pareto_front(qualified, objectives), key=time_of)
+        _write_json(pareto_path_for(weights_path), {
+            'objectives': {o: OBJECTIVES[o] for o in objectives},
+            'reference_values': reference_values,
+            'pick': pick,
+            'front': [{'trial': t.number,
+                       'objectives': t.user_attrs['entry']['objectives'],
+                       'geomean_ratio': math.exp(time_of(t)),
+                       'weights': t.user_attrs['entry']['weights']} for t in front],
+        })
+        candidates = front
+        if pick == 'no_worse_than_reference' and reference_values:
+            bar = [t for t in front
+                   if all(t.user_attrs['entry']['objectives'][o] <= reference_values[o] + 1e-12
+                          for o in objectives if o != 'time')]
+            if bar:
+                candidates = bar
+            elif final:
+                print('[optuna] WARN no Pareto trial is as good as the reference on the other '
+                      'objectives; taking the fastest')
+        best = min(candidates, key=time_of)
+    else:
+        best = min(qualified, key=time_of)
     best_weights = best.user_attrs['entry']['weights']
     _write_json(weights_path, best_weights)
     if not final:
         return
     print(f'[optuna] best trial: {best.number}  geomean time ratio vs baseline: '
-          f'x{math.exp(best.value):.4f}')
+          f'x{math.exp(time_of(best)):.4f}')
+    if multi:
+        print(f'[optuna] its objectives: {best.user_attrs["entry"]["objectives"]}; '
+              f'reference: {reference_values}; picked by {pick!r} from a Pareto front of '
+              f'{len(front)} trials, written to {pareto_path_for(weights_path)}')
     print(f'[optuna] best weights: {best_weights}')
     print(f'[optuna] best weights written to {weights_path}')
 
@@ -929,7 +1100,7 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
                 planner=planner, generator=generator, seq_optimizer=seq_opt)
 
     summary = _summarize_evaluation(test_eval.assemblies, runsets, reference, weights,
-                                    str(weights_path), eval_runs)
+                                    str(weights_path), eval_runs, run_dirs)
     _write_json(eval_dir / 'summary.json', summary)
     text = _format_evaluation(summary)
     (eval_dir / 'summary.txt').write_text(text)
@@ -984,6 +1155,14 @@ def _compare(rows, a, b):
         if band:
             out['by_size'].append({'parts': f'{lo}-{hi}' if hi else f'{lo}+', 'n': len(band),
                                    'geomean_ratio': _geomean(band)})
+    out['metric_mean'] = {}
+    with_metrics = [r for r in paired if all(r['runs'][x].get('metrics') for x in (a, b))]
+    if with_metrics:
+        for m in ('held_parts', 'non_upward'):
+            out['metric_mean'][m] = {
+                side: sum(r['runs'][side]['metrics'][m] for r in with_metrics) / len(with_metrics)
+                for side in (a, b)}
+        out['metric_n'] = len(with_metrics)
     out['component_mean_s'] = {}
     # Only where both sides have a breakdown (the parallel total has none: it
     # is not a sum of the components).
@@ -996,15 +1175,20 @@ def _compare(rows, a, b):
     return out
 
 
-def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, eval_runs):
+def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, eval_runs,
+                          run_dirs=None):
     rows = []
     for ass in ass_list:
         aid = str(ass.id)
         runs = {}
-        for name, *_ in eval_runs:
+        for name, _planner, _generator, seq_opt, *_ in eval_runs:
             rec = runsets[name].get(aid) or {}
             runs[name] = {'status': rec.get('status'), 'total_s': rec.get('total_s'),
                           'components': rec.get('components')}
+            # Held parts / pull direction of the timed sequence; not for the
+            # split run, whose timed order is not stats['sequence'].
+            if run_dirs and seq_opt is None and rec.get('status') == 'ok':
+                runs[name]['metrics'] = _plan_metrics(Path(run_dirs[name]) / f'{aid}_run')
             if 'split' in rec:
                 runs[name].update({k: rec.get(k) for k in
                                    ('split', 'n_joins', 'flat_total_s', 'failure',
@@ -1101,6 +1285,9 @@ def _format_evaluation(summary):
             '  by part count: ' + ',  '.join(f'{x["parts"]} (n={x["n"]}) x{x["geomean_ratio"]:.3f}'
                                             for x in c['by_size']),
         ]
+        if c['metric_mean']:
+            lines.append(f'  mean per step over {c["metric_n"]} assemblies: ' + ',  '.join(
+                f'{m} {v[a]:.3f} vs {v[b]:.3f}' for m, v in c['metric_mean'].items()))
         if c['component_mean_s']:
             lines.append('  mean component time (s): ' + ',  '.join(
                 f'{comp[:-2]} {v[a]:.1f} vs {v[b]:.1f}' for comp, v in c['component_mean_s'].items()
