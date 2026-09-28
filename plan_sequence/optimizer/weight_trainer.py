@@ -99,6 +99,7 @@ import os
 import random
 import shutil
 import socket
+import threading
 import time
 import traceback
 import warnings
@@ -140,9 +141,11 @@ _PRECHECK_ABORT = 'no self-stable initial pose'
 # Seconds between checks while another process computes a stored run.
 _RUN_POLL_S = 30
 
-# A lock older than this is stale (its holder was killed, e.g. at a cluster
-# job's time limit) and is taken over. Far above any single plan's duration.
-_LOCK_STALE_S = 6 * 3600
+# A live holder refreshes its lock's mtime every _LOCK_HEARTBEAT_S; a lock
+# not refreshed for _LOCK_STALE_S is stale (its holder was killed, e.g. out of
+# memory or at a job's time limit, possibly on another node) and is taken over.
+_LOCK_HEARTBEAT_S = 60
+_LOCK_STALE_S = 15 * 60
 
 
 def _write_json(path, data, indent=2):
@@ -442,8 +445,9 @@ def _run_fingerprint(args, weights, planner='heuristic', generator='rand', seq_o
 
 def _try_lock(path):
     """Create `path` exclusively; None if another live process holds it. A
-    lock left by a dead process on this host, or older than _LOCK_STALE_S
-    (a holder on another node that was killed), is taken over."""
+    lock left by a dead process on this host, or not refreshed for
+    _LOCK_STALE_S (a holder on another node that was killed), is taken over.
+    Hold it through _LockHeartbeat, which keeps it fresh."""
     me = {'host': socket.gethostname(), 'pid': os.getpid(), 'since': time.time()}
     for _ in range(2):
         try:
@@ -454,7 +458,11 @@ def _try_lock(path):
                     holder = json.load(_f)
             except (OSError, json.JSONDecodeError):
                 return None
-            if time.time() - float(holder.get('since', time.time())) > _LOCK_STALE_S:
+            try:
+                age = time.time() - os.path.getmtime(path)
+            except OSError:
+                continue  # released meanwhile
+            if age > _LOCK_STALE_S:
                 os.remove(str(path))
                 continue
             if holder.get('host') != me['host']:
@@ -473,8 +481,31 @@ def _try_lock(path):
     return None
 
 
+class _LockHeartbeat:
+    """Refresh a held lock's mtime from a background thread until closed, so
+    other processes (on any node) can tell a live holder from a dead one."""
+
+    def __init__(self, path):
+        self.path = path
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._beat, daemon=True)
+        self._thread.start()
+
+    def _beat(self):
+        while not self._stop.wait(_LOCK_HEARTBEAT_S):
+            try:
+                os.utime(self.path)
+            except OSError:
+                return
+
+    def close(self):
+        self._stop.set()
+        self._thread.join()
+
+
 def _ensure_runs(ass_list, args, run_root, weights, label, clear_sdf=False,
-                 deadline=None, planner='heuristic', generator='rand', seq_optimizer=None):
+                 deadline=None, planner='heuristic', generator='rand', seq_optimizer=None,
+                 wait=True):
     """One stored run per assembly with fixed `weights`, computing the missing
     ones: records in `run_root/<id>.json`, planning output in
     `run_root/<id>_run/`. Several processes can run this at once (e.g. the
@@ -495,7 +526,11 @@ def _ensure_runs(ass_list, args, run_root, weights, label, clear_sdf=False,
     reads `weights`); e.g. 'gen-adapter' / 'heur-out' for the heur-out
     baseline, which ignores the weights. `seq_optimizer='divide'` adds the
     subassembly plan, and the run is scored by its split timing (see
-    _assess_run)."""
+    _assess_run).
+
+    `wait=False`: compute what no other process holds and return without
+    waiting for the rest, so a caller with several run sets can do all the
+    work it can take before it waits on anyone."""
     run_root = Path(run_root)
     run_root.mkdir(parents=True, exist_ok=True)
     fingerprint = _run_fingerprint(args, weights, planner, generator, seq_optimizer)
@@ -525,6 +560,7 @@ def _ensure_runs(ass_list, args, run_root, weights, label, clear_sdf=False,
             if lock is None:
                 waiting.append(ass)
                 continue
+            heartbeat = _LockHeartbeat(lock)
             try:
                 _saved = (getattr(args, 'use_previous_sdf', False), args.planner,
                           args.generator, getattr(args, 'seq_optimizer', None))
@@ -547,7 +583,10 @@ def _ensure_runs(ass_list, args, run_root, weights, label, clear_sdf=False,
                       + (f'  split={extra["split"]}' if extra else '')
                       + f'  ({wall:.0f}s)')
             finally:
+                heartbeat.close()
                 os.remove(str(lock))
+        if waiting and not wait:
+            break
         if waiting and len(waiting) == len(pending):
             ids = [str(a.id) for a in waiting]
             if ids != announced:
@@ -1069,13 +1108,18 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
     if reference_only:
         print(f'[eval] {len(test_eval.assemblies)} assemblies: reference and heur-out runs only')
         with _pipeline_environment(args, output_root, cfg):
-            for name, planner, generator, seq_opt, which, _what in _EVAL_RUNS:
-                if which != 'reference':
-                    continue
-                run_dir = output_root / ('baselines' if name == 'reference' else name)
-                _ensure_runs(test_eval.assemblies, args, run_dir, reference, name,
-                             clear_sdf=(name == 'reference'), deadline=deadline,
-                             planner=planner, generator=generator, seq_optimizer=seq_opt)
+            # First everything no other worker holds, then wait for the rest:
+            # a worker must not sit on another's reference run while heur-out
+            # runs are still unclaimed.
+            for wait in (False, True):
+                for name, planner, generator, seq_opt, which, _what in _EVAL_RUNS:
+                    if which != 'reference':
+                        continue
+                    run_dir = output_root / ('baselines' if name == 'reference' else name)
+                    _ensure_runs(test_eval.assemblies, args, run_dir, reference, name,
+                                 clear_sdf=(name == 'reference'), deadline=deadline,
+                                 planner=planner, generator=generator, seq_optimizer=seq_opt,
+                                 wait=wait)
         return None
     with open(weights_path) as _f:
         loaded = json.load(_f)
@@ -1090,14 +1134,22 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
     run_dirs = {'reference': output_root / 'baselines', 'trained': eval_dir / 'runs',
                 'heur-out': output_root / 'heur-out', 'trained+split': eval_dir / 'split_runs'}
     eval_runs = [r for r in _EVAL_RUNS if split or r[3] is None]
+    # Reference first (an assembly's first plan regenerates its SDFs), then
+    # the runs only this phase makes, then heur-out, which the reference-only
+    # phase normally leaves done; so a shortfall there cannot starve the
+    # trained runs. Two passes: first what no other worker holds, then wait.
+    priority = ('reference', 'trained', 'trained+split', 'heur-out')
+    ordered = sorted(eval_runs, key=lambda r: priority.index(r[0]))
     runsets = {}
     with _pipeline_environment(args, output_root, cfg):
-        for name, planner, generator, seq_opt, which, _what in eval_runs:
-            runsets[name] = _ensure_runs(
-                test_eval.assemblies, args, run_dirs[name],
-                reference if which == 'reference' else weights, name,
-                clear_sdf=(name == 'reference'), deadline=deadline,
-                planner=planner, generator=generator, seq_optimizer=seq_opt)
+        for wait in (False, True):
+            for name, planner, generator, seq_opt, which, _what in ordered:
+                runsets[name] = _ensure_runs(
+                    test_eval.assemblies, args, run_dirs[name],
+                    reference if which == 'reference' else weights, name,
+                    clear_sdf=(name == 'reference'), deadline=deadline,
+                    planner=planner, generator=generator, seq_optimizer=seq_opt,
+                    wait=wait)
 
     summary = _summarize_evaluation(test_eval.assemblies, runsets, reference, weights,
                                     str(weights_path), eval_runs, run_dirs)
