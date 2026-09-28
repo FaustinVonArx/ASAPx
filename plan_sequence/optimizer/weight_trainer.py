@@ -833,6 +833,44 @@ def _warm_start_weights(sources, top):
     return out
 
 
+def _trial_owner():
+    """Who runs a trial: host, pid and the Slurm job (the array's, so all
+    tasks of one submission share it)."""
+    return {'host': socket.gethostname(), 'pid': os.getpid(),
+            'slurm_job': os.environ.get('SLURM_ARRAY_JOB_ID') or os.environ.get('SLURM_JOB_ID')}
+
+
+def _fail_orphaned_trials(study):
+    """Mark as failed the trials a killed worker left RUNNING (scancel, time
+    limit, out of memory): they would otherwise stay in the journal for good,
+    and constant-liar TPE keeps treating their points as bad. A trial is
+    orphaned when its owner was another Slurm submission (the submit script
+    refuses to run two on one run directory), or a process on this host that
+    is gone."""
+    import optuna
+    me = _trial_owner()
+    n = 0
+    for t in study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.RUNNING,)):
+        owner = t.user_attrs.get('owner') or {}
+        dead = bool(me['slurm_job'] and owner.get('slurm_job')
+                    and owner['slurm_job'] != me['slurm_job'])
+        if not dead and owner.get('host') == me['host'] and owner.get('pid') != me['pid']:
+            try:
+                os.kill(int(owner['pid']), 0)
+            except ProcessLookupError:
+                dead = True
+            except (PermissionError, TypeError, ValueError):
+                pass
+        if dead:
+            try:
+                study._storage.set_trial_state_values(t._trial_id, optuna.trial.TrialState.FAIL)
+                n += 1
+            except Exception:
+                pass  # another worker got there first
+    if n:
+        print(f'[optuna] marked {n} trial(s) left running by a killed worker as failed')
+
+
 def _constraints_func(trial):
     # Optuna constraint: <= 0 is feasible. A trial without the attribute (e.g.
     # from a study written before failures were counted) reads as infeasible.
@@ -995,6 +1033,7 @@ def train_heuristic_weights(test_eval, args,
             storage=storage,
             load_if_exists=bool(storage),
         )
+        _fail_orphaned_trials(study)
         n_done_initial = len(study.trials)
         if history_path.exists() and not n_done_initial:
             # Fresh study: trial numbers restart at 0, so the old history
@@ -1027,6 +1066,7 @@ def train_heuristic_weights(test_eval, args,
         stop_on_failure = bool(cfg['stop_on_failure'])
 
         def objective(trial):
+            trial.set_user_attr('owner', _trial_owner())
             params = {k: trial.suggest_float(k, *search_space[k], log=True) for k in free_keys}
             weights = {k: float(params[k]) if k in params else fixed[k] for k in WEIGHT_KEYS}
             is_reference = params == reference_params
