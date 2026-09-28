@@ -225,10 +225,16 @@ def _time_model_prior(fixed):
 # Running one assembly
 # ----------------------------------------------------------------------------
 
-def _assess_run(storage_dir, ass):
+def _assess_run(storage_dir, ass, split=False):
     """Classify one assembly's pipeline output. Returns (status, total_s,
-    components): total_s and the timing components (timing_overview totals)
-    are None unless status == 'ok'.
+    components, extra): total_s and the timing components (timing_overview
+    totals) are None unless status == 'ok'; `extra` is {} except with
+    `split`.
+
+    `split` (a --seq-optimizer divide run): score the subassembly plan's own
+    timing (timing_overview_split.json) when the run found a plan that can be
+    carried out, else the run's flat sequence; `extra` records which
+    ('used' / 'none' / 'infeasible'), the flat total and the number of joins.
 
     'excluded' marks a precheck abort, which the weights cannot influence.
     Every other status except 'ok' is a failure.
@@ -238,7 +244,7 @@ def _assess_run(storage_dir, ass):
         with open(log_dir / 'stats.json') as _f:
             stats = json.load(_f)
     except (OSError, json.JSONDecodeError):
-        return 'no_stats', None, None
+        return 'no_stats', None, None, {}
 
     stop_msg = stats.get('stop_msg')
     if stop_msg == 'interrupt':
@@ -247,26 +253,46 @@ def _assess_run(storage_dir, ass):
         # interrupted plan to the weights.
         raise KeyboardInterrupt
     if stop_msg == _PRECHECK_ABORT:
-        return 'excluded', None, None
+        return 'excluded', None, None, {}
     if not stats.get('success'):
-        return f'plan_failed: {stop_msg}', None, None
+        return f'plan_failed: {stop_msg}', None, None, {}
     # A complete plan removes every part but the last, which stays put.
     sequence = stats.get('sequence') or []
     if len(set(ass.objects) - set(sequence)) > 1:
-        return 'incomplete_sequence', None, None
+        return 'incomplete_sequence', None, None, {}
 
     try:
         with open(log_dir / 'timing_overview.json') as _f:
             timing = json.load(_f)
     except (OSError, json.JSONDecodeError):
-        return 'no_timing', None, None
+        return 'no_timing', None, None, {}
     if len(timing.get('per_step') or []) != len(sequence):
-        return 'timing_mismatch', None, None
+        return 'timing_mismatch', None, None, {}
     total = (timing.get('totals') or {}).get('total_s')
     if total is None or float(total) <= 0:
         # A complete plan always takes time; a ratio against zero is undefined.
-        return 'no_timing', None, None
-    return 'ok', float(total), timing['totals']
+        return 'no_timing', None, None, {}
+    if not split:
+        return 'ok', float(total), timing['totals'], {}
+
+    extra = {'split': 'none', 'flat_total_s': float(total), 'flat_components': timing['totals'],
+             'n_joins': 0, 'source': stats.get('split_sequence_source')}
+    if not stats.get('split_plan'):
+        return 'ok', float(total), timing['totals'], extra
+    try:
+        with open(log_dir / 'timing_overview_split.json') as _f:
+            split_timing = json.load(_f)
+    except (OSError, json.JSONDecodeError):
+        extra['split'] = 'untimed'
+        return 'ok', float(total), timing['totals'], extra
+    extra['n_joins'] = split_timing.get('n_joins', 0)
+    if split_timing.get('status') != 'ok':
+        extra['split'] = 'infeasible'
+        extra['failure'] = split_timing.get('failure')
+        return 'ok', float(total), timing['totals'], extra
+    extra['split'] = 'used'
+    extra['parallel_total_s'] = (split_timing.get('parallel') or {}).get('total_s')
+    return 'ok', float(split_timing['totals']['total_s']), split_timing['totals'], extra
 
 
 def _use_weights(weights, path):
@@ -276,10 +302,10 @@ def _use_weights(weights, path):
     settings.heuristic_weights_optuna_path = str(path)
 
 
-def _run_assembly(ass, args, run_dir):
+def _run_assembly(ass, args, run_dir, split=False):
     """Plan + arm-time one assembly into `run_dir`, which is wiped first:
     get_assembly_plans_ASAP returns a leftover sequence.json without planning.
-    Returns (status, total_s, wall_s, components)."""
+    Returns (status, total_s, wall_s, components, extra); see _assess_run."""
     run_dir = Path(run_dir)
     if run_dir.exists():
         shutil.rmtree(str(run_dir))
@@ -289,20 +315,20 @@ def _run_assembly(ass, args, run_dir):
     try:
         ass.storage_dir = run_dir
         ass.planner.get_assembly_plans(args)
-        status, total, components = _assess_run(run_dir, ass)
+        status, total, components, extra = _assess_run(run_dir, ass, split=split)
     except Exception as _e:
         traceback.print_exc()
-        status, total, components = f'error: {_e}', None, None
+        status, total, components, extra = f'error: {_e}', None, None, {}
     finally:
         ass.storage_dir = _saved_storage
-    return status, total, time.time() - t0, components
+    return status, total, time.time() - t0, components, extra
 
 
 # ----------------------------------------------------------------------------
 # Stored runs (baselines, evaluation)
 # ----------------------------------------------------------------------------
 
-def _run_fingerprint(args, weights, planner='heuristic', generator='rand'):
+def _run_fingerprint(args, weights, planner='heuristic', generator='rand', seq_optimizer=None):
     """What a stored run depends on besides the assembly: its planner and
     weights and the planning / timing configuration. A stored run is reused
     only while this matches."""
@@ -321,12 +347,21 @@ def _run_fingerprint(args, weights, planner='heuristic', generator='rand'):
     # Not num_proc: results no longer depend on it (DFA submission order).
     arg_keys = ('budget', 'max_pose', 'max_gripper', 'pose_reuse', 'early_term',
                 'seq_optimizer', 'seed', 'gripper_type', 'gripper_scale')
+    if seq_optimizer == 'divide':
+        # What the subassembly plan and its timing depend on.
+        setting_keys += (
+            'divide_weights', 'divide_split_threshold', 'subassembly_max_depth',
+            'subassembly_min_parts', 'subassembly_search_timeout',
+            'subassembly_verify_top_k', 'subassembly_sweep_states',
+            'subassembly_sweep_max_states',
+        )
     fp = {
         'planner': planner,
         'generator': generator,
+        'seq_optimizer': seq_optimizer,
         'weights': weights,
         'settings': {k: getattr(settings, k, None) for k in setting_keys},
-        'args': {k: getattr(args, k, None) for k in arg_keys},
+        'args': {k: getattr(args, k, None) for k in arg_keys if k != 'seq_optimizer'},
     }
     # JSON round trip so a fresh fingerprint compares equal to a stored one
     # (tuples become lists).
@@ -367,7 +402,7 @@ def _try_lock(path):
 
 
 def _ensure_runs(ass_list, args, run_root, weights, label, clear_sdf=False,
-                 deadline=None, planner='heuristic', generator='rand'):
+                 deadline=None, planner='heuristic', generator='rand', seq_optimizer=None):
     """One stored run per assembly with fixed `weights`, computing the missing
     ones: records in `run_root/<id>.json`, planning output in
     `run_root/<id>_run/`. Several processes can run this at once (e.g. the
@@ -386,10 +421,12 @@ def _ensure_runs(ass_list, args, run_root, weights, label, clear_sdf=False,
 
     `planner` / `generator`: what plans (default: the heuristic planner, which
     reads `weights`); e.g. 'gen-adapter' / 'heur-out' for the heur-out
-    baseline, which ignores the weights."""
+    baseline, which ignores the weights. `seq_optimizer='divide'` adds the
+    subassembly plan, and the run is scored by its split timing (see
+    _assess_run)."""
     run_root = Path(run_root)
     run_root.mkdir(parents=True, exist_ok=True)
-    fingerprint = _run_fingerprint(args, weights, planner, generator)
+    fingerprint = _run_fingerprint(args, weights, planner, generator, seq_optimizer)
     _use_weights(weights, run_root / 'weights.json')
 
     records = {}
@@ -417,22 +454,25 @@ def _ensure_runs(ass_list, args, run_root, weights, label, clear_sdf=False,
                 waiting.append(ass)
                 continue
             try:
-                _saved = (getattr(args, 'use_previous_sdf', False), args.planner, args.generator)
+                _saved = (getattr(args, 'use_previous_sdf', False), args.planner,
+                          args.generator, getattr(args, 'seq_optimizer', None))
                 if clear_sdf:
                     args.use_previous_sdf = False
-                args.planner, args.generator = planner, generator
+                args.planner, args.generator, args.seq_optimizer = planner, generator, seq_optimizer
                 try:
-                    status, total, wall, components = _run_assembly(
-                        ass, args, run_root / f'{aid}_run')
+                    status, total, wall, components, extra = _run_assembly(
+                        ass, args, run_root / f'{aid}_run', split=(seq_optimizer == 'divide'))
                 finally:
-                    args.use_previous_sdf, args.planner, args.generator = _saved
+                    (args.use_previous_sdf, args.planner, args.generator,
+                     args.seq_optimizer) = _saved
                 record = {'id': aid, 'n_parts': len(ass.objects), 'status': status,
                           'total_s': total, 'components': components,
-                          'wall_s': wall, 'fingerprint': fingerprint}
+                          'wall_s': wall, 'fingerprint': fingerprint, **extra}
                 _write_json(record_path, record)
                 records[aid] = record
                 print(f'[optuna] {label} {aid}: {status}'
                       + (f'  total={total:.2f}s' if status == 'ok' else '')
+                      + (f'  split={extra["split"]}' if extra else '')
                       + f'  ({wall:.0f}s)')
             finally:
                 os.remove(str(lock))
@@ -666,7 +706,7 @@ def train_heuristic_weights(test_eval, args,
                     outcome = 'deadline'
                     study.stop()
                     break
-                status, total, _wall, _components = _run_assembly(ass, args, trial_dir / aid)
+                status, total, _wall, _components, _extra = _run_assembly(ass, args, trial_dir / aid)
                 per_status[aid] = status
                 per_total[aid] = total
                 if status != 'ok':
@@ -793,20 +833,40 @@ _SIZE_BANDS = ((5, 9), (10, 14), (15, 19), (20, 26), (27, None))
 # plans give equal times to the last digit.
 _TIE_LOG_RATIO = 1e-9
 
-# The planners compared on the test split: (label, planner, generator, what).
-# 'reference' is the heuristic planner with the reference weights (its runs
-# are the training baselines), 'trained' the same planner with the trained
-# weights, 'heur-out' the gen:heur-out baseline of data_assembly_time.
+# The planners compared on the test split:
+# (label, planner, generator, seq_optimizer, weights, what). 'reference' is the
+# heuristic planner with the reference weights (its runs are the training
+# baselines), 'trained' the same planner with the trained weights, 'heur-out'
+# the gen:heur-out baseline of data_assembly_time, 'trained+split' the trained
+# weights with the recursive subassembly plan (--seq-optimizer divide), scored
+# by the plan's own timing (plan_robot/split_timing.py) -- only with `split`.
 _EVAL_RUNS = (
-    ('reference', 'heuristic', 'rand', 'heuristic DFA planner, reference weights'),
-    ('trained', 'heuristic', 'rand', 'heuristic DFA planner, trained weights'),
-    ('heur-out', 'gen-adapter', 'heur-out', 'gen:heur-out baseline (heur-out generator)'),
+    ('reference', 'heuristic', 'rand', None, 'reference', 'heuristic DFA planner, reference weights'),
+    ('trained', 'heuristic', 'rand', None, 'trained', 'heuristic DFA planner, trained weights'),
+    ('heur-out', 'gen-adapter', 'heur-out', None, 'reference', 'gen:heur-out baseline (heur-out generator)'),
+    ('trained+split', 'heuristic', 'rand', 'divide', 'trained',
+     'trained weights + subassembly plan, timed as carried out'),
 )
 _EVAL_COMPARISONS = (('trained', 'reference'), ('trained', 'heur-out'), ('heur-out', 'reference'))
+# 'trained+divide' and 'trained+split-par' are no runs of their own but other
+# totals of the 'trained+split' run: its flat timing (the divide optimizer's
+# sequence without carrying out the split) and its parallel timing (S and R of
+# every split taken apart at once; plan_robot/split_timing.py). trained+split
+# vs trained+divide isolates the split, trained+divide vs trained the
+# optimizer's choice of sequence (the minimum-cost explored path instead of the
+# first one found).
+_SPLIT_COMPARISONS = (('trained+split', 'trained'), ('trained+split', 'trained+divide'),
+                      ('trained+divide', 'trained'), ('trained+split', 'reference'),
+                      ('trained+split', 'heur-out'),
+                      ('trained+split-par', 'trained+split'),
+                      ('trained+split-par', 'trained+divide'),
+                      ('trained+split-par', 'trained'), ('trained+split-par', 'reference'),
+                      ('trained+split-par', 'heur-out'))
 
 
 def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
-                               label='trained', time_budget_s=None):
+                               label='trained', time_budget_s=None, reference_only=False,
+                               split=False):
     """Test the weights in `weights_path` on `test_eval.assemblies` (held out
     from training) against two baselines: the heuristic planner with the
     reference weights, and gen:heur-out. Every run is planned and arm-timed
@@ -819,34 +879,57 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
     `<output_root>/eval_<label>/summary.{json,txt}` and returns the summary.
     `time_budget_s`: no run starts, and no waiting continues, after it; the
     summary then lists what was left out.
+
+    `reference_only`: plan only the two baselines (reference weights and
+    heur-out), which do not depend on training, and stop. A cluster run does
+    this on wide workers while training is still going, so the evaluation
+    proper only has the trained-weight runs left. Returns None.
+
+    `split`: also plan every assembly with the trained weights plus the
+    recursive subassembly plan ('trained+split', in `eval_<label>/split_runs/`)
+    and compare it with the other three. Its search replays the 'trained'
+    run's physics from the cache; the divide optimizer, the plan's
+    verification and the per-context checks of its timing are what it adds.
     """
     deadline = None if time_budget_s is None else time.time() + float(time_budget_s)
     cfg = _training_config()
     output_root = Path(output_root or 'assets/optuna_training')
+    reference = _pin(_reference_weights(), cfg['fixed_weights'])
+    if reference_only:
+        print(f'[eval] {len(test_eval.assemblies)} assemblies: reference and heur-out runs only')
+        with _pipeline_environment(args, output_root, cfg):
+            for name, planner, generator, seq_opt, which, _what in _EVAL_RUNS:
+                if which != 'reference':
+                    continue
+                run_dir = output_root / ('baselines' if name == 'reference' else name)
+                _ensure_runs(test_eval.assemblies, args, run_dir, reference, name,
+                             clear_sdf=(name == 'reference'), deadline=deadline,
+                             planner=planner, generator=generator, seq_optimizer=seq_opt)
+        return None
     with open(weights_path) as _f:
         loaded = json.load(_f)
     missing = [k for k in WEIGHT_KEYS if k not in loaded]
     if missing:
         raise ValueError(f'{weights_path} lacks weights {missing}')
     weights = {k: float(loaded[k]) for k in WEIGHT_KEYS}
-    reference = _pin(_reference_weights(), cfg['fixed_weights'])
     eval_dir = output_root / f'eval_{label}'
     print(f'[eval] {len(test_eval.assemblies)} assemblies; reference {reference}; '
           f'{label} {weights} (from {weights_path})')
 
     run_dirs = {'reference': output_root / 'baselines', 'trained': eval_dir / 'runs',
-                'heur-out': output_root / 'heur-out'}
-    run_weights = {'reference': reference, 'trained': weights, 'heur-out': reference}
+                'heur-out': output_root / 'heur-out', 'trained+split': eval_dir / 'split_runs'}
+    eval_runs = [r for r in _EVAL_RUNS if split or r[3] is None]
     runsets = {}
     with _pipeline_environment(args, output_root, cfg):
-        for name, planner, generator, _what in _EVAL_RUNS:
+        for name, planner, generator, seq_opt, which, _what in eval_runs:
             runsets[name] = _ensure_runs(
-                test_eval.assemblies, args, run_dirs[name], run_weights[name], name,
+                test_eval.assemblies, args, run_dirs[name],
+                reference if which == 'reference' else weights, name,
                 clear_sdf=(name == 'reference'), deadline=deadline,
-                planner=planner, generator=generator)
+                planner=planner, generator=generator, seq_optimizer=seq_opt)
 
     summary = _summarize_evaluation(test_eval.assemblies, runsets, reference, weights,
-                                    str(weights_path))
+                                    str(weights_path), eval_runs)
     _write_json(eval_dir / 'summary.json', summary)
     text = _format_evaluation(summary)
     (eval_dir / 'summary.txt').write_text(text)
@@ -863,7 +946,9 @@ def _compare(rows, a, b):
     """Paired comparison of run set `a` against `b` over the assemblies both
     planned completely: time ratio a/b, and which assemblies only one of them
     planned (the success side, kept out of the ratio)."""
-    paired = [r for r in rows if r['runs'][a]['status'] == 'ok' and r['runs'][b]['status'] == 'ok']
+    paired = [r for r in rows
+              if all(r['runs'][x]['status'] == 'ok' and r['runs'][x]['total_s'] is not None
+                     for x in (a, b))]
     ratios = [r['runs'][a]['total_s'] / r['runs'][b]['total_s'] for r in paired]
     logs = [math.log(x) for x in ratios]
     out = {
@@ -900,7 +985,9 @@ def _compare(rows, a, b):
             out['by_size'].append({'parts': f'{lo}-{hi}' if hi else f'{lo}+', 'n': len(band),
                                    'geomean_ratio': _geomean(band)})
     out['component_mean_s'] = {}
-    if paired:
+    # Only where both sides have a breakdown (the parallel total has none: it
+    # is not a sum of the components).
+    if paired and all(r['runs'][x]['components'] for r in paired for x in (a, b)):
         for comp in ('step_disassembly_s', 'transitions_s', 'base_travel_s',
                      'reorientation_s', 'hold_s'):
             out['component_mean_s'][comp] = {
@@ -909,18 +996,42 @@ def _compare(rows, a, b):
     return out
 
 
-def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path):
+def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, eval_runs):
     rows = []
     for ass in ass_list:
         aid = str(ass.id)
         runs = {}
-        for name, *_ in _EVAL_RUNS:
+        for name, *_ in eval_runs:
             rec = runsets[name].get(aid) or {}
             runs[name] = {'status': rec.get('status'), 'total_s': rec.get('total_s'),
                           'components': rec.get('components')}
+            if 'split' in rec:
+                runs[name].update({k: rec.get(k) for k in
+                                   ('split', 'n_joins', 'flat_total_s', 'failure',
+                                    'parallel_total_s')})
+                runs['trained+divide'] = {
+                    'status': rec.get('status'), 'total_s': rec.get('flat_total_s'),
+                    'components': rec.get('flat_components')}
+                # Without a usable plan there is nothing to parallelise: the
+                # flat time, as for trained+split.
+                runs['trained+split-par'] = {
+                    'status': rec.get('status'),
+                    'total_s': (rec.get('parallel_total_s') if rec.get('split') == 'used'
+                                else rec.get('total_s')),
+                    'components': None, 'split': rec.get('split')}
+            elif name == 'trained+split':
+                runs['trained+divide'] = {'status': rec.get('status'), 'total_s': None,
+                                          'components': None}
+                runs['trained+split-par'] = dict(runs['trained+divide'])
         rows.append({'id': aid, 'n_parts': len(ass.objects), 'runs': runs})
+    if any(r[0] == 'trained+split' for r in eval_runs):
+        eval_runs = list(eval_runs) + [
+            ('trained+split-par', None, None, None, None,
+             'the trained+split plan with S and R of every split taken apart in parallel'),
+            ('trained+divide', None, None, None, None,
+             'trained weights, divide optimizer\'s sequence timed flat (the trained+split run without the split)')]
     success = {}
-    for name, *_ in _EVAL_RUNS:
+    for name, *_ in eval_runs:
         statuses = [r['runs'][name]['status'] for r in rows]
         success[name] = {
             'ok': sum(s == 'ok' for s in statuses),
@@ -928,15 +1039,31 @@ def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path):
             'failed': [r['id'] for r, s in zip(rows, statuses) if s not in ('ok', 'excluded', None)],
             'not_run': [r['id'] for r, s in zip(rows, statuses) if s is None],
         }
-    return {
-        'runs': {name: what for name, _p, _g, what in _EVAL_RUNS},
+    names = [r[0] for r in eval_runs]
+    comparisons = [c for c in _EVAL_COMPARISONS + _SPLIT_COMPARISONS
+                   if c[0] in names and c[1] in names]
+    summary = {
+        'runs': {r[0]: r[-1] for r in eval_runs},
         'weights_path': weights_path,
         'reference_weights': reference,
         'weights': weights,
         'success': success,
-        'comparisons': {f'{a} vs {b}': _compare(rows, a, b) for a, b in _EVAL_COMPARISONS},
+        'comparisons': {f'{a} vs {b}': _compare(rows, a, b) for a, b in comparisons},
         'per_assembly': rows,
     }
+    if 'trained+split' in names:
+        # How often the subassembly plan was actually what got timed.
+        kinds = [r['runs']['trained+split'].get('split') for r in rows
+                 if r['runs']['trained+split']['status'] == 'ok']
+        summary['split_usage'] = {
+            'used': sum(k == 'used' for k in kinds),
+            'no_plan': sum(k == 'none' for k in kinds),
+            'infeasible': [r['id'] for r in rows
+                           if r['runs']['trained+split'].get('split') == 'infeasible'],
+            'untimed': [r['id'] for r in rows
+                        if r['runs']['trained+split'].get('split') == 'untimed'],
+        }
+    return summary
 
 
 def _format_evaluation(summary):
@@ -950,8 +1077,14 @@ def _format_evaluation(summary):
               f'trained weights:   {summary["weights"]}', '',
               f'{len(summary["per_assembly"])} assemblies; complete plans per planner:']
     for name, s in summary['success'].items():
-        lines.append(f'  {name:<10} ok {s["ok"]:>3}   precheck-excluded {s["excluded"]:>3}   '
+        lines.append(f'  {name:<13} ok {s["ok"]:>3}   precheck-excluded {s["excluded"]:>3}   '
                      f'failed {s["failed"]}' + (f'   not run (time budget) {s["not_run"]}' if s['not_run'] else ''))
+    if 'split_usage' in summary:
+        u = summary['split_usage']
+        lines.append(f'  trained+split timed as a subassembly plan on {u["used"]}; no plan found '
+                     f'on {u["no_plan"]}; plan not executable as told (flat time used) on '
+                     f'{len(u["infeasible"])} {u["infeasible"]}'
+                     + (f'; split timing missing on {u["untimed"]}' if u['untimed'] else ''))
     for key, c in summary['comparisons'].items():
         a, b = key.split(' vs ')
         lines += ['', f'{key}: time ratio {a}/{b} over {c["n_paired"]} assemblies both planned',
@@ -967,24 +1100,35 @@ def _format_evaluation(summary):
             + (f'   Wilcoxon p = {c["wilcoxon_p"]:.3g}' if c['wilcoxon_p'] is not None else ''),
             '  by part count: ' + ',  '.join(f'{x["parts"]} (n={x["n"]}) x{x["geomean_ratio"]:.3f}'
                                             for x in c['by_size']),
-            '  mean component time (s): ' + ',  '.join(
-                f'{comp[:-2]} {v[a]:.1f} vs {v[b]:.1f}' for comp, v in c['component_mean_s'].items()
-                if v[a] or v[b]),
         ]
-    head = f'{"id":<7}{"parts":>6}' + ''.join(f'{n + " s":>13}' for n in names)
-    head += f'{"trained/ref":>13}{"trained/h-o":>13}'
+        if c['component_mean_s']:
+            lines.append('  mean component time (s): ' + ',  '.join(
+                f'{comp[:-2]} {v[a]:.1f} vs {v[b]:.1f}' for comp, v in c['component_mean_s'].items()
+                if v[a] or v[b]))
+    ratio_cols = [('trained', 'reference', 'trained/ref'), ('trained', 'heur-out', 'trained/h-o')]
+    if 'trained+split' in names:
+        ratio_cols += [('trained+split', 'trained', 'split/trained'),
+                       ('trained+split', 'trained+divide', 'split/divide'),
+                       ('trained+split-par', 'trained+divide', 'par/divide')]
+    width = {n: max(13, len(n) + 3) + 2 for n in names}
+    head = f'{"id":<7}{"parts":>6}' + ''.join(f'{n + " s":>{width[n]}}' for n in names)
+    head += ''.join(f'{label:>14}' for _a, _b, label in ratio_cols)
     lines += ['', head]
     for r in summary['per_assembly']:
         cells = []
         for n in names:
             run = r['runs'][n]
-            cells.append(f'{run["total_s"]:13.2f}' if run['status'] == 'ok'
-                         else f'{(run["status"] or "not run")[:12]:>13}')
-        t = r['runs']['trained']
+            mark = {'used': ' S', 'none': ' -', 'infeasible': ' !', 'untimed': ' ?'}.get(run.get('split'), '')
+            cells.append(f'{run["total_s"]:{width[n] - 2}.2f}{mark:<2}' if run['status'] == 'ok'
+                         and run['total_s'] is not None
+                         else f'{(run["status"] or "not run")[:width[n] - 1]:>{width[n]}}')
         ratios = []
-        for other in ('reference', 'heur-out'):
-            o = r['runs'][other]
-            ratios.append(f'{"x%.3f" % (t["total_s"] / o["total_s"]):>13}'
-                          if t['status'] == 'ok' and o['status'] == 'ok' else f'{"-":>13}')
+        for a, b, _label in ratio_cols:
+            ra, rb = r['runs'][a], r['runs'][b]
+            ratios.append(f'{"x%.3f" % (ra["total_s"] / rb["total_s"]):>14}'
+                          if ra['status'] == 'ok' and rb['status'] == 'ok' else f'{"-":>14}')
         lines.append(f'{r["id"]:<7}{r["n_parts"]:>6}' + ''.join(cells) + ''.join(ratios))
+    if 'trained+split' in names:
+        lines.append('(trained+split: S = timed as a subassembly plan, - = no plan found, '
+                     '! = plan not executable as told, flat time used)')
     return '\n'.join(lines) + '\n'
