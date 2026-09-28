@@ -312,6 +312,11 @@ def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc,
         stats = planner.get_stats(tree)
         if getattr(planner, 'sim_cache_summary', None):
             stats['sim_cache'] = planner.sim_cache_summary
+        # Parts the initial-pose precheck let fall and every later stability
+        # check ignores (settings.max_initial_held_parts); the subassembly
+        # timing re-runs stability checks and must ignore the same ones.
+        stats['ignored_unstable_parts'] = sorted(
+            str(p) for p in (getattr(planner, '_ignored_unstable_parts', None) or ()))
 
         # Integrated sequence selection + divide-optimizer split probe.
         # The chosen sequence replaces stats['sequence']; the split is purely

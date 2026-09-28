@@ -909,7 +909,10 @@ class SequencePlanner:
         '''
         if self.base_part is not None:
             return [], frozenset(), []
-        debug_dir = os.path.join(log_dir, 'precheck_poses') if log_dir is not None else None
+        # The per-pose screenshots are media: a timing-only run
+        # (settings.render_gifs off) skips them.
+        debug_dir = (os.path.join(log_dir, 'precheck_poses')
+                     if log_dir is not None and getattr(settings, 'render_gifs', True) else None)
         # settings.debug_stability turns on per-pose gravity-sim replays.
         # Paths under <log_dir>/precheck_stability/ — produced by reusing the
         # sim's already-populated state history, so no re-simulation.
@@ -943,8 +946,6 @@ class SequencePlanner:
             if len(node) == 2 and node_info['n_gripper'] is not None:
                 node_expand_list.append(node)
 
-        G0 = self.parts.copy()
-
         # Use a monotonic counter past any existing n_eval. Parallel DFA shares
         # n_eval across a whole batch of siblings, so multiple 2-part leaves can
         # carry identical n_eval; when several of them expand to the same 1-part
@@ -952,42 +953,7 @@ class SequencePlanner:
         next_n_eval = max((tree.nodes[n]['n_eval'] for n in tree.nodes), default=0) + 1
 
         for node in node_expand_list:
-            part_a, part_b = node
-            mass_a, mass_b = self.part_mass[part_a], self.part_mass[part_b]
-            # Primary role assignment: lighter part moves, heavier stays fixed.
-            primary_fix, primary_move = (part_a, part_b) if mass_a > mass_b else (part_b, part_a)
-            # Try both role assignments before giving up. The mass-based pick is
-            # usually right (less inertia on the gripper actuating the move) but
-            # for some geometries the only feasible separation direction is
-            # blocked under the primary assignment (e.g. settings.filter_below_ground
-            # rejects every pose because the lighter part naturally extracts
-            # downward in all stable orientations). Swapping roles is cheap and
-            # catches those cases. Skip the swap when one of the two is the
-            # base_part (it must remain fixed by definition).
-            role_pairs = [(primary_fix, primary_move)]
-            if self.base_part is None:
-                role_pairs.append((primary_move, primary_fix))
-            else:
-                # base_part must be fixed; flip to enforce it if the mass heuristic
-                # chose otherwise. No further swap to try.
-                if primary_move == self.base_part:
-                    role_pairs = [(primary_move, primary_fix)]
-
-            parts_removed = [part for part in G0 if part != part_a and part != part_b]
-            poses = tree.nodes[tuple(node)]['poses'][:pose_reuse]
-            node_mesh = get_combined_mesh(self.assembly_dir, node)
-            fresh = get_stable_poses(node_mesh, max_num=max_poses - pose_reuse)
-            # Same proximity-prefer pass as in plan(): when the parent step's
-            # pose is known, order fresh stable poses closest-first.
-            parent_pose = self._parent_pose_for(tree, node)
-            if parent_pose is not None and len(fresh) > 1:
-                fresh = self._sort_poses_by_proximity(fresh, parent_pose)
-            poses.extend(fresh)
-            if self.base_part is not None:
-                poses = [None]
-            elif len(poses) == 0:
-                poses = [translation_pose_to_ground(node_mesh)]
-
+            role_pairs, parts_removed, poses = self._leaf_candidates(tree, node, max_poses, pose_reuse)
             matched = False
             for part_fix, part_move in role_pairs:
                 for pose in poses:
@@ -999,6 +965,49 @@ class SequencePlanner:
                         break
                 if matched:
                     break
+
+    def _leaf_candidates(self, tree, node, max_poses, pose_reuse):
+        """What _expand_leaf tries for a 2-part node, in the order it tries
+        them: (role_pairs, parts_removed, poses), each (part_fix, part_move)
+        role pair being checked with every pose, and the first feasible
+        (role pair, pose) taken."""
+        G0 = self.parts.copy()
+        part_a, part_b = node
+        mass_a, mass_b = self.part_mass[part_a], self.part_mass[part_b]
+        # Primary role assignment: lighter part moves, heavier stays fixed.
+        primary_fix, primary_move = (part_a, part_b) if mass_a > mass_b else (part_b, part_a)
+        # Try both role assignments before giving up. The mass-based pick is
+        # usually right (less inertia on the gripper actuating the move) but
+        # for some geometries the only feasible separation direction is
+        # blocked under the primary assignment (e.g. settings.filter_below_ground
+        # rejects every pose because the lighter part naturally extracts
+        # downward in all stable orientations). Swapping roles is cheap and
+        # catches those cases. Skip the swap when one of the two is the
+        # base_part (it must remain fixed by definition).
+        role_pairs = [(primary_fix, primary_move)]
+        if self.base_part is None:
+            role_pairs.append((primary_move, primary_fix))
+        else:
+            # base_part must be fixed; flip to enforce it if the mass heuristic
+            # chose otherwise. No further swap to try.
+            if primary_move == self.base_part:
+                role_pairs = [(primary_move, primary_fix)]
+
+        parts_removed = [part for part in G0 if part != part_a and part != part_b]
+        poses = tree.nodes[tuple(node)]['poses'][:pose_reuse]
+        node_mesh = get_combined_mesh(self.assembly_dir, node)
+        fresh = get_stable_poses(node_mesh, max_num=max_poses - pose_reuse)
+        # Same proximity-prefer pass as in plan(): when the parent step's
+        # pose is known, order fresh stable poses closest-first.
+        parent_pose = self._parent_pose_for(tree, node)
+        if parent_pose is not None and len(fresh) > 1:
+            fresh = self._sort_poses_by_proximity(fresh, parent_pose)
+        poses.extend(fresh)
+        if self.base_part is not None:
+            poses = [None]
+        elif len(poses) == 0:
+            poses = [translation_pose_to_ground(node_mesh)]
+        return role_pairs, parts_removed, poses
 
     @staticmethod
     def plot_tree(tree, save_path=None):

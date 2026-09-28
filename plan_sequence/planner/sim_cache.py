@@ -93,17 +93,16 @@ def _config_hash(extra):
 
 
 class SimCache:
-    """Cache for one plan of one assembly. `key()` identifies a candidate
-    check by the per-task inputs; the planner-level inputs are fixed per plan
-    and go into the directory's config hash."""
+    """Cache for one plan of one assembly. `key()` identifies a record by its
+    per-task inputs; `fields` are the inputs fixed for the whole plan (the
+    planner configuration, or what kind of record it is, e.g. the initial
+    precheck) and go into the directory's config hash, so records made under
+    different ones never mix. Values must be hashable by repr, e.g. an
+    ignore list as a sorted tuple."""
 
-    def __init__(self, root, assembly_dir, base_part, max_grippers, optimizer,
-                 allow_gap, get_dof, skip_stability, ignore_unstable):
+    def __init__(self, root, assembly_dir, **fields):
         assembly_dir = os.path.abspath(assembly_dir)
-        planner_fields = (
-            base_part, max_grippers, optimizer, bool(allow_gap), bool(get_dof),
-            bool(skip_stability), tuple(sorted(str(p) for p in (ignore_unstable or ()))),
-        )
+        planner_fields = tuple(sorted((k, repr(v)) for k, v in fields.items()))
         # Keyed by geometry, not by directory: data_assembly_time plans the same
         # subassembly out of a different temp dir in each RUN.
         geometry_dir = Path(root) / _geometry_hash(assembly_dir)[:16]
@@ -136,10 +135,15 @@ class SimCache:
             return
 
     @staticmethod
-    def key(part_move, parts_rest, pose):
+    def key(part_move, parts_rest, pose, extra=None):
+        """`extra`: inputs that differ between records of one plan besides
+        the part, the remaining parts and the pose (e.g. the leaf expansion's
+        gripper budget)."""
         pose_key = (None if pose is None
                     else np.ascontiguousarray(pose, dtype=np.float64).tobytes())
         fields = (part_move, tuple(parts_rest), pose_key)
+        if extra is not None:
+            fields += (extra,)
         return hashlib.sha1(pickle.dumps(fields, protocol=4)).hexdigest()
 
     def get(self, key):

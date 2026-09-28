@@ -12,6 +12,45 @@ from utils.parallel import parallel_execute
 import settings
 
 
+def candidate_poses(assembly_dir, parts, parent_pose, max_num, reused=()):
+    """The poses a candidate check is tried in, in trial order, for the body
+    made of `parts`: `reused` ones first, then up to `max_num` stable poses of
+    the body -- closest to `parent_pose` first when there is one -- with
+    `parent_pose` itself put in front unless already present (so the body
+    stays put whenever the step allows it). [None] when there is nothing.
+    Shared by the DFA search and the subassembly timing
+    (plan_robot/split_timing.py), which must pick poses the same way."""
+    poses = list(reused)
+    fresh = get_stable_poses(get_combined_mesh(assembly_dir, list(parts)), max_num=max_num)
+    # When multiple fresh stable poses are returned for this subassembly,
+    # prefer the orientation closest to the parent step's pose so the
+    # operator doesn't have to re-orient between consecutive steps unless
+    # the geometry actually demands it. No effect at the root (no parent).
+    if parent_pose is not None and len(fresh) > 1:
+        fresh = SequencePlanner._sort_poses_by_proximity(fresh, parent_pose)
+    poses.extend(fresh)
+    # Add the parent step's pose as an extra candidate (one more than
+    # max_poses by design). The robot otherwise has to re-orient between
+    # consecutive steps whenever the trimesh stable-pose list for this
+    # subassembly doesn't happen to land on the parent's orientation;
+    # explicitly probing the parent pose lets the planner keep the
+    # assembly stationary when assemblability + stability still hold for
+    # the child. Inserted at the front so per-edge sort orders (which
+    # break ties by proximity to parent_pose) pick it first when feasible.
+    # Deduped against existing candidates by a small angular tolerance.
+    if parent_pose is not None:
+        eps = 1e-3
+        already_present = any(
+            SequencePlanner._rotation_angle_between(parent_pose, p) < eps
+            for p in poses if p is not None
+        )
+        if not already_present:
+            poses.insert(0, parent_pose)
+    if not poses:
+        poses = [None]
+    return poses
+
+
 class DFASequencePlanner(SequencePlanner):
 
     G_path = None
@@ -308,42 +347,148 @@ class DFASequencePlanner(SequencePlanner):
                 mark = ' ★' if g_prime_key in next_set else '  '
                 print(f'    {str(part):<20}  {dt_p:>7}  {dt_s:>7}  {stab:<22}  {score_str}  {mark}')
 
+    def _record_check(self, sim_info, count=True):
+        """Book one candidate check's worker timings (the `_dt_*` fields,
+        popped here) into the timing buckets, and, with `count`, into the
+        assembly / stability success counters. A result replayed from the sim
+        cache carries no timings and adds nothing to the buckets."""
+        if count:
+            self._n_assembly_checks += 1
+        dt_path = sim_info.pop('_dt_path', None)
+        if dt_path is not None:
+            self._timing['path_finding'] += dt_path
+            self._timing_counts['path_finding'] += 1
+        dt_stab = sim_info.pop('_dt_stab', None)
+        dt_tool = sim_info.pop('_dt_tool', None)
+        dt_build = sim_info.pop('_dt_build', None)
+        dt_dof = sim_info.pop('_dt_dof', None)
+        for _dt, _bucket in ((dt_build, 'sim_build'), (dt_dof, 'dof')):
+            if _dt is not None:
+                self._timing[_bucket] += _dt
+                self._timing_counts[_bucket] += 1
+        # Attribute the whole worker cost of this candidate to the part it
+        # tried to remove.
+        _part = str(sim_info.get('part_move'))
+        _cost = sum(
+            float(x)
+            for x in (dt_path, dt_stab, dt_tool, dt_build, dt_dof)
+            if x is not None
+        )
+        self._timing_by_part[_part] += _cost
+        self._timing_by_part_counts[_part] += 1
+        if sim_info['action'] is not None:
+            if count:
+                self._n_assembly_success += 1
+                self._n_stability_checks += 1
+            if dt_stab is not None:
+                self._timing['stability_check'] += dt_stab
+                self._timing_counts['stability_check'] += 1
+            if count and sim_info['parts_fix'] is not None:
+                self._n_stability_success += 1
+        if dt_tool is not None:
+            self._timing['tool_check'] += dt_tool
+            self._timing_counts['tool_check'] += 1
+
+    def _sim_cache_eligible(self, timeout, n_success_term, render):
+        # Replaying is exact only when a check's result does not depend on
+        # timing or on side outputs: not with a timeout, a per-parent success
+        # quota (which tasks finish before the quota trips depends on timing),
+        # tools or rendering.
+        return (self.sim_cache_dir is not None and timeout is None
+                and n_success_term is None and not self.tools and not render)
+
+    def _initial_stable_poses_cached(self, parts, max_poses, log_dir):
+        """_initial_stable_poses through the sim cache when it is on: the
+        precheck depends on the geometry, the candidate count and the
+        physics, never on the planner or its weights."""
+        from .sim_cache import SimCache
+        cache = SimCache(self.sim_cache_dir, self.assembly_dir, kind='initial_precheck',
+                         max_poses=max_poses, allow_gap=bool(self.allow_gap))
+        key = SimCache.key('precheck', parts, None)
+        hit = cache.get(key)
+        if hit is not None:
+            print('[DFA.plan] initial precheck replayed from the sim cache')
+            return hit['poses'], frozenset(hit['observed_fallen']), hit['per_pose']
+        poses, observed_fallen, per_pose = self._initial_stable_poses(parts, max_poses, log_dir=log_dir)
+        cache.put(key, {'poses': poses, 'observed_fallen': sorted(observed_fallen),
+                        'per_pose': per_pose})
+        cache.close()
+        return poses, observed_fallen, per_pose
+
+    def _expand_leaf(self, tree, max_poses, pose_reuse, grasp_planner, optimizer, debug, render):
+        """Parallel, cached version of SequencePlanner._expand_leaf. The base
+        version checks every 2-part node's candidates one at a time in the
+        main process and takes the first feasible (role pair, pose) per node;
+        with the search itself replayed from the sim cache, those serial
+        checks were most of a plan's wall time. Here every candidate goes
+        through the worker pool (cached ones skip it) and each node takes the
+        first feasible candidate in the same order, so the tree is the one the
+        base version builds."""
+        if grasp_planner is not None or self.num_proc <= 1:
+            return super()._expand_leaf(tree, max_poses, pose_reuse, grasp_planner,
+                                        optimizer, debug, render)
+        nodes = [n for n in tree.nodes if len(n) == 2 and tree.nodes[n]['n_gripper'] is not None]
+        if not nodes:
+            return
+        # Same counter as the base version: past every existing n_eval.
+        next_n_eval = max((tree.nodes[n]['n_eval'] for n in tree.nodes), default=0) + 1
+
+        tasks = []  # (node_idx, part_fix, part_move, parts_removed, pose), in trial order
+        for ni, node in enumerate(nodes):
+            role_pairs, parts_removed, poses = self._leaf_candidates(tree, node, max_poses, pose_reuse)
+            for part_fix, part_move in role_pairs:
+                for pose in poses:
+                    tasks.append((ni, part_fix, part_move, parts_removed, pose))
+
+        cache = getattr(self, '_sim_cache', None)
+        # The leaf check runs with a 2-gripper budget, the search with the
+        # plan's; keep their records apart.
+        keys = [cache.key(pm, [pf], pose, extra=('leaf', 2)) if cache is not None else None
+                for _ni, pf, pm, _pr, pose in tasks]
+        results = {}
+        pending = []
+        for k, (ni, part_fix, part_move, parts_removed, pose) in enumerate(tasks):
+            cached = cache.get(keys[k]) if cache is not None else None
+            if cached is not None:
+                results[k] = cached
+                continue
+            pending.append((
+                self.asset_folder, self.assembly_dir, self.save_sdf, self.base_part,
+                part_move, [part_fix], parts_removed, pose, 2,
+                # allow_gap False: the base version's _simulate never passes it
+                # to the stability check, and the tree must come out the same.
+                None, optimizer, max(debug - 2, 0), render, False, self.get_dof,
+                self.tools, self.skip_stability, self._ignored_unstable_parts,
+                (ni, k),
+            ))
+        for sim_info, arg in parallel_execute(
+            _simulate_standalone_tagged, pending, self.num_proc,
+            show_progress=debug > 0, desc='DFA leaf expansion', return_args=True,
+        ):
+            _ni, k = arg[-1]
+            sim_info.pop('_task_tag', None)
+            if cache is not None:
+                cache.put(keys[k], sim_info)
+            self._record_check(sim_info, count=False)
+            results[k] = sim_info
+
+        for ni, node in enumerate(nodes):
+            for k, (tni, part_fix, _pm, _pr, _pose) in enumerate(tasks):
+                if tni == ni and results.get(k) is not None and results[k]['feasible']:
+                    super()._update_tree(tree, list(node), [part_fix], next_n_eval, results[k])
+                    next_n_eval += 1
+                    break
+
     def _compute_poses(self, tree, G, max_poses, pose_reuse):
         if self.base_part is not None:
             return [None]
-        poses = list(tree.nodes[tuple(G)]['poses'][:pose_reuse])
-        G_mesh = get_combined_mesh(self.assembly_dir, G)
         _t0 = time()
-        fresh = get_stable_poses(G_mesh, max_num=max_poses - pose_reuse)
+        poses = candidate_poses(
+            self.assembly_dir, G, self._parent_pose_for(tree, G), max_poses - pose_reuse,
+            reused=tree.nodes[tuple(G)]['poses'][:pose_reuse],
+        )
         self._timing['stable_pose'] += time() - _t0
         self._timing_counts['stable_pose'] += 1
-        # When multiple fresh stable poses are returned for this subassembly,
-        # prefer the orientation closest to the parent step's pose so the
-        # operator doesn't have to re-orient between consecutive steps unless
-        # the geometry actually demands it. No effect at the root (no parent).
-        parent_pose = self._parent_pose_for(tree, G)
-        if parent_pose is not None and len(fresh) > 1:
-            fresh = self._sort_poses_by_proximity(fresh, parent_pose)
-        poses.extend(fresh)
-        # Add the parent step's pose as an extra candidate (one more than
-        # max_poses by design). The robot otherwise has to re-orient between
-        # consecutive steps whenever the trimesh stable-pose list for this
-        # subassembly doesn't happen to land on the parent's orientation;
-        # explicitly probing the parent pose lets the planner keep the
-        # assembly stationary when assemblability + stability still hold for
-        # the child. Inserted at the front so per-edge sort orders (which
-        # break ties by proximity to parent_pose) pick it first when feasible.
-        # Deduped against existing candidates by a small angular tolerance.
-        if parent_pose is not None:
-            eps = 1e-3
-            already_present = any(
-                self._rotation_angle_between(parent_pose, p) < eps
-                for p in poses if p is not None
-            )
-            if not already_present:
-                poses.insert(0, parent_pose)
-        if not poses:
-            poses = [None]
         return poses
 
     def _update_tree(self, tree, parts_parent, parts_child, n_eval, sim_info):
@@ -431,7 +576,12 @@ class DFASequencePlanner(SequencePlanner):
             observed_fallen = frozenset()
         else:
             _t_pre = time()
-            initial_poses, observed_fallen, _per_pose = self._initial_stable_poses(G0, max_poses, log_dir=log_dir)
+            if self._sim_cache_eligible(timeout, n_success_term, render):
+                initial_poses, observed_fallen, _per_pose = self._initial_stable_poses_cached(
+                    G0, max_poses, log_dir)
+            else:
+                initial_poses, observed_fallen, _per_pose = self._initial_stable_poses(
+                    G0, max_poses, log_dir=log_dir)
             # Wall-clock, not worker CPU: the precheck is its own phase and was
             # previously invisible, silently inflating the other buckets.
             self._timing['initial_precheck'] += time() - _t_pre
@@ -522,15 +672,20 @@ class DFASequencePlanner(SequencePlanner):
         # so it stays off with a timeout, a per-parent success quota (which tasks
         # finish before the quota trips depends on timing), tools or rendering.
         sim_cache = None
+        self._sim_cache = None
         self.sim_cache_summary = None
         if self.sim_cache_dir is not None:
-            if timeout is None and n_success_term is None and not self.tools and not render:
+            if self._sim_cache_eligible(timeout, n_success_term, render):
                 from .sim_cache import SimCache
                 sim_cache = SimCache(
-                    self.sim_cache_dir, self.assembly_dir, self.base_part, max_grippers,
-                    optimizer, self.allow_gap, self.get_dof, self.skip_stability,
-                    self._ignored_unstable_parts,
+                    self.sim_cache_dir, self.assembly_dir, base_part=self.base_part,
+                    max_grippers=max_grippers, optimizer=optimizer,
+                    allow_gap=bool(self.allow_gap), get_dof=bool(self.get_dof),
+                    skip_stability=bool(self.skip_stability),
+                    ignore_unstable=tuple(sorted(str(p) for p in self._ignored_unstable_parts)),
                 )
+                # _expand_leaf, called from inside the loop below, uses it too.
+                self._sim_cache = sim_cache
                 print(f'[DFA.plan] sim cache: {sim_cache.dir} '
                       f'({sim_cache.summary()["entries_loaded"]} entries)')
             else:
@@ -696,40 +851,7 @@ class DFASequencePlanner(SequencePlanner):
 
                 # Accumulate per-check counts/timings (worker-side timings are stripped here).
                 for sim_info, _, _ in received:
-                    self._n_assembly_checks += 1
-                    dt_path = sim_info.pop('_dt_path', None)
-                    if dt_path is not None:
-                        self._timing['path_finding'] += dt_path
-                        self._timing_counts['path_finding'] += 1
-                    dt_stab = sim_info.pop('_dt_stab', None)
-                    dt_tool = sim_info.pop('_dt_tool', None)
-                    dt_build = sim_info.pop('_dt_build', None)
-                    dt_dof = sim_info.pop('_dt_dof', None)
-                    for _dt, _bucket in ((dt_build, 'sim_build'), (dt_dof, 'dof')):
-                        if _dt is not None:
-                            self._timing[_bucket] += _dt
-                            self._timing_counts[_bucket] += 1
-                    # Attribute the whole worker cost of this candidate to the
-                    # part it tried to remove.
-                    _part = str(sim_info.get('part_move'))
-                    _cost = sum(
-                        float(x)
-                        for x in (dt_path, dt_stab, dt_tool, dt_build, dt_dof)
-                        if x is not None
-                    )
-                    self._timing_by_part[_part] += _cost
-                    self._timing_by_part_counts[_part] += 1
-                    if sim_info['action'] is not None:
-                        self._n_assembly_success += 1
-                        self._n_stability_checks += 1
-                        if dt_stab is not None:
-                            self._timing['stability_check'] += dt_stab
-                            self._timing_counts['stability_check'] += 1
-                        if sim_info['parts_fix'] is not None:
-                            self._n_stability_success += 1
-                    if dt_tool is not None:
-                        self._timing['tool_check'] += dt_tool
-                        self._timing_counts['tool_check'] += 1
+                    self._record_check(sim_info)
 
                 # Bucket results by parent_idx.
                 received_by_parent = defaultdict(list)  # parent_idx -> [(sim_info, real_arg)]
@@ -860,6 +982,7 @@ class DFASequencePlanner(SequencePlanner):
             print(e, f'from {self.assembly_dir}')
             print(traceback.format_exc())
         finally:
+            self._sim_cache = None
             if sim_cache is not None:
                 sim_cache.close()
                 self.sim_cache_summary = sim_cache.summary()
