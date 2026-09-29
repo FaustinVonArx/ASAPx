@@ -227,36 +227,54 @@ def resolve_split_steps(asset_folder, assembly_dir, plan, split_steps, *, max_po
     return steps, failure
 
 
-def parallel_makespan(plan, steps, overview):
-    """Time of the plan when S and R of every split are taken apart at once
-    by separate workers: a split block takes its own steps (prefix + join)
-    plus max(S, R), recursively. Step times are the sequential ones from
-    `overview`, except that the first step of an R block travels from the join
-    (its 'parallel_from_centroid') instead of from where S ended. Returns
-    {'total_s', 'per_block_s'}."""
+def parallel_makespan(plan, steps, overview, workers=None):
+    """Time of the plan when S and R of a split are taken apart at once by
+    separate workers: a split block takes its own steps (prefix + join) plus
+    max(S, R). Step times are the sequential ones from `overview`, except that
+    the first step of an R block taken apart in parallel travels from the join
+    (its 'parallel_from_centroid') instead of from where S ended.
+
+    `workers`: how many there are. None = as many as the plan can use (every
+    split, at every depth, in parallel). With k, a split block's workers are
+    shared out between its halves (ceil(k/2) to S, the rest to R), and a half
+    left with one worker is taken apart sequentially, nested splits included:
+    2 workers take S and R of the outermost split at once and nothing else.
+    Returns {'total_s', 'per_block_s', 'workers'}."""
     from plan_robot.arm_pipeline import _arc_travel
 
     per_step = overview['per_step']
     center = overview.get('assembly_center') or [0.0, 0.0, 0.0]
     velocity = max(float(overview.get('base_travel_velocity', 1.0)), 1e-9)
-    step_time = []
+    seq_time, par_time = [], []
     for st, entry in zip(steps, per_step):
         t = float(entry['total_s'])
+        seq_time.append(t)
         if 'parallel_from_centroid' in st and st.get('part_centroid_world') is not None:
             arc, _ = _arc_travel(st['parallel_from_centroid'], st['part_centroid_world'], center)
             t += arc / velocity - float(entry['base_travel_s'])
-        step_time.append(t)
+        par_time.append(t)
 
     per_block = {}
 
-    def block_time(block):
-        own = sum(t for st, t in zip(steps, step_time) if st.get('block') == list(block['path']))
+    def own_steps(block, parallel_start):
+        # A block's own steps (prefix, join); its first step travels from the
+        # join only when it is an R half started by a worker of its own.
+        times = par_time if parallel_start else seq_time
+        return sum(t for st, t in zip(steps, times) if st.get('block') == list(block['path']))
+
+    def block_time(block, k, parallel_start=False):
+        own = own_steps(block, parallel_start)
         if block['kind'] == 'split':
-            own += max(block_time(block['S']), block_time(block['R']))
+            if k is None or k >= 2:
+                k_s = None if k is None else (k + 1) // 2
+                k_r = None if k is None else k // 2
+                own += max(block_time(block['S'], k_s), block_time(block['R'], k_r, True))
+            else:
+                own += block_time(block['S'], 1) + block_time(block['R'], 1)
         per_block['.'.join(block['path']) or 'root'] = own
         return own
 
-    return {'total_s': block_time(plan), 'per_block_s': per_block}
+    return {'total_s': block_time(plan, workers), 'per_block_s': per_block, 'workers': workers}
 
 
 def time_split_plan(planner_asset_folder, arm_asset_folder, assembly_dir, stats, setup,
@@ -292,6 +310,7 @@ def time_split_plan(planner_asset_folder, arm_asset_folder, assembly_dir, stats,
         overview = time_steps_simplified(arm_asset_folder, assembly_dir, steps,
                                          gripper_type, gripper_scale, num_proc=num_proc)
         overview['parallel'] = parallel_makespan(plan, steps, overview)
+        overview['parallel_2'] = parallel_makespan(plan, steps, overview, workers=2)
         overview['status'] = 'ok'
     overview['n_joins'] = n_joins
     overview['split_sequence_source'] = stats.get('split_sequence_source')

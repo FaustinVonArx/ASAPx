@@ -334,6 +334,7 @@ def _assess_run(storage_dir, ass, split=False):
         return 'ok', float(total), timing['totals'], extra
     extra['split'] = 'used'
     extra['parallel_total_s'] = (split_timing.get('parallel') or {}).get('total_s')
+    extra['parallel2_total_s'] = (split_timing.get('parallel_2') or {}).get('total_s')
     return 'ok', float(split_timing['totals']['total_s']), split_timing['totals'], extra
 
 
@@ -1695,14 +1696,16 @@ def _aggregate_random(ass_list, runsets, seeds):
                        'total_s': r.get('total_s') if r else None} for k, r in per],
         }
     return out
-# 'trained+divide' and 'trained+split-par' are no runs of their own but other
-# totals of the 'trained+split' run: its flat timing (the divide optimizer's
-# sequence without carrying out the split) and its parallel timing (S and R of
-# every split taken apart at once; plan_robot/split_timing.py). trained+split
-# vs trained+divide isolates the split, trained+divide vs trained the
-# optimizer's choice of sequence (the minimum-cost explored path instead of the
-# first one found).
-_SPLIT_COMPARISONS = (('trained+split', 'trained'), ('trained+split', 'trained+divide'),
+# 'trained+divide', 'trained+split-2w' and 'trained+split-par' are no runs of
+# their own but other totals of the 'trained+split' run: its flat timing (its
+# sequence without carrying out the split), its time with two workers (S and R
+# of the outermost split at once) and with as many as the plan can use (every
+# split, at every depth; plan_robot/split_timing.parallel_makespan).
+# trained+split vs trained+divide isolates the split.
+_SPLIT_COMPARISONS = (('trained+split-2w', 'trained'), ('trained+split-2w', 'reference'),
+                      ('trained+split-2w', 'heur-out'), ('trained+split-2w', 'trained+split'),
+                      ('trained+split', 'random'), ('trained+split-2w', 'random'),
+                      ('trained+split', 'trained'), ('trained+split', 'trained+divide'),
                       ('trained+divide', 'trained'), ('trained+split', 'reference'),
                       ('trained+split', 'heur-out'),
                       ('trained+split-par', 'trained+split'),
@@ -1713,7 +1716,8 @@ _SPLIT_COMPARISONS = (('trained+split', 'trained'), ('trained+split', 'trained+d
 
 def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
                                label='trained', time_budget_s=None, reference_only=False,
-                               split=False, store=None, random_seeds=0):
+                               split=False, store=None, random_seeds=0,
+                               reference_first=False, wait_for_others=True):
     """Test the weights in `weights_path` on `test_eval.assemblies` (held out
     from training) against two baselines: the heuristic planner with the
     reference weights, and gen:heur-out. Every run is planned and arm-timed
@@ -1742,10 +1746,20 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
 
     `random_seeds` (k > 0): also plan every assembly k times with random
     decisions ('dfa-random': the same search, the next frontier drawn at
-    random; seeds 0..k-1), and with the reference weights but no sequence
-    selection ('reference-first'), and compare them: is the heuristic better
-    than chance, and how much of that is the ranking vs the selection. The
+    random; seeds 0..k-1) and compare: is a planner better than chance. The
     random run of an assembly is the geometric mean of its complete seeds.
+    `reference_first`: also the reference weights without sequence selection
+    ('reference-first'): how much is the ranking vs the selection.
+
+    Work goes assembly by assembly in the given order, so a run cut short by
+    its time limit leaves whole assemblies, not a planner's column. Within an
+    assembly, the reference run comes first (it regenerates the SDFs the
+    others read), trained before trained+split (each replays the one before
+    from the candidate-check cache); a run whose predecessor is still being
+    planned elsewhere is left for later instead of planned cold beside it.
+    `wait_for_others=False`: return once nothing is left that this process
+    can claim, instead of waiting for the runs other processes hold (a large
+    job array, followed by one summary pass).
     """
     deadline = None if time_budget_s is None else time.time() + float(time_budget_s)
     cfg = _training_config()
@@ -1780,9 +1794,10 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
     eval_runs = [r for r in _EVAL_RUNS if split or r[3] is None]
     overrides = {}
     seeds = list(range(int(random_seeds or 0)))
-    if seeds:
+    if reference_first:
         eval_runs.append(_REFERENCE_FIRST_RUN)
         overrides['reference-first'] = ({}, {'sequence_selection': 'first'})
+    if seeds:
         for k in seeds:
             eval_runs.append((f'random#{k}', 'dfa-random', 'rand', None, 'reference',
                               f'random decisions, seed {k}'))
@@ -1794,17 +1809,49 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
     priority = {'reference': 0, 'reference-first': 1, 'trained': 2, 'trained+split': 3,
                 'heur-out': 99}
     ordered = sorted(eval_runs, key=lambda r: priority.get(r[0], 50))
-    runsets = {}
+    runsets = {r[0]: {} for r in ordered}
+
+    def prerequisite(name):
+        if name == 'reference':
+            return None
+        return {'trained+split': 'trained'}.get(name, 'reference')
+
+    def claim(run, ass):
+        name, planner, generator, seq_opt, which, _what = run
+        arg_over, set_over = overrides.get(name, ({}, {}))
+        got = _ensure_runs(
+            [ass], args, store, reference if which == 'reference' else weights, name,
+            clear_sdf=(name == 'reference'), deadline=deadline,
+            planner=planner, generator=generator, seq_optimizer=seq_opt,
+            wait=False, arg_overrides=arg_over, setting_overrides=set_over)
+        runsets[name].update(got)
+        return bool(got)
+
     with _pipeline_environment(args, store, cfg):
-        for wait in (False, True):
-            for name, planner, generator, seq_opt, which, _what in ordered:
-                arg_over, set_over = overrides.get(name, ({}, {}))
-                runsets[name] = _ensure_runs(
-                    test_eval.assemblies, args, store,
-                    reference if which == 'reference' else weights, name,
-                    clear_sdf=(name == 'reference'), deadline=deadline,
-                    planner=planner, generator=generator, seq_optimizer=seq_opt,
-                    wait=wait, arg_overrides=arg_over, setting_overrides=set_over)
+        while True:
+            progress, pending = False, 0
+            for ass in test_eval.assemblies:
+                aid = str(ass.id)
+                for run in ordered:
+                    if aid in runsets[run[0]]:
+                        continue
+                    pre = prerequisite(run[0])
+                    if (pre is not None and aid not in runsets[pre]) or \
+                            (deadline is not None and time.time() > deadline):
+                        pending += 1
+                        continue
+                    if claim(run, ass):
+                        progress = True
+                    else:
+                        pending += 1
+            if not pending or (deadline is not None and time.time() > deadline):
+                break
+            if not progress:
+                if not wait_for_others:
+                    print(f'[eval] nothing left to claim; {pending} runs are held by other '
+                          f'processes or wait for one; leaving them to those')
+                    break
+                time.sleep(_RUN_POLL_S)
     if seeds:
         runsets['random'] = _aggregate_random(test_eval.assemblies, runsets, seeds)
         eval_runs = [r for r in eval_runs if not r[0].startswith('random#')] + [
@@ -1903,7 +1950,13 @@ def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, e
             if 'split' in rec:
                 runs[name].update({k: rec.get(k) for k in
                                    ('split', 'n_joins', 'flat_total_s', 'failure',
-                                    'parallel_total_s')})
+                                    'parallel_total_s', 'parallel2_total_s')})
+                used = rec.get('split') == 'used'
+                runs['trained+split-2w'] = {
+                    'status': (rec.get('status') if not used or rec.get('parallel2_total_s')
+                               else 'no_2_worker_timing'),
+                    'total_s': rec.get('parallel2_total_s') if used else rec.get('total_s'),
+                    'components': None, 'split': rec.get('split')}
                 runs['trained+divide'] = {
                     'status': rec.get('status'), 'total_s': rec.get('flat_total_s'),
                     'components': rec.get('flat_components')}
@@ -1918,9 +1971,12 @@ def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, e
                 runs['trained+divide'] = {'status': rec.get('status'), 'total_s': None,
                                           'components': None}
                 runs['trained+split-par'] = dict(runs['trained+divide'])
+                runs['trained+split-2w'] = dict(runs['trained+divide'])
         rows.append({'id': aid, 'n_parts': len(ass.objects), 'runs': runs})
     if any(r[0] == 'trained+split' for r in eval_runs):
         eval_runs = list(eval_runs) + [
+            ('trained+split-2w', None, None, None, None,
+             'the trained+split plan taken apart by two workers (S and R of the outermost split at once)'),
             ('trained+split-par', None, None, None, None,
              'the trained+split plan with S and R of every split taken apart in parallel'),
             ('trained+divide', None, None, None, None,
@@ -2010,10 +2066,13 @@ def _format_evaluation(summary):
                 if v[a] or v[b]))
     ratio_cols = [('trained', 'reference', 'trained/ref'), ('trained', 'heur-out', 'trained/h-o')]
     if 'random' in names:
-        ratio_cols += [('reference', 'random', 'ref/random'), ('reference-first', 'random', 'rfirst/random')]
+        ratio_cols += [('reference', 'random', 'ref/random'), ('heur-out', 'random', 'h-o/random')]
+        if 'reference-first' in names:
+            ratio_cols.append(('reference-first', 'random', 'rfirst/random'))
     if 'trained+split' in names:
         ratio_cols += [('trained+split', 'trained', 'split/trained'),
                        ('trained+split', 'trained+divide', 'split/divide'),
+                       ('trained+split-2w', 'trained', '2w/trained'),
                        ('trained+split-par', 'trained+divide', 'par/divide')]
     width = {n: max(13, len(n) + 3) + 2 for n in names}
     head = f'{"id":<7}{"parts":>6}' + ''.join(f'{n + " s":>{width[n]}}' for n in names)

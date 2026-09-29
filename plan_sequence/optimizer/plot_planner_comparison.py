@@ -3,22 +3,26 @@ held-out assemblies of an evaluation with random seeds (weight_trainer
 evaluate_heuristic_weights(random_seeds=N), e.g. cluster/random_baseline_submit.sh).
 
     python ASAPx/plan_sequence/optimizer/plot_planner_comparison.py \
-        --summary <run>/eval_random/summary.json --store assets/optuna_store \
-        --weights <run>/heuristic_weights.json --ids <test ids> --out <file stem>
+        --summary <run>/eval_campaign/summary.json --out <file stem> [--ids <ids>]
+        [--store assets/optuna_store --weights <run>/heuristic_weights.json]
 
 Series, every one as the per-assembly time ratio against random (geometric
-mean over its seeds), so 1 is chance and lower is faster:
-  heur-out                       the gen:heur-out baseline (no sequence selection)
+mean over its seeds), so 1 is chance and lower is faster; each drawn when the
+summary has it:
+  heur-out (baseline)            the gen:heur-out baseline
   reference, first / selected    heuristic, reference weights, without / with
                                  sequence selection (the cheapest explored sequence)
-  trained, first / selected      the same with the trained weights
+  trained, selected              the same with the trained weights
   trained + subassemblies        the trained weights with the recursive
-                                 subassembly plan, one worker (sequential)
-                                 and S and R taken apart at once (parallel);
-                                 where no plan was found or it could not be
-                                 carried out, the flat time
-The trained-weight runs come from the result store (records with those
-weights); the others from the summary. Left: geometric mean with a 95%
+                                 subassembly plan: one worker, two workers
+                                 (S and R of the outermost split at once) and,
+                                 for older summaries without the two-worker
+                                 time, every split at once; where no plan was
+                                 found or it could not be carried out, the
+                                 flat time
+With --store and --weights, also 'trained, first' from the result store
+(records with those weights and no sequence selection). --ids defaults to
+every assembly of the summary. Left: geometric mean with a 95%
 bootstrap interval and how many assemblies beat random; right: every
 assembly. Writes <out>.png and <out>.pdf.
 """
@@ -30,6 +34,7 @@ import os
 import random
 
 import matplotlib
+import matplotlib.ticker
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt  # noqa: E402
 
@@ -69,30 +74,43 @@ def _bootstrap(logs, n=10000, seed=0):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--summary', required=True)
-    ap.add_argument('--store', required=True)
-    ap.add_argument('--weights', required=True, help='the trained weights file')
-    ap.add_argument('--ids', required=True, help='comma-separated held-out ids')
+    ap.add_argument('--store', default=None, help="with --weights: add 'trained, first'")
+    ap.add_argument('--weights', default=None, help='the trained weights file')
+    ap.add_argument('--ids', default=None, help='comma-separated ids (default: all in the summary)')
     ap.add_argument('--out', required=True, help='output path without extension')
     a = ap.parse_args()
 
-    ids = [x for x in a.ids.split(',') if x]
     with open(a.summary) as f:
         summary = json.load(f)
-    with open(a.weights) as f:
-        weights = json.load(f)
     rows = {r['id']: r['runs'] for r in summary['per_assembly']}
+    ids = [x for x in a.ids.split(',') if x] if a.ids else list(rows)
 
     def from_summary(name):
         return {i: rows[i][name]['total_s'] for i in ids
                 if i in rows and rows[i].get(name, {}).get('status') == 'ok'}
 
     random_t = from_summary('random')
-    series = {'heur-out': from_summary('heur-out'),
+    stored = {}
+    if a.store and a.weights:
+        with open(a.weights) as f:
+            stored = _store_series(a.store, json.load(f), set(ids))
+    two = from_summary('trained+split-2w')
+    # Summaries from before the subassembly runs joined the random evaluation
+    # lack them; the store has them then.
+    one = from_summary('trained+split') or stored.get('trained + subassemblies, 1 worker', {})
+    par = {} if two else (from_summary('trained+split-par')
+                          or stored.get('trained + subassemblies, parallel', {}))
+    series = {'heur-out (baseline)': from_summary('heur-out'),
               'reference, first': from_summary('reference-first'),
-              'reference, selected': from_summary('reference')}
-    series.update(_store_series(a.store, weights, set(ids)))
-    order = list(series)
-    colors = {'heur-out': '#969696', 'reference, first': '#9ecae1', 'reference, selected': '#3182bd',
+              'reference, selected': from_summary('reference'),
+              'trained, first': stored.get('trained, first', {}),
+              'trained, selected': from_summary('trained'),
+              'trained + subassemblies, 1 worker': one,
+              'trained + subassemblies, 2 workers': two,
+              'trained + subassemblies, parallel': par}
+    order = [n for n, v in series.items() if v]
+    colors = {'heur-out (baseline)': '#969696', 'reference, first': '#9ecae1', 'reference, selected': '#3182bd',
+              'trained + subassemblies, 2 workers': '#e6550d',
               'trained, first': '#a1d99b', 'trained, selected': '#31a354',
               'trained + subassemblies, 1 worker': '#fdae6b',
               'trained + subassemblies, parallel': '#e6550d'}
@@ -109,7 +127,7 @@ def main():
                        'per_assembly': dict(zip(common, logs))}
     names = [n for n in order if n in stats]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.8), gridspec_kw={'width_ratios': [1.1, 1]})
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 1.6 + 0.62 * len(names)), gridspec_kw={'width_ratios': [1.1, 1]})
     y = list(range(len(names)))[::-1]
     for yi, name in zip(y, names):
         s = stats[name]
@@ -132,23 +150,27 @@ def main():
         ax2.scatter(vals, jitter, s=18, color=colors[name], edgecolor='black', lw=0.3, zorder=3)
     ax2.axvline(1.0, color='gray', ls='--', lw=1)
     ax2.set_xscale('log')
+    ax2.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
     ticks = [0.25, 0.5, 1, 2]
     ax2.set_xticks(ticks)
     ax2.set_xticklabels([f'x{t:g}' for t in ticks])
     ax2.set_yticks(y)
     ax2.set_yticklabels([])
     ax2.set_xlabel('per assembly, time / random (log scale)')
-    ax2.set_title(f'Every held-out assembly (n={len(ids)})')
+    ax2.set_title(f'Every assembly (n={len(random_t)})')
     for ax in (ax1, ax2):
         ax.grid(axis='x', alpha=0.3)
         ax.spines[['top', 'right']].set_visible(False)
 
     n_seeds = max((len(rows[i]['random'].get('seeds') or []) for i in ids if i in rows), default=0)
-    fig.text(0.01, 0.005,
-             f'Random: DFA search with each next frontier drawn at random, geometric mean over {n_seeds} seeds. '
-             '"selected" = the cheapest sequence of the explored tree under the planner\'s own cost; '
-             '"first" = the first one found. Subassembly runs predate that setting and pick their sequence '
-             'the same way (lowest cost).', fontsize=7.5, color='#444', wrap=True)
+    note = (f'Random: DFA search with each next frontier drawn at random, '
+            f'geometric mean over {n_seeds} seed{"s" if n_seeds != 1 else ""}. '
+            '"selected" = the cheapest sequence of the explored tree under the planner\'s own cost'
+            + ('; "first" = the first one found.' if any(n.endswith('first') for n in names) else '.'))
+    if not two and 'trained + subassemblies, 1 worker' in names:
+        note += (' Subassembly runs predate that setting and pick their sequence the same way '
+                 '(lowest cost); "parallel" = every split at once.')
+    fig.text(0.01, 0.005, note, fontsize=7.5, color='#444', wrap=True)
     fig.tight_layout(rect=(0, 0.04, 1, 1))
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     fig.savefig(a.out + '.png', dpi=200)
