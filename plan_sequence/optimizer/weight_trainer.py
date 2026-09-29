@@ -957,7 +957,9 @@ def derive_selected_runs(store=None, mode='min_cost', deadline=None, num_proc=10
                       f'{record.get("total_s"):.2f}s -> '
                       + (f'{derived["total_s"]:.2f}s' if derived.get('status') == 'ok'
                          else derived.get('status'))
-                      + f'  (cost {sel["first_cost"]:.3f} -> {sel["cost"]:.3f})')
+                      + ('  (the first sequence was not a feasible path of the tree)'
+                         if sel['first_cost'] is None
+                         else f'  (cost {sel["first_cost"]:.3f} -> {sel["cost"]:.3f})'))
         finally:
             heartbeat.close()
             os.remove(str(lock))
@@ -1038,6 +1040,10 @@ def selection_report(run_dir, store=None, mode='min_cost'):
                          'objective_first': sum(logs_old) / len(logs_old),
                          'objective_selected': sum(logs_new) / len(logs_new)})
     out['history'] = rescored
+    if not rescored:
+        lines += [f'training history: no trial re-scored yet ({missing} complete trials lack '
+                  f'selected runs for some assembly; run select to completion)'
+                  if history else 'training history: none in this run directory', '']
     if rescored:
         b1 = min(rescored, key=lambda r: r['objective_first'])
         b2 = min(rescored, key=lambda r: r['objective_selected'])
