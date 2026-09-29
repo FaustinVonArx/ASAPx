@@ -8,6 +8,7 @@ evaluate_heuristic_weights(random_seeds=N), e.g. cluster/random_baseline_submit.
 
 Series, every one as the per-assembly time ratio against random (geometric
 mean over its seeds), so 1 is chance and lower is faster:
+  heur-out                       the gen:heur-out baseline (no sequence selection)
   reference, first / selected    heuristic, reference weights, without / with
                                  sequence selection (the cheapest explored sequence)
   trained, first / selected      the same with the trained weights
@@ -86,11 +87,12 @@ def main():
                 if i in rows and rows[i].get(name, {}).get('status') == 'ok'}
 
     random_t = from_summary('random')
-    series = {'reference, first': from_summary('reference-first'),
+    series = {'heur-out': from_summary('heur-out'),
+              'reference, first': from_summary('reference-first'),
               'reference, selected': from_summary('reference')}
     series.update(_store_series(a.store, weights, set(ids)))
     order = list(series)
-    colors = {'reference, first': '#9ecae1', 'reference, selected': '#3182bd',
+    colors = {'heur-out': '#969696', 'reference, first': '#9ecae1', 'reference, selected': '#3182bd',
               'trained, first': '#a1d99b', 'trained, selected': '#31a354',
               'trained + subassemblies, 1 worker': '#fdae6b',
               'trained + subassemblies, parallel': '#e6550d'}
@@ -107,7 +109,7 @@ def main():
                        'per_assembly': dict(zip(common, logs))}
     names = [n for n in order if n in stats]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.2), gridspec_kw={'width_ratios': [1.1, 1]})
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.8), gridspec_kw={'width_ratios': [1.1, 1]})
     y = list(range(len(names)))[::-1]
     for yi, name in zip(y, names):
         s = stats[name]
