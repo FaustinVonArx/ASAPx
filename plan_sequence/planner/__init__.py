@@ -7,6 +7,7 @@ from .llm import LLMDFASequencePlanner
 from .comparison import ComparisonDFASequencePlanner
 from .preference import PreferenceLearningDFASequencePlanner
 from .generator_adapter import GeneratorAdapterDFASequencePlanner
+from .dfa_random import RandomFrontierDFASequencePlanner
 
 
 planners = {
@@ -19,4 +20,5 @@ planners = {
     'comparison': ComparisonDFASequencePlanner,
     'preference': PreferenceLearningDFASequencePlanner,
     'gen-adapter': GeneratorAdapterDFASequencePlanner,
+    'dfa-random': RandomFrontierDFASequencePlanner,
 }

@@ -574,7 +574,25 @@ def _note_assembly(paths, ass):
 
 def _ensure_runs(ass_list, args, store, weights, label, clear_sdf=False,
                  deadline=None, planner='heuristic', generator='rand', seq_optimizer=None,
-                 wait=True):
+                 wait=True, arg_overrides=None, setting_overrides=None):
+    """See _ensure_runs_. `arg_overrides` / `setting_overrides`: args fields
+    and settings values the run set is planned under (e.g. another --seed,
+    sequence_selection='first'); they enter the fingerprint like any other."""
+    saved_args = {k: getattr(args, k, None) for k in (arg_overrides or {})}
+    for k, v in (arg_overrides or {}).items():
+        setattr(args, k, v)
+    try:
+        with _settings_as(setting_overrides or {}):
+            return _ensure_runs_(ass_list, args, store, weights, label, clear_sdf, deadline,
+                                 planner, generator, seq_optimizer, wait)
+    finally:
+        for k, v in saved_args.items():
+            setattr(args, k, v)
+
+
+def _ensure_runs_(ass_list, args, store, weights, label, clear_sdf=False,
+                  deadline=None, planner='heuristic', generator='rand', seq_optimizer=None,
+                  wait=True):
     """One stored run per assembly with fixed `weights`, computing the missing
     ones into `store` (see _store_paths) and returning {id: record}. Several
     processes can run this at once (e.g. the workers of a job array): each
@@ -1638,7 +1656,39 @@ _EVAL_RUNS = (
     ('trained+split', 'heuristic', 'rand', 'divide', 'trained',
      'trained weights + subassembly plan, timed as carried out'),
 )
-_EVAL_COMPARISONS = (('trained', 'reference'), ('trained', 'heur-out'), ('heur-out', 'reference'))
+_EVAL_COMPARISONS = (('trained', 'reference'), ('trained', 'heur-out'), ('heur-out', 'reference'),
+                     ('reference', 'random'), ('reference-first', 'random'),
+                     ('trained', 'random'), ('heur-out', 'random'),
+                     ('reference', 'reference-first'))
+# With random_seeds: the reference weights without sequence selection, so
+# random (which cannot select) is also compared with the ranking alone.
+_REFERENCE_FIRST_RUN = ('reference-first', 'heuristic', 'rand', None, 'reference',
+                        'heuristic DFA planner, reference weights, first sequence found')
+
+
+def _aggregate_random(ass_list, runsets, seeds):
+    """One record per assembly from its random seeds: complete if any seed
+    planned completely, the time the geometric mean of those, the plan
+    metrics their mean; 'seeds' lists every seed's outcome."""
+    out = {}
+    for ass in ass_list:
+        aid = str(ass.id)
+        per = [(k, runsets[f'random#{k}'].get(aid)) for k in seeds]
+        done = [r for _k, r in per if r]
+        if not done:
+            continue
+        ok = [r for r in done if r.get('status') == 'ok' and r.get('total_s')]
+        metrics = [r['metrics'] for r in ok if r.get('metrics')]
+        out[aid] = {
+            'status': 'ok' if ok else done[0].get('status'),
+            'total_s': _geomean([math.log(r['total_s']) for r in ok]) if ok else None,
+            'components': None,
+            'metrics': ({m: sum(x[m] for x in metrics) / len(metrics)
+                         for m in ('held_parts', 'non_upward')} if metrics else None),
+            'seeds': [{'seed': k, 'status': r.get('status') if r else None,
+                       'total_s': r.get('total_s') if r else None} for k, r in per],
+        }
+    return out
 # 'trained+divide' and 'trained+split-par' are no runs of their own but other
 # totals of the 'trained+split' run: its flat timing (the divide optimizer's
 # sequence without carrying out the split) and its parallel timing (S and R of
@@ -1657,17 +1707,15 @@ _SPLIT_COMPARISONS = (('trained+split', 'trained'), ('trained+split', 'trained+d
 
 def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
                                label='trained', time_budget_s=None, reference_only=False,
-                               split=False, store=None):
+                               split=False, store=None, random_seeds=0):
     """Test the weights in `weights_path` on `test_eval.assemblies` (held out
     from training) against two baselines: the heuristic planner with the
     reference weights, and gen:heur-out. Every run is planned and arm-timed
-    exactly like a training trial: no media, the candidate-check cache shared
-    under `output_root`, one stored run per assembly guarded by a lock, so the
-    workers of a job array split the set between them and a re-run only
-    computes what is missing. Reference runs share `<output_root>/baselines/`
-    with training (same fingerprint); heur-out runs, which do not depend on
-    any weights, live in `<output_root>/heur-out/`. Writes
-    `<output_root>/eval_<label>/summary.{json,txt}` and returns the summary.
+    exactly like a training trial: no media, the candidate-check cache shared,
+    one stored run per assembly guarded by a lock, so the workers of a job
+    array split the set between them and a re-run only computes what is
+    missing. Writes `<output_root>/eval_<label>/summary.{json,txt}` and
+    returns the summary.
     `time_budget_s`: no run starts, and no waiting continues, after it; the
     summary then lists what was left out.
 
@@ -1685,6 +1733,13 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
     and compare it with the other three. Its search replays the 'trained'
     run's physics from the cache; the divide optimizer, the plan's
     verification and the per-context checks of its timing are what it adds.
+
+    `random_seeds` (k > 0): also plan every assembly k times with random
+    decisions ('dfa-random': the same search, the next frontier drawn at
+    random; seeds 0..k-1), and with the reference weights but no sequence
+    selection ('reference-first'), and compare them: is the heuristic better
+    than chance, and how much of that is the ranking vs the selection. The
+    random run of an assembly is the geometric mean of its complete seeds.
     """
     deadline = None if time_budget_s is None else time.time() + float(time_budget_s)
     cfg = _training_config()
@@ -1717,22 +1772,38 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
           f'{label} {weights} (from {weights_path})')
 
     eval_runs = [r for r in _EVAL_RUNS if split or r[3] is None]
+    overrides = {}
+    seeds = list(range(int(random_seeds or 0)))
+    if seeds:
+        eval_runs.append(_REFERENCE_FIRST_RUN)
+        overrides['reference-first'] = ({}, {'sequence_selection': 'first'})
+        for k in seeds:
+            eval_runs.append((f'random#{k}', 'dfa-random', 'rand', None, 'reference',
+                              f'random decisions, seed {k}'))
+            overrides[f'random#{k}'] = ({'seed': k}, {})
     # Reference first (an assembly's first plan regenerates its SDFs), then
     # the runs only this phase makes, then heur-out, which the reference-only
     # phase normally leaves done; so a shortfall there cannot starve the
     # trained runs. Two passes: first what no other worker holds, then wait.
-    priority = ('reference', 'trained', 'trained+split', 'heur-out')
-    ordered = sorted(eval_runs, key=lambda r: priority.index(r[0]))
+    priority = {'reference': 0, 'reference-first': 1, 'trained': 2, 'trained+split': 3,
+                'heur-out': 99}
+    ordered = sorted(eval_runs, key=lambda r: priority.get(r[0], 50))
     runsets = {}
     with _pipeline_environment(args, store, cfg):
         for wait in (False, True):
             for name, planner, generator, seq_opt, which, _what in ordered:
+                arg_over, set_over = overrides.get(name, ({}, {}))
                 runsets[name] = _ensure_runs(
                     test_eval.assemblies, args, store,
                     reference if which == 'reference' else weights, name,
                     clear_sdf=(name == 'reference'), deadline=deadline,
                     planner=planner, generator=generator, seq_optimizer=seq_opt,
-                    wait=wait)
+                    wait=wait, arg_overrides=arg_over, setting_overrides=set_over)
+    if seeds:
+        runsets['random'] = _aggregate_random(test_eval.assemblies, runsets, seeds)
+        eval_runs = [r for r in eval_runs if not r[0].startswith('random#')] + [
+            ('random', None, None, None, None,
+             f'random decisions (dfa-random), geometric mean over {len(seeds)} seeds')]
 
     summary = _summarize_evaluation(test_eval.assemblies, runsets, reference, weights,
                                     str(weights_path), eval_runs)
@@ -1821,6 +1892,8 @@ def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, e
                           'components': rec.get('components')}
             if seq_opt is None:
                 runs[name]['metrics'] = rec.get('metrics')
+            if 'seeds' in rec:
+                runs[name]['seeds'] = rec['seeds']
             if 'split' in rec:
                 runs[name].update({k: rec.get(k) for k in
                                    ('split', 'n_joins', 'flat_total_s', 'failure',
@@ -1895,6 +1968,11 @@ def _format_evaluation(summary):
     for name, s in summary['success'].items():
         lines.append(f'  {name:<13} ok {s["ok"]:>3}   precheck-excluded {s["excluded"]:>3}   '
                      f'failed {s["failed"]}' + (f'   not run (time budget) {s["not_run"]}' if s['not_run'] else ''))
+    seed_runs = [x for r in summary['per_assembly'] for x in (r['runs'].get('random') or {}).get('seeds', [])]
+    if seed_runs:
+        n_ok = sum(x['status'] == 'ok' for x in seed_runs)
+        lines.append(f'  random seeds planned completely: {n_ok} of {len(seed_runs)} '
+                     f'(an assembly counts as ok above when any seed did)')
     if 'split_usage' in summary:
         u = summary['split_usage']
         lines.append(f'  trained+split timed as a subassembly plan on {u["used"]}; no plan found '
@@ -1925,6 +2003,8 @@ def _format_evaluation(summary):
                 f'{comp[:-2]} {v[a]:.1f} vs {v[b]:.1f}' for comp, v in c['component_mean_s'].items()
                 if v[a] or v[b]))
     ratio_cols = [('trained', 'reference', 'trained/ref'), ('trained', 'heur-out', 'trained/h-o')]
+    if 'random' in names:
+        ratio_cols += [('reference', 'random', 'ref/random'), ('reference-first', 'random', 'rfirst/random')]
     if 'trained+split' in names:
         ratio_cols += [('trained+split', 'trained', 'split/trained'),
                        ('trained+split', 'trained+divide', 'split/divide'),
@@ -1950,4 +2030,11 @@ def _format_evaluation(summary):
     if 'trained+split' in names:
         lines.append('(trained+split: S = timed as a subassembly plan, - = no plan found, '
                      '! = plan not executable as told, flat time used)')
+    if seed_runs:
+        lines += ['', 'random, per seed (s):']
+        for r in summary['per_assembly']:
+            seeds = (r['runs'].get('random') or {}).get('seeds') or []
+            lines.append(f'  {r["id"]:<7}' + '  '.join(
+                f'{x["total_s"]:8.2f}' if x['status'] == 'ok' and x['total_s'] else f'{(x["status"] or "not run")[:8]:>8}'
+                for x in seeds))
     return '\n'.join(lines) + '\n'
