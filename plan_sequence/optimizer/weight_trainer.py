@@ -443,6 +443,14 @@ def _run_fingerprint(args, weights, planner='heuristic', generator='rand', seq_o
         'settings': {k: getattr(settings, k, None) for k in setting_keys},
         'args': {k: getattr(args, k, None) for k in arg_keys if k != 'seq_optimizer'},
     }
+    # Only the heuristic planner selects its sequence (run_seq_plan). Runs
+    # stored before selection existed kept the first sequence found, so
+    # 'first' leaves the fingerprint as it was and they stay reusable; the
+    # divide optimizer used to pick its own sequence, so a divide run always
+    # records the mode and never matches one of those.
+    selection = getattr(settings, 'sequence_selection', 'min_cost')
+    if planner == 'heuristic' and (selection != 'first' or seq_optimizer == 'divide'):
+        fp['sequence_selection'] = selection
     # JSON round trip so a fresh fingerprint compares equal to a stored one
     # (tuples become lists).
     return json.loads(json.dumps(fp, default=str))
@@ -757,6 +765,313 @@ def import_run_into_store(run_dir, dataset_dir, store=None):
         shutil.copytree(str(run_dir / 'sim_cache'), str(store / 'sim_cache'), dirs_exist_ok=True)
     print(f'[import] {run_dir} -> {store}: {counts}')
     return counts
+
+
+# ----------------------------------------------------------------------------
+# Store maintenance: sequence selection for runs stored before it existed
+# ----------------------------------------------------------------------------
+
+def _store_index(store):
+    """{(assembly id, fingerprint key): record path} over the whole store."""
+    index = {}
+    for d in (Path(store) / 'runs').glob('*'):
+        try:
+            with open(d / 'assembly.json') as _f:
+                aid = str(json.load(_f)['id'])
+        except (OSError, json.JSONDecodeError, KeyError):
+            continue
+        for rec in d.glob('*.json'):
+            if rec.name != 'assembly.json' and not rec.name.endswith('.weights.json'):
+                index[(aid, rec.stem)] = rec
+    return index
+
+
+@contextlib.contextmanager
+def _settings_as(values):
+    """Temporarily set the settings a stored run was made with (its
+    fingerprint's), so re-timing it reproduces its conditions."""
+    import settings
+    saved = {k: getattr(settings, k) for k in values if hasattr(settings, k)}
+    missing = [k for k in values if not hasattr(settings, k)]
+    for k, v in values.items():
+        setattr(settings, k, tuple(v) if isinstance(v, list) and isinstance(saved.get(k), tuple) else v)
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            setattr(settings, k, v)
+        for k in missing:
+            delattr(settings, k)
+
+
+def _derive_selected(rec_path, record, store, mode, num_proc):
+    """The run `record` would have been with sequence selection `mode`: the
+    planning is identical up to the selection, so the stored tree is reused;
+    the selected sequence is re-timed only when it differs. Returns the new
+    record, written next to the old one under the new fingerprint."""
+    import pickle
+    import types
+    from plan_sequence.optimizer.base import select_min_cost_sequence
+    from plan_sequence.planner.heuristic import HeuristicDFASequencePlanner
+
+    fingerprint = json.loads(json.dumps(dict(record['fingerprint'], sequence_selection=mode)))
+    d = Path(rec_path).parent
+    key = _fingerprint_key(fingerprint)
+    new_rec, new_run = d / f'{key}.json', d / f'{key}_run'
+    old_run = d / f'{Path(rec_path).stem}_run'
+    base = {k: v for k, v in record.items() if k not in ('fingerprint', 'created')}
+    base.update(fingerprint=fingerprint, created=time.time(), derived_from=Path(rec_path).stem)
+
+    def alias():
+        # Same plan as the old run: point at its output instead of copying.
+        if not new_run.exists() and old_run.exists():
+            os.symlink(old_run.name, new_run)
+
+    if record.get('status') != 'ok':
+        # A failed plan returns before any selection, in the pipeline too.
+        alias()
+        base['sequence_selection'] = {'mode': mode, 'changed': False, 'reason': 'plan not complete'}
+        return base, new_rec
+    with open(old_run / 'log' / 'stats.json') as _f:
+        stats = json.load(_f)
+    with open(old_run / 'log' / 'tree.pkl', 'rb') as _f:
+        tree = pickle.load(_f)
+    assembly_dir = record['assembly_dir']
+    parts = sorted(max(tree.nodes, key=len))
+    edge_cost = HeuristicDFASequencePlanner.edge_scorer(
+        os.path.abspath('assets'), assembly_dir, parts, fingerprint['weights'])
+    first = list(stats['sequence'])
+    chosen, cost, first_cost = select_min_cost_sequence(tree, edge_cost, prefer=first)
+    info = {'mode': mode, 'changed': chosen is not None and list(chosen) != first,
+            'cost': cost, 'first_cost': first_cost, 'first_sequence': first}
+    base['sequence_selection'] = info
+    if not info['changed']:
+        alias()
+        return base, new_rec
+
+    # Re-time the selected sequence exactly as _render_plan does.
+    if new_run.is_symlink() or new_run.is_file():
+        new_run.unlink()
+    elif new_run.exists():
+        shutil.rmtree(str(new_run))  # a half-written earlier attempt
+    shutil.copytree(str(old_run), str(new_run), symlinks=True)
+    log = new_run / 'log'
+    for name in ('timing_overview.json', 'arm_plans.json', 'timing_overview_split.json'):
+        if (log / name).exists():
+            (log / name).unlink()
+    stats['sequence'] = list(chosen)
+    stats['sequence_selection'] = info
+    _write_json(log / 'stats.json', stats)
+    from plan_robot.arm_pipeline import plan_arm_sequence
+    fp_settings = fingerprint.get('settings') or {}
+    gripper_type = ('rod' if fp_settings.get('contact_model', 'rod') == 'rod'
+                    else (fingerprint.get('args') or {}).get('gripper_type') or 'rod')
+    gripper_scale = (fingerprint.get('args') or {}).get('gripper_scale') or 0.4
+    t0 = time.time()
+    with _settings_as({k: v for k, v in fp_settings.items() if v is not None}):
+        plan_arm_sequence(os.path.abspath(os.path.join('ASAPx', 'assets')), assembly_dir,
+                          list(chosen), tree, gripper_type=gripper_type,
+                          gripper_scale=gripper_scale, log_dir=str(log), num_proc=num_proc)
+    objects = {p.stem: None for p in Path(assembly_dir).glob('*.obj')}
+    status, total, components, _extra = _assess_run(
+        new_run, types.SimpleNamespace(id=record.get('id'), objects=objects))
+    base.update(status=status, total_s=total, components=components,
+                metrics=_plan_metrics(new_run) if status == 'ok' else None,
+                retime_s=time.time() - t0)
+    return base, new_rec
+
+
+def derive_selected_runs(store=None, mode='min_cost', deadline=None, num_proc=10):
+    """For every stored heuristic run made before sequence selection existed
+    (no 'sequence_selection' in its fingerprint, i.e. the first sequence
+    found), store the run selection `mode` would have made, under the
+    fingerprint a current run gets -- so every later training, evaluation or
+    warm start reuses it. Locked per run, so an array of workers shares the
+    work; resumable (done runs are skipped). Run from the repository root.
+    Returns {'derived': n, 'changed': n, 'skipped': n}."""
+    store = Path(store or DEFAULT_STORE)
+    todo = []
+    for rec_path in sorted((store / 'runs').glob('*/*.json')):
+        if rec_path.name == 'assembly.json' or rec_path.name.endswith('.weights.json'):
+            continue
+        try:
+            with open(rec_path) as _f:
+                record = json.load(_f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        fp = record.get('fingerprint') or {}
+        if fp.get('planner') == 'heuristic' and not fp.get('seq_optimizer') \
+                and 'sequence_selection' not in fp and record.get('assembly_dir'):
+            todo.append((rec_path, record))
+    # Every worker walks the list in its own order, so they rarely meet on a lock.
+    random.Random(os.getpid()).shuffle(todo)
+    counts = {'derived': 0, 'changed': 0, 'skipped': 0, 'failed': 0}
+    print(f'[select] {len(todo)} stored heuristic runs without sequence selection')
+    for rec_path, record in todo:
+        if deadline is not None and time.time() > deadline:
+            print('[select] time budget used up; the rest is left for the next run')
+            break
+        fingerprint = json.loads(json.dumps(dict(record['fingerprint'], sequence_selection=mode)))
+        new_rec = rec_path.parent / f'{_fingerprint_key(fingerprint)}.json'
+        if new_rec.exists():
+            counts['skipped'] += 1
+            continue
+        lock = _try_lock(new_rec.with_suffix('.lock'))
+        if lock is None:
+            continue
+        heartbeat = _LockHeartbeat(lock)
+        try:
+            if new_rec.exists():
+                continue
+            try:
+                derived, path = _derive_selected(rec_path, record, store, mode, num_proc)
+            except Exception as _e:
+                traceback.print_exc()
+                print(f'[select] {record.get("id")} {rec_path.name}: failed ({_e}); left for the next run')
+                counts['failed'] += 1
+                continue
+            _write_json(path, derived)
+            counts['derived'] += 1
+            sel = derived['sequence_selection']
+            if sel.get('changed'):
+                counts['changed'] += 1
+                print(f'[select] {record.get("id")} {record.get("label")}: '
+                      f'{record.get("total_s"):.2f}s -> '
+                      + (f'{derived["total_s"]:.2f}s' if derived.get('status') == 'ok'
+                         else derived.get('status'))
+                      + f'  (cost {sel["first_cost"]:.3f} -> {sel["cost"]:.3f})')
+        finally:
+            heartbeat.close()
+            os.remove(str(lock))
+    print(f'[select] done: {counts}')
+    return counts
+
+
+def selection_report(run_dir, store=None, mode='min_cost'):
+    """How sequence selection `mode` changes a run: per stored run, the time
+    of the selected sequence against the first one found; and the training
+    history re-scored with selected sequences (every trial's objective, the
+    best trial, its weights -> <run>/heuristic_weights_<mode>.json). Needs
+    derive_selected_runs first. Writes <run>/sequence_selection_report.{txt,json}."""
+    run_dir = Path(run_dir)
+    store = Path(store or DEFAULT_STORE)
+    index = _store_index(store)
+
+    def lookup(aid, fingerprint):
+        path = index.get((aid, _fingerprint_key(json.loads(json.dumps(fingerprint)))))
+        if path is None:
+            return None
+        with open(path) as _f:
+            return json.load(_f)
+
+    def pair(aid, fingerprint):
+        old = lookup(aid, fingerprint)
+        new = lookup(aid, dict(fingerprint, sequence_selection=mode)) if old else None
+        return old, new
+
+    # Baseline fingerprints: the run's own (legacy baselines/ dir) or its
+    # history's per-assembly records.
+    base_fp = {}
+    for rec in sorted((run_dir / 'baselines').glob('*.json')):
+        if rec.name != 'weights.json':
+            with open(rec) as _f:
+                r = json.load(_f)
+            if 'fingerprint' in r:
+                base_fp[rec.stem] = r['fingerprint']
+    try:
+        with open(run_dir / 'history.json') as _f:
+            history = json.load(_f)
+    except (OSError, json.JSONDecodeError):
+        history = []
+    for e in history:
+        for aid, path in (e.get('per_assembly_record') or {}).items():
+            if aid not in base_fp and Path(path).exists():
+                with open(path) as _f:
+                    fp = json.load(_f)['fingerprint']
+                fp = {k: v for k, v in fp.items() if k != 'sequence_selection'}
+                base_fp[aid] = dict(fp, weights=json.loads(json.dumps(
+                    _pin(_reference_weights(), _training_config()['fixed_weights']))))
+
+    lines = [f'Sequence selection "{mode}" vs the first sequence found: {run_dir}', '=' * 78]
+    out = {'run': str(run_dir), 'mode': mode}
+
+    # History, re-scored.
+    rescored = []
+    missing = 0
+    for e in history:
+        if e.get('outcome') != 'complete' or e.get('n_failed') or not e.get('per_assembly_total_s'):
+            continue
+        logs_old, logs_new, ok = [], [], True
+        for aid in e['per_assembly_total_s']:
+            if aid not in base_fp:
+                ok = False
+                break
+            b_old, b_new = pair(aid, base_fp[aid])
+            t_old, t_new = pair(aid, dict(base_fp[aid], weights=e['weights']))
+            if not all(r and r.get('status') == 'ok' for r in (b_old, b_new, t_old, t_new)):
+                ok = False
+                break
+            logs_old.append(math.log(t_old['total_s'] / b_old['total_s']))
+            logs_new.append(math.log(t_new['total_s'] / b_new['total_s']))
+        if not ok:
+            missing += 1
+            continue
+        rescored.append({'trial': e['trial'], 'weights': e['weights'],
+                         'objective_first': sum(logs_old) / len(logs_old),
+                         'objective_selected': sum(logs_new) / len(logs_new)})
+    out['history'] = rescored
+    if rescored:
+        b1 = min(rescored, key=lambda r: r['objective_first'])
+        b2 = min(rescored, key=lambda r: r['objective_selected'])
+        out['best_first'], out['best_selected'] = b1, b2
+        _write_json(run_dir / f'heuristic_weights_{mode}.json', b2['weights'])
+        lines += [f'training history: {len(rescored)} complete trials re-scored'
+                  + (f' ({missing} could not be: runs missing from the store)' if missing else ''),
+                  f'  best trial, first sequence:     {b1["trial"]:4d}  x{math.exp(b1["objective_first"]):.4f} of its baseline',
+                  f'  best trial, selected sequence:  {b2["trial"]:4d}  x{math.exp(b2["objective_selected"]):.4f} of its baseline'
+                  f' (weights -> heuristic_weights_{mode}.json)', '']
+
+    # Every derived run in the store: selected vs first.
+    def label_of(r):
+        label = r.get('label') or '?'
+        return 'trial' if label.startswith('trial') else label
+
+    by_label = {}
+    for (aid, _key), path in index.items():
+        with open(path) as _f:
+            r = json.load(_f)
+        sel = r.get('sequence_selection') or {}
+        if sel.get('mode') != mode or not r.get('derived_from'):
+            continue
+        old_path = path.parent / f'{r["derived_from"]}.json'
+        if not old_path.exists():
+            continue
+        with open(old_path) as _f:
+            old = json.load(_f)
+        if old.get('status') != 'ok' or r.get('status') != 'ok':
+            by_label.setdefault(label_of(r), []).append(None)
+            continue
+        by_label.setdefault(label_of(r), []).append(math.log(r['total_s'] / old['total_s']))
+    lines.append('whole store (all runs), selected / first sequence time per stored run:')
+    out['store'] = {}
+    for label in sorted(by_label, key=lambda x: (x == 'trial', x)):
+        vals = [v for v in by_label[label] if v is not None]
+        if not vals:
+            continue
+        s = {'n': len(vals), 'changed': sum(abs(v) > _TIE_LOG_RATIO for v in vals),
+             'faster': sum(v < -_TIE_LOG_RATIO for v in vals),
+             'slower': sum(v > _TIE_LOG_RATIO for v in vals),
+             'geomean_ratio': _geomean(vals),
+             'geomean_ratio_changed': _geomean([v for v in vals if abs(v) > _TIE_LOG_RATIO])}
+        out['store'][label] = s
+        lines.append(f'  {label:<13} n={s["n"]:4d}  changed {s["changed"]:4d}  faster/slower {s["faster"]}/{s["slower"]}'
+                     f'  geomean x{s["geomean_ratio"]:.4f}'
+                     + (f'  (changed only x{s["geomean_ratio_changed"]:.4f})' if s['changed'] else ''))
+    text = '\n'.join(lines) + '\n'
+    _write_json(run_dir / 'sequence_selection_report.json', out)
+    (run_dir / 'sequence_selection_report.txt').write_text(text)
+    print(text)
+    return out
 
 
 @contextlib.contextmanager

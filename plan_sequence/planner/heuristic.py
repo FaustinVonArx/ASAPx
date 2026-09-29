@@ -117,6 +117,21 @@ class HeuristicDFASequencePlanner(DFASequencePlanner):
                     weights[k] = float(v)
         return weights
 
+    @classmethod
+    def edge_scorer(cls, asset_folder, assembly_dir, parts, weights, save_sdf=False):
+        """The planner's per-edge cost as a standalone function
+        (G_prime, sim_info, parent_G, parent_pose) -> float, with fixed
+        `weights`, for scoring a finished tree without a planner (stored runs,
+        optimizer/base.select_min_cost_sequence). Same features, same code."""
+        scorer = cls.__new__(cls)
+        scorer.asset_folder, scorer.assembly_dir = asset_folder, assembly_dir
+        scorer.parts, scorer.save_sdf = list(parts), save_sdf
+        w = {k: float(weights[k]) for k in FEATURE_ORDER}
+
+        def edge_cost(G_prime, sim_info, parent_G, parent_pose):
+            return scorer._cost_child(w, G_prime, sim_info, parent_G, parent_pose=parent_pose)
+        return edge_cost
+
     def _contact_graph_full(self):
         g = getattr(self, '_cg_full', None)
         if g is None:

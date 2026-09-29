@@ -318,9 +318,36 @@ def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc,
         stats['ignored_unstable_parts'] = sorted(
             str(p) for p in (getattr(planner, '_ignored_unstable_parts', None) or ()))
 
-        # Integrated sequence selection + divide-optimizer split probe.
-        # The chosen sequence replaces stats['sequence']; the split is purely
-        # diagnostic (printed when debug > 0). See BaseSequenceOptimizer.
+        # Sequence selection (settings.sequence_selection): 'min_cost' replaces
+        # the planner's first complete sequence with the cheapest complete one
+        # of the explored tree under the planner's own edge cost; 'first'
+        # keeps it. Only the heuristic planner selects: its search is ranked
+        # by that cost, while its subclasses (gen-adapter, llm, comparison,
+        # preference) rank by other means and only inherit it.
+        if stats.get('success') and planner_name == 'heuristic':
+            try:
+                import settings as _user_settings
+                _selection = getattr(_user_settings, 'sequence_selection', 'min_cost')
+            except ImportError:
+                _selection = 'min_cost'
+            if _selection == 'min_cost':
+                from plan_sequence.optimizer.base import select_min_cost_sequence
+                _edge_cost = planner.edge_scorer(planner.asset_folder, planner.assembly_dir,
+                                                 planner.parts, planner._load_weights(),
+                                                 save_sdf=save_sdf)
+                _first = list(stats['sequence'])
+                _chosen, _cost, _first_cost = select_min_cost_sequence(tree, _edge_cost, prefer=_first)
+                if _chosen is not None:
+                    stats['sequence'] = list(_chosen)
+                    stats['sequence_selection'] = {
+                        'mode': 'min_cost', 'changed': list(_chosen) != _first,
+                        'cost': _cost, 'first_cost': _first_cost, 'first_sequence': _first}
+                    print(f'[seq_plan] sequence selection: cost {_cost:.3f} '
+                          f'(first found {_first_cost if _first_cost is None else round(_first_cost, 3)})'
+                          + ('; replaced the first sequence' if list(_chosen) != _first else ''))
+
+        # Divide optimizer: the split probe and the recursive subassembly plan.
+        # The flat sequence is whatever selection above left in stats.
         if stats.get('success') and seq_optimizer == 'divide':
             from plan_sequence.optimizer.base import BaseSequenceOptimizer
             from plan_sequence.optimizer.divide import DivideOptimizer
@@ -364,18 +391,12 @@ def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc,
             except ImportError:
                 _threshold = 0.1
 
-            chosen_sequence = opt.optimize_scored(
-                cost_fn=_cost_fn, divide_optimizer=div,
-                threshold=_threshold, debug=debug,
-            )
-            if chosen_sequence is not None:
-                if debug > 0 and div is not None:
-                    print(f'[seq_plan] divide optimizer found {len(div.locally_free)} locally free subassemblies:')
-                    for idx, entry in enumerate(div.locally_free):
-                        S, R, score = entry[0], entry[1], entry[2]
-                        print(f'  {idx+1}. S={sorted(S)}  R={sorted(R)}  score={score:.4f}  '
-                              f'{"ACCEPTED" if score >= _threshold else "rejected"}')
-                stats['sequence'] = list(chosen_sequence)
+            if debug > 0 and div is not None:
+                print(f'[seq_plan] divide optimizer found {len(div.locally_free)} locally free subassemblies:')
+                for idx, entry in enumerate(div.locally_free):
+                    S, R, score = entry[0], entry[1], entry[2]
+                    print(f'  {idx+1}. S={sorted(S)}  R={sorted(R)}  score={score:.4f}  '
+                          f'{"ACCEPTED" if score >= _threshold else "rejected"}')
 
             # Persist the top physically-verified subassembly split so the
             # renderer can visualise it (see play_subassembly_split). Skipped

@@ -3,6 +3,86 @@ import random
 import networkx as nx
 
 
+def select_min_cost_sequence(tree, edge_cost, prefer=None):
+    """The complete sequence of the explored `tree` with the lowest summed
+    edge cost: a shortest path over the tree, linear in its size, so it never
+    enumerates sequences (their number grows combinatorially).
+
+    `edge_cost(G_prime, sim_info, parent_G, parent_pose) -> float` is the
+    planner's per-edge cost (HeuristicDFASequencePlanner.edge_scorer).
+    `parent_pose` is the pose of the edge the path itself arrived by -- the
+    tree shares nodes between sequences, so a node's first in-edge (what
+    _parent_pose_for returns) may belong to another one. The search state is
+    therefore the edge, not the node.
+
+    `prefer`: a sequence kept whenever it is among the cheapest (e.g. the
+    planner's own), so selection changes a run only when it finds strictly
+    cheaper.
+
+    Returns (sequence, cost, prefer_cost); (None, None, None) when the tree
+    has no complete sequence. prefer_cost is None without `prefer` or when
+    `prefer` is not a complete path of the tree.
+    """
+    roots = [n for n in tree.nodes if tree.in_degree(n) == 0]
+    if not roots:
+        return None, None, None
+    root = max(roots, key=len)
+
+    def feasible_out(node):
+        for _, child, data in tree.out_edges(node, data=True):
+            sim_info = data.get('sim_info') or {}
+            if sim_info.get('feasible'):
+                yield child, sim_info
+
+    def is_terminal(node):
+        return len(node) == 1 and tree.nodes[node].get('n_gripper') is not None
+
+    # best[(u, v)] = (cost of the cheapest path from the root ending with
+    # edge u->v, previous edge); edges only ever go to one part fewer, so
+    # nodes in order of decreasing size are a topological order.
+    best = {}
+    for node in sorted(tree.nodes, key=len, reverse=True):
+        if node == root:
+            arrivals = [(0.0, None, None)]
+        else:
+            arrivals = [(best[(u, node)][0], (u, node),
+                         (tree.edges[u, node].get('sim_info') or {}).get('pose'))
+                        for u in tree.predecessors(node) if (u, node) in best]
+        if not arrivals:
+            continue
+        for child, sim_info in feasible_out(node):
+            options = [(c + float(edge_cost(child, sim_info, node, pose)), e)
+                       for c, e, pose in arrivals]
+            best[(node, child)] = min(options, key=lambda x: x[0])
+
+    ends = [(c, e) for e, (c, _prev) in best.items() if is_terminal(e[1])]
+    if not ends:
+        return None, None, None
+    cost, edge = min(ends, key=lambda x: x[0])
+    sequence = []
+    while edge is not None:
+        sequence.append(tree.edges[edge]['sim_info']['part_move'])
+        edge = best[edge][1]
+    sequence.reverse()
+
+    prefer_cost = None
+    if prefer:
+        node, pose, total = root, None, 0.0
+        for part in prefer:
+            step = next(((child, si) for child, si in feasible_out(node)
+                         if si.get('part_move') == part), None)
+            if step is None:
+                total = None
+                break
+            total += float(edge_cost(step[0], step[1], node, pose))
+            node, pose = step[0], step[1].get('pose')
+        if total is not None and is_terminal(node):
+            prefer_cost = total
+            if prefer_cost <= cost + 1e-9 * max(1.0, abs(cost)):
+                return list(prefer), prefer_cost, prefer_cost
+    return sequence, cost, prefer_cost
+
+
 class BaseSequenceOptimizer:
     '''
     Base optimizer that selects a disassembly sequence from a planning tree
