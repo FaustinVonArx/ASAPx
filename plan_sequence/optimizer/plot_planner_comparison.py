@@ -20,6 +20,9 @@ summary has it:
                                  time, every split at once; where no plan was
                                  found or it could not be carried out, the
                                  flat time
+  ... where faster, 2 workers    per assembly the faster of 'trained, selected'
+                                 and the two-worker subassembly time (the
+                                 planner choosing by its own timing model)
 With --store and --weights, also 'trained, first' from the result store
 (records with those weights and no sequence selection). --ids defaults to
 every assembly of the summary. Left: geometric mean with a 95%
@@ -107,10 +110,12 @@ def main():
               'trained, selected': from_summary('trained'),
               'trained + subassemblies, 1 worker': one,
               'trained + subassemblies, 2 workers': two,
+              'trained + subassemblies where faster, 2 workers': from_summary('trained+best-2w'),
               'trained + subassemblies, parallel': par}
     order = [n for n, v in series.items() if v]
     colors = {'heur-out (baseline)': '#969696', 'reference, first': '#9ecae1', 'reference, selected': '#3182bd',
               'trained + subassemblies, 2 workers': '#e6550d',
+              'trained + subassemblies where faster, 2 workers': '#a63603',
               'trained, first': '#a1d99b', 'trained, selected': '#31a354',
               'trained + subassemblies, 1 worker': '#fdae6b',
               'trained + subassemblies, parallel': '#e6550d'}
@@ -167,6 +172,9 @@ def main():
             f'geometric mean over {n_seeds} seed{"s" if n_seeds != 1 else ""}. '
             '"selected" = the cheapest sequence of the explored tree under the planner\'s own cost'
             + ('; "first" = the first one found.' if any(n.endswith('first') for n in names) else '.'))
+    if 'trained + subassemblies where faster, 2 workers' in names:
+        note += (' "where faster" = per assembly the faster of the flat sequence and the '
+                 'two-worker subassembly plan, as the timing model predicts.')
     if not two and 'trained + subassemblies, 1 worker' in names:
         note += (' Subassembly runs predate that setting and pick their sequence the same way '
                  '(lowest cost); "parallel" = every split at once.')
