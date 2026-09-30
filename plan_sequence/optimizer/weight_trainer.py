@@ -333,6 +333,7 @@ def _assess_run(storage_dir, ass, split=False):
         extra['failure'] = split_timing.get('failure')
         return 'ok', float(total), timing['totals'], extra
     extra['split'] = 'used'
+    extra['split_metrics'] = _split_metrics(split_timing)
     extra['parallel_total_s'] = (split_timing.get('parallel') or {}).get('total_s')
     extra['parallel2_total_s'] = (split_timing.get('parallel_2') or {}).get('total_s')
     return 'ok', float(split_timing['totals']['total_s']), split_timing['totals'], extra
@@ -374,6 +375,19 @@ def _plan_metrics(run_dir):
             non_upward.append(1.0 - a[2] / n if n > 1e-9 else 1.0)
         node = child
     return {'held_parts': sum(held) / len(held), 'non_upward': sum(non_upward) / len(non_upward)}
+
+
+def _split_metrics(split_timing):
+    """Held parts per step of a subassembly plan as timed (split_timing's
+    per_step hold_count; a join holds none), comparable with _plan_metrics'
+    held_parts: the plan also has one step per part but the last, a join
+    standing in for the removal it replaces. The pull direction is not in the
+    timing, so no non_upward."""
+    steps = (split_timing or {}).get('per_step') or []
+    counts = [s.get('hold_count') for s in steps]
+    if not counts or any(c is None for c in counts):
+        return None
+    return {'held_parts': sum(counts) / len(counts)}
 
 
 def _use_weights(weights, path):
@@ -612,6 +626,13 @@ def _load_record(paths, fingerprint):
     if record.get('status') == 'ok' and 'metrics' not in record and not record.get('split'):
         record['metrics'] = _plan_metrics(paths['run'])
         _write_json(paths['record'], record)
+    if record.get('split') == 'used' and 'split_metrics' not in record:
+        try:
+            with open(Path(paths['run']) / 'log' / 'timing_overview_split.json') as _f:
+                record['split_metrics'] = _split_metrics(json.load(_f))
+            _write_json(paths['record'], record)
+        except (OSError, json.JSONDecodeError):
+            pass
     return record
 
 
@@ -1747,10 +1768,14 @@ def _aggregate_random(ass_list, runsets, seeds):
             continue
         ok = [r for r in done if r.get('status') == 'ok' and r.get('total_s')]
         metrics = [r['metrics'] for r in ok if r.get('metrics')]
+        comps = [r['components'] for r in ok if r.get('components')]
         out[aid] = {
             'status': 'ok' if ok else done[0].get('status'),
             'total_s': _geomean([math.log(r['total_s']) for r in ok]) if ok else None,
-            'components': None,
+            # Component means over the seeds (an arithmetic mean, so they do
+            # not add up to the geometric-mean total exactly with several).
+            'components': ({k: sum(float(c.get(k) or 0.0) for c in comps) / len(comps)
+                            for k in comps[0]} if comps else None),
             'metrics': ({m: sum(x[m] for x in metrics) / len(metrics)
                          for m in ('held_parts', 'non_upward')} if metrics else None),
             'seeds': [{'seed': k, 'status': r.get('status') if r else None,
@@ -2023,11 +2048,14 @@ def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, e
                                    ('split', 'n_joins', 'flat_total_s', 'failure',
                                     'parallel_total_s', 'parallel2_total_s')})
                 used = rec.get('split') == 'used'
+                if used:
+                    runs[name]['metrics'] = rec.get('split_metrics')
                 runs['trained+split-2w'] = {
                     'status': (rec.get('status') if not used or rec.get('parallel2_total_s')
                                else 'no_2_worker_timing'),
                     'total_s': rec.get('parallel2_total_s') if used else rec.get('total_s'),
-                    'components': None, 'split': rec.get('split')}
+                    'components': None, 'split': rec.get('split'),
+                    'metrics': rec.get('split_metrics') if used else None}
                 runs['trained+divide'] = {
                     'status': rec.get('status'), 'total_s': rec.get('flat_total_s'),
                     'components': rec.get('flat_components')}
@@ -2052,9 +2080,13 @@ def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, e
                 continue
             flat, sp = runs['trained'], runs[split_name]
             if flat['status'] == 'ok' and sp['status'] == 'ok' and flat['total_s'] and sp['total_s']:
-                runs[best] = {'status': 'ok', 'total_s': min(flat['total_s'], sp['total_s']),
-                              'components': None,
-                              'pick': 'split' if sp['total_s'] < flat['total_s'] else 'flat'}
+                pick = 'split' if sp['total_s'] < flat['total_s'] else 'flat'
+                chosen = sp if pick == 'split' else flat
+                # Components exist for the sequential time only (the
+                # two-worker time is a makespan, not a sum of steps).
+                runs[best] = {'status': 'ok', 'total_s': chosen['total_s'], 'pick': pick,
+                              'components': chosen.get('components'),
+                              'metrics': (flat if pick == 'flat' else sp).get('metrics')}
             else:
                 runs[best] = {'status': flat['status'] if flat['status'] != 'ok' else sp['status'],
                               'total_s': None, 'components': None}
