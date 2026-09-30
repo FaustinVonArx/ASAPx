@@ -1763,7 +1763,9 @@ def _aggregate_random(ass_list, runsets, seeds):
 # of the outermost split at once) and with as many as the plan can use (every
 # split, at every depth; plan_robot/split_timing.parallel_makespan).
 # trained+split vs trained+divide isolates the split.
-_SPLIT_COMPARISONS = (('trained+best-2w', 'random'), ('trained+best-2w', 'trained'),
+_SPLIT_COMPARISONS = (('trained+best-1w', 'random'), ('trained+best-1w', 'trained'),
+                      ('trained+best-1w', 'reference'), ('trained+best-1w', 'heur-out'),
+                      ('trained+best-2w', 'random'), ('trained+best-2w', 'trained'),
                       ('trained+best-2w', 'reference'), ('trained+best-2w', 'heur-out'),
                       ('trained+split-2w', 'trained'), ('trained+split-2w', 'reference'),
                       ('trained+split-2w', 'heur-out'), ('trained+split-2w', 'trained+split'),
@@ -2041,24 +2043,29 @@ def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, e
                                           'components': None}
                 runs['trained+split-par'] = dict(runs['trained+divide'])
                 runs['trained+split-2w'] = dict(runs['trained+divide'])
-        if 'trained+split-2w' in runs and 'trained' in runs:
-            # The planner's own choice between the two, by the timing model
-            # it already ran on both: the subassembly plan only where it is
-            # predicted faster with two workers than the flat sequence.
-            flat, two = runs['trained'], runs['trained+split-2w']
-            if flat['status'] == 'ok' and two['status'] == 'ok' and flat['total_s'] and two['total_s']:
-                pick = 'split' if two['total_s'] < flat['total_s'] else 'flat'
-                runs['trained+best-2w'] = {'status': 'ok', 'total_s': min(flat['total_s'], two['total_s']),
-                                           'components': None, 'pick': pick}
+        # The planner's own choice between the flat sequence and the
+        # subassembly plan, by the timing model it already ran on both: the
+        # plan only where it is predicted faster, with one worker and with two.
+        for best, split_name in (('trained+best-1w', 'trained+split'),
+                                 ('trained+best-2w', 'trained+split-2w')):
+            if split_name not in runs or 'trained' not in runs:
+                continue
+            flat, sp = runs['trained'], runs[split_name]
+            if flat['status'] == 'ok' and sp['status'] == 'ok' and flat['total_s'] and sp['total_s']:
+                runs[best] = {'status': 'ok', 'total_s': min(flat['total_s'], sp['total_s']),
+                              'components': None,
+                              'pick': 'split' if sp['total_s'] < flat['total_s'] else 'flat'}
             else:
-                runs['trained+best-2w'] = {
-                    'status': flat['status'] if flat['status'] != 'ok' else two['status'],
-                    'total_s': None, 'components': None}
+                runs[best] = {'status': flat['status'] if flat['status'] != 'ok' else sp['status'],
+                              'total_s': None, 'components': None}
         rows.append({'id': aid, 'n_parts': len(ass.objects), 'runs': runs})
     if any(r[0] == 'trained+split' for r in eval_runs):
         eval_runs = list(eval_runs) + [
             ('trained+split-2w', None, None, None, None,
              'the trained+split plan taken apart by two workers (S and R of the outermost split at once)'),
+            ('trained+best-1w', None, None, None, None,
+             'per assembly the faster of trained and trained+split (the subassembly plan only '
+             'where the timing model predicts it faster with one worker)'),
             ('trained+best-2w', None, None, None, None,
              'per assembly the faster of trained and trained+split-2w (the subassembly plan only '
              'where the timing model predicts it faster with two workers)'),
@@ -2099,9 +2106,10 @@ def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, e
             'untimed': [r['id'] for r in rows
                         if r['runs']['trained+split'].get('split') == 'untimed'],
         }
-        picks = [r['runs'].get('trained+best-2w', {}).get('pick') for r in rows]
-        summary['split_usage']['best_2w_picks_split'] = sum(p == 'split' for p in picks)
-        summary['split_usage']['best_2w_picks_flat'] = sum(p == 'flat' for p in picks)
+        for w in ('1w', '2w'):
+            picks = [r['runs'].get(f'trained+best-{w}', {}).get('pick') for r in rows]
+            summary['split_usage'][f'best_{w}_picks_split'] = sum(p == 'split' for p in picks)
+            summary['split_usage'][f'best_{w}_picks_flat'] = sum(p == 'flat' for p in picks)
     return summary
 
 
@@ -2129,9 +2137,10 @@ def _format_evaluation(summary):
                      f'on {u["no_plan"]}; plan not executable as told (flat time used) on '
                      f'{len(u["infeasible"])} {u["infeasible"]}'
                      + (f'; split timing missing on {u["untimed"]}' if u['untimed'] else ''))
-        if 'best_2w_picks_split' in u:
-            lines.append(f'  trained+best-2w picks the subassembly plan on {u["best_2w_picks_split"]}, '
-                         f'the flat sequence on {u["best_2w_picks_flat"]}')
+        for w in ('1w', '2w'):
+            if f'best_{w}_picks_split' in u:
+                lines.append(f'  trained+best-{w} picks the subassembly plan on {u[f"best_{w}_picks_split"]}, '
+                             f'the flat sequence on {u[f"best_{w}_picks_flat"]}')
     for key, c in summary['comparisons'].items():
         a, b = key.split(' vs ')
         lines += ['', f'{key}: time ratio {a}/{b} over {c["n_paired"]} assemblies both planned',
@@ -2164,7 +2173,8 @@ def _format_evaluation(summary):
         ratio_cols += [('trained+split', 'trained', 'split/trained'),
                        ('trained+split', 'trained+divide', 'split/divide'),
                        ('trained+split-2w', 'trained', '2w/trained'),
-                       ('trained+best-2w', 'trained', 'best/trained'),
+                       ('trained+best-1w', 'trained', 'best1/trained'),
+                       ('trained+best-2w', 'trained', 'best2/trained'),
                        ('trained+split-par', 'trained+divide', 'par/divide')]
     width = {n: max(13, len(n) + 3) + 2 for n in names}
     head = f'{"id":<7}{"parts":>6}' + ''.join(f'{n + " s":>{width[n]}}' for n in names)
