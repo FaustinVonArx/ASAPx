@@ -183,6 +183,45 @@ def main():
               f"faster than random {s['wins']}/{s['n']}")
     print(f'wrote {a.out}.png / .pdf / .json')
 
+    # By size: the same ratio per band of part counts, one line per series.
+    n_parts = {r['id']: r['n_parts'] for r in summary['per_assembly']}
+    bands = [(lo, hi) for lo, hi in ((5, 9), (10, 14), (15, 20), (21, 25), (26, 30))
+             if any(lo <= n_parts[i] <= hi for i in random_t)]
+    if len(bands) < 2:
+        return
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    width = 0.8 / len(names)
+    for k, name in enumerate(names):
+        xs, ys, los, his, ns = [], [], [], [], []
+        for b, (lo, hi) in enumerate(bands):
+            logs = [v for i, v in stats[name]['per_assembly'].items() if lo <= n_parts[i] <= hi]
+            if len(logs) < 2:
+                continue
+            g = math.exp(sum(logs) / len(logs))
+            ci = _bootstrap(logs)
+            xs.append(b - 0.4 + width * (k + 0.5))
+            ys.append(g)
+            los.append(g - ci[0])
+            his.append(ci[1] - g)
+            ns.append(len(logs))
+        ax.errorbar(xs, ys, yerr=[los, his], fmt='o', color=colors[name], ecolor=colors[name],
+                    capsize=2, ms=5, label=name, mec='black', mew=0.4)
+    ax.axhline(1.0, color='gray', ls='--', lw=1)
+    counts = []
+    for lo, hi in bands:
+        counts.append(sum(lo <= n_parts[i] <= hi for i in random_t))
+    ax.set_xticks(range(len(bands)))
+    ax.set_xticklabels([f'{lo}-{hi} parts\n(n={c})' for (lo, hi), c in zip(bands, counts)])
+    ax.set_ylabel('time / random (geometric mean, 95% CI)')
+    ax.set_title('By assembly size')
+    ax.grid(axis='y', alpha=0.3)
+    ax.spines[['top', 'right']].set_visible(False)
+    ax.legend(fontsize=8, frameon=False, loc='upper left', bbox_to_anchor=(1.0, 1.0))
+    fig.tight_layout()
+    fig.savefig(a.out + '_by_size.png', dpi=200)
+    fig.savefig(a.out + '_by_size.pdf')
+    print(f'wrote {a.out}_by_size.png / .pdf')
+
 
 if __name__ == '__main__':
     main()

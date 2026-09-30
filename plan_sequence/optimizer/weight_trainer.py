@@ -1836,10 +1836,11 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
                     if aid in runsets[run[0]]:
                         continue
                     pre = prerequisite(run[0])
-                    if (pre is not None and aid not in runsets[pre]) or \
-                            (deadline is not None and time.time() > deadline):
+                    if pre is not None and aid not in runsets[pre]:
                         pending += 1
                         continue
+                    # Past the deadline _ensure_runs still reads what is
+                    # stored; it only plans nothing new.
                     if claim(run, ass):
                         progress = True
                     else:
