@@ -14,15 +14,15 @@ summary has it:
                                  sequence selection (the cheapest explored sequence)
   trained, selected              the same with the trained weights
   trained + subassemblies        the trained weights with the recursive
-                                 subassembly plan: one worker, two workers
-                                 (S and R of the outermost split at once) and,
-                                 for older summaries without the two-worker
-                                 time, every split at once; where no plan was
-                                 found or it could not be carried out, the
-                                 flat time
-  ... where faster, 1 / 2 workers  per assembly the faster of 'trained, selected'
-                                 and the subassembly time with as many workers
-                                 (the planner choosing by its own timing model)
+                                 subassembly plan, one and two workers (S and R
+                                 of the outermost split at once), carried out
+                                 where the timing model predicts it faster than
+                                 'trained, selected' (the planner's default),
+                                 else the flat sequence
+  ... (always split)             with --show-forced (or summaries without the
+                                 choice): the plan carried out on every
+                                 assembly that has one; every split at once
+                                 ('parallel') for older summaries
 With --store and --weights, also 'trained, first' from the result store
 (records with those weights and no sequence selection). --ids defaults to
 every assembly of the summary. Left: geometric mean with a 95%
@@ -81,6 +81,9 @@ def main():
     ap.add_argument('--weights', default=None, help='the trained weights file')
     ap.add_argument('--ids', default=None, help='comma-separated ids (default: all in the summary)')
     ap.add_argument('--out', required=True, help='output path without extension')
+    ap.add_argument('--show-forced', action='store_true',
+                    help='also draw the subassembly plan carried out on every assembly '
+                         '(by default only where it is predicted faster)')
     a = ap.parse_args()
 
     with open(a.summary) as f:
@@ -103,24 +106,29 @@ def main():
     one = from_summary('trained+split') or stored.get('trained + subassemblies, 1 worker', {})
     par = {} if two else (from_summary('trained+split-par')
                           or stored.get('trained + subassemblies, parallel', {}))
+    # The subassembly plan is carried out where the timing model predicts it
+    # faster than the flat sequence (the planner's default); summaries from
+    # before that choice only have it carried out everywhere.
+    best1, best2 = from_summary('trained+best-1w'), from_summary('trained+best-2w')
+    forced = a.show_forced or not (best1 or best2)
     series = {'heur-out (baseline)': from_summary('heur-out'),
               'reference, first': from_summary('reference-first'),
               'reference, selected': from_summary('reference'),
               'trained, first': stored.get('trained, first', {}),
               'trained, selected': from_summary('trained'),
-              'trained + subassemblies, 1 worker': one,
-              'trained + subassemblies, 2 workers': two,
-              'trained + subassemblies where faster, 1 worker': from_summary('trained+best-1w'),
-              'trained + subassemblies where faster, 2 workers': from_summary('trained+best-2w'),
-              'trained + subassemblies, parallel': par}
+              'trained + subassemblies, 1 worker': best1,
+              'trained + subassemblies, 2 workers': best2,
+              'trained + subassemblies (always split), 1 worker': one if forced else {},
+              'trained + subassemblies (always split), 2 workers': two if forced else {},
+              'trained + subassemblies (always split), parallel': par if forced else {}}
     order = [n for n, v in series.items() if v]
     colors = {'heur-out (baseline)': '#969696', 'reference, first': '#9ecae1', 'reference, selected': '#3182bd',
-              'trained + subassemblies, 2 workers': '#e6550d',
-              'trained + subassemblies where faster, 1 worker': '#9e9ac8',
-              'trained + subassemblies where faster, 2 workers': '#54278f',
               'trained, first': '#a1d99b', 'trained, selected': '#31a354',
-              'trained + subassemblies, 1 worker': '#fdae6b',
-              'trained + subassemblies, parallel': '#e6550d'}
+              'trained + subassemblies, 1 worker': '#9e9ac8',
+              'trained + subassemblies, 2 workers': '#54278f',
+              'trained + subassemblies (always split), 1 worker': '#fdae6b',
+              'trained + subassemblies (always split), 2 workers': '#e6550d',
+              'trained + subassemblies (always split), parallel': '#e6550d'}
 
     stats = {}
     for name in order:
@@ -174,10 +182,10 @@ def main():
             f'geometric mean over {n_seeds} seed{"s" if n_seeds != 1 else ""}. '
             '"selected" = the cheapest sequence of the explored tree under the planner\'s own cost'
             + ('; "first" = the first one found.' if any(n.endswith('first') for n in names) else '.'))
-    if any('where faster' in n for n in names):
-        note += (' "where faster" = per assembly the faster of the flat sequence and the '
-                 'subassembly plan with as many workers, as the timing model predicts.')
-    if not two and 'trained + subassemblies, 1 worker' in names:
+    if best1 or best2:
+        note += (' Subassemblies: the plan is carried out where the timing model predicts it '
+                 'faster than the flat sequence with as many workers, else the flat sequence.')
+    elif 'trained + subassemblies (always split), 1 worker' in names and not two:
         note += (' Subassembly runs predate that setting and pick their sequence the same way '
                  '(lowest cost); "parallel" = every split at once.')
     fig.text(0.01, 0.005, note, fontsize=7.5, color='#444', wrap=True)

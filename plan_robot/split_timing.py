@@ -277,6 +277,43 @@ def parallel_makespan(plan, steps, overview, workers=None):
     return {'total_s': block_time(plan, workers), 'per_block_s': per_block, 'workers': workers}
 
 
+def split_time_for(split_overview, workers):
+    """The subassembly plan's time with `workers` (1 = sequential totals,
+    2 = 'parallel_2', None = 'parallel', every split at once); None when the
+    overview has no usable time for that."""
+    if not split_overview or split_overview.get('status') != 'ok':
+        return None
+    if workers == 1:
+        return (split_overview.get('totals') or {}).get('total_s')
+    key = 'parallel_2' if workers == 2 else 'parallel'
+    return (split_overview.get(key) or {}).get('total_s')
+
+
+def choose_split(flat_overview, split_overview, workers=1, only_if_faster=True):
+    """Whether to carry out the subassembly plan or the flat sequence: the
+    plan when it is timed and (with `only_if_faster`) predicted faster with
+    `workers` than the flat sequence. Returns {'adopt', 'workers', 'flat_s',
+    'split_s', 'reason'}."""
+    flat_s = ((flat_overview or {}).get('totals') or {}).get('total_s')
+    split_s = split_time_for(split_overview, workers)
+    if not split_overview:
+        reason, adopt = 'no subassembly plan', False
+    elif split_overview.get('status') != 'ok':
+        reason, adopt = 'plan cannot be carried out as told', False
+    elif split_s is None:
+        reason, adopt = f'no time for {workers} worker(s)', False
+    elif not only_if_faster:
+        reason, adopt = 'adopted without comparison', True
+    elif flat_s is None:
+        reason, adopt = 'flat sequence untimed', True
+    elif split_s < flat_s:
+        reason, adopt = 'faster than the flat sequence', True
+    else:
+        reason, adopt = 'not faster than the flat sequence', False
+    return {'adopt': adopt, 'workers': workers, 'flat_s': flat_s, 'split_s': split_s,
+            'reason': reason}
+
+
 def time_split_plan(planner_asset_folder, arm_asset_folder, assembly_dir, stats, setup,
                     log_dir=None, num_proc=1, sim_cache_dir=None, allow_gap=False,
                     gripper_type='rod', gripper_scale=0.4):
