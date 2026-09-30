@@ -381,13 +381,23 @@ def _split_metrics(split_timing):
     """Held parts per step of a subassembly plan as timed (split_timing's
     per_step hold_count; a join holds none), comparable with _plan_metrics'
     held_parts: the plan also has one step per part but the last, a join
-    standing in for the removal it replaces. The pull direction is not in the
-    timing, so no non_upward."""
+    standing in for the removal it replaces. non_upward over the removals
+    when the timing records their pulls."""
     steps = (split_timing or {}).get('per_step') or []
     counts = [s.get('hold_count') for s in steps]
     if not counts or any(c is None for c in counts):
         return None
-    return {'held_parts': sum(counts) / len(counts)}
+    out = {'held_parts': sum(counts) / len(counts)}
+    # Pull direction over the removals, as _plan_metrics: 1 - z of the unit
+    # pull; only split timings from after the actions were recorded have it.
+    removes = [s for s in steps if s.get('kind', 'remove') == 'remove']
+    if removes and all(s.get('action') is not None for s in removes):
+        vals = []
+        for s in removes:
+            n = math.sqrt(sum(float(x) ** 2 for x in s['action']))
+            vals.append(1.0 - float(s['action'][2]) / n if n > 1e-9 else 1.0)
+        out['non_upward'] = sum(vals) / len(vals)
+    return out
 
 
 def _use_weights(weights, path):
@@ -623,7 +633,7 @@ def _load_record(paths, fingerprint):
         return None
     if record.get('fingerprint') != fingerprint:
         return None  # a key collision; recompute
-    if record.get('status') == 'ok' and 'metrics' not in record and not record.get('split'):
+    if record.get('status') == 'ok' and 'metrics' not in record:
         record['metrics'] = _plan_metrics(paths['run'])
         _write_json(paths['record'], record)
     if record.get('split') == 'used' and 'split_metrics' not in record:
@@ -750,9 +760,9 @@ def _ensure_runs_(ass_list, args, store, weights, label, clear_sdf=False,
                           'wall_s': wall, 'label': label, 'created': time.time(),
                           'assembly_dir': str(ass.assembly_dir),
                           'fingerprint': fingerprint, **extra}
-                # Held parts / pull direction of the timed sequence; not for a
-                # split run, whose timed order is not stats['sequence'].
-                if status == 'ok' and seq_optimizer is None:
+                # Held parts / pull direction of stats['sequence'] -- for a
+                # split run its flat sequence; the plan's own are split_metrics.
+                if status == 'ok':
                     record['metrics'] = _plan_metrics(paths['run'])
                 _write_json(paths['record'], record)
                 records[aid] = record
@@ -2048,17 +2058,16 @@ def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, e
                                    ('split', 'n_joins', 'flat_total_s', 'failure',
                                     'parallel_total_s', 'parallel2_total_s')})
                 used = rec.get('split') == 'used'
-                if used:
-                    runs[name]['metrics'] = rec.get('split_metrics')
+                runs[name]['metrics'] = rec.get('split_metrics') if used else rec.get('metrics')
                 runs['trained+split-2w'] = {
                     'status': (rec.get('status') if not used or rec.get('parallel2_total_s')
                                else 'no_2_worker_timing'),
                     'total_s': rec.get('parallel2_total_s') if used else rec.get('total_s'),
                     'components': None, 'split': rec.get('split'),
-                    'metrics': rec.get('split_metrics') if used else None}
+                    'metrics': rec.get('split_metrics') if used else rec.get('metrics')}
                 runs['trained+divide'] = {
                     'status': rec.get('status'), 'total_s': rec.get('flat_total_s'),
-                    'components': rec.get('flat_components')}
+                    'components': rec.get('flat_components'), 'metrics': rec.get('metrics')}
                 # Without a usable plan there is nothing to parallelise: the
                 # flat time, as for trained+split.
                 runs['trained+split-par'] = {
@@ -2074,11 +2083,17 @@ def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, e
         # The planner's own choice between the flat sequence and the
         # subassembly plan, by the timing model it already ran on both: the
         # plan only where it is predicted faster, with one worker and with two.
+        # The flat side is the subassembly run's own flat sequence
+        # ('trained+divide'), as the pipeline compares (choose_split): usually
+        # the trained run's, but where the explored tree held a path that
+        # respects the plan's order the run's sequence is that path.
         for best, split_name in (('trained+best-1w', 'trained+split'),
                                  ('trained+best-2w', 'trained+split-2w')):
             if split_name not in runs or 'trained' not in runs:
                 continue
-            flat, sp = runs['trained'], runs[split_name]
+            sp = runs[split_name]
+            own = runs.get('trained+divide') or {}
+            flat = own if own.get('status') == 'ok' and own.get('total_s') else runs['trained']
             if flat['status'] == 'ok' and sp['status'] == 'ok' and flat['total_s'] and sp['total_s']:
                 pick = 'split' if sp['total_s'] < flat['total_s'] else 'flat'
                 chosen = sp if pick == 'split' else flat

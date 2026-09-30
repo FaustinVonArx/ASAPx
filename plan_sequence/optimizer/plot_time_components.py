@@ -73,14 +73,17 @@ def main():
         held = [x['metrics']['held_parts'] * (r['n_parts'] - 1)
                 for r, x in zip(paired, runs) if x.get('metrics')]
         held_step = [x['metrics']['held_parts'] for x in runs if x.get('metrics')]
+        pull = [x['metrics']['non_upward'] for x in runs
+                if x.get('metrics') and x['metrics'].get('non_upward') is not None]
         stats[name] = {'label': label, 'mean_total_s': total, 'components_s': comps,
                        'held_parts_per_assembly': sum(held) / len(held) if len(held) == n else None,
-                       'held_parts_per_step': sum(held_step) / len(held_step) if len(held_step) == n else None}
+                       'held_parts_per_step': sum(held_step) / len(held_step) if len(held_step) == n else None,
+                       'non_upward_per_step': sum(pull) / len(pull) if len(pull) == n else None}
     shown = [c for c in COMPONENTS
              if any((s['components_s'] or {}).get(c[0], 0.0) > 1e-6 for s in stats.values())]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 1.8 + 0.62 * len(series)),
-                                   gridspec_kw={'width_ratios': [1.6, 1]})
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 1.8 + 0.62 * len(series)),
+                                        gridspec_kw={'width_ratios': [1.6, 1, 1]})
     y = list(range(len(series)))[::-1]
     for yi, (name, label, colour) in zip(y, series):
         s = stats[name]
@@ -122,14 +125,31 @@ def main():
     ax2.set_xlim(0, held_max * 1.6 if held_max else 1)
     ax2.set_xlabel('extra parts held, per assembly (mean)')
     ax2.set_title('Required holds')
-    for ax in (ax1, ax2):
+
+    for yi, (name, label, colour) in zip(y, series):
+        v = stats[name]['non_upward_per_step']
+        if v is None:
+            ax3.text(0.02, yi, 'not recorded for subassembly plans', va='center', fontsize=8,
+                     color='#777', transform=ax3.get_yaxis_transform())
+            continue
+        ax3.barh(yi, v, color=colour, height=0.65)
+        ax3.text(v + 0.01, yi, f'{v:.2f}', va='center', fontsize=9)
+    ax3.set_yticks(y)
+    ax3.set_yticklabels([])
+    ax3.set_ylim(ax1.get_ylim())
+    ax3.set_xlim(0, 1.0)
+    ax3.set_xlabel('pull direction per step: 0 up, 1 sideways (mean)')
+    ax3.set_title('Pull direction (z-alignment)')
+    for ax in (ax1, ax2, ax3):
         ax.grid(axis='x', alpha=0.3)
         ax.spines[['top', 'right']].set_visible(False)
     note = ('Means over the same assemblies (larger assemblies weigh more in seconds). "selected" = cheapest '
             'explored sequence under the planner\'s cost; subassemblies = the plan where the timing model '
             'predicts it faster than the flat sequence, else the flat sequence. Holds: parts that must be held '
-            'for the rest to stay stable during a step, summed over the steps.')
-    fig.text(0.01, 0.005, '\n'.join(textwrap.wrap(note, 190)), fontsize=7.5, color='#444')
+            'for the rest to stay stable during a step, summed over the steps. Pull direction: 1 - cos of the '
+            'angle between a removal\'s pull and world up (0 straight up, 1 sideways, 2 straight down), '
+            'averaged over the steps -- the quantity the z_alignment weight penalises.')
+    fig.text(0.01, 0.005, '\n'.join(textwrap.wrap(note, 230)), fontsize=7.5, color='#444')
     fig.tight_layout(rect=(0, 0.05, 1, 1))
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     fig.savefig(a.out + '.png', dpi=200)

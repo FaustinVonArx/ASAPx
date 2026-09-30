@@ -348,6 +348,11 @@ def time_split_plan(planner_asset_folder, arm_asset_folder, assembly_dir, stats,
                                          gripper_type, gripper_scale, num_proc=num_proc)
         overview['parallel'] = parallel_makespan(plan, steps, overview)
         overview['parallel_2'] = parallel_makespan(plan, steps, overview, workers=2)
+        # Each removal's pull (world frame), for the plan's pull-direction
+        # metric; a join's direction is recorded in another frame, so not here.
+        for st, entry in zip(steps, overview.get('per_step') or []):
+            if st.get('kind') == 'remove' and st.get('action') is not None:
+                entry['action'] = [float(x) for x in st['action']]
         overview['status'] = 'ok'
     overview['n_joins'] = n_joins
     overview['split_sequence_source'] = stats.get('split_sequence_source')
