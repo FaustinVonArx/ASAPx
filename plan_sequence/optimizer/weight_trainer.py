@@ -383,14 +383,22 @@ def _use_weights(weights, path):
     settings.heuristic_weights_optuna_path = str(path)
 
 
-def _run_assembly(ass, args, run_dir, split=False):
+def _run_assembly(ass, args, run_dir, split=False, timeout_s=None):
     """Plan + arm-time one assembly into `run_dir`, which is wiped first:
     get_assembly_plans_ASAP returns a leftover sequence.json without planning.
-    Returns (status, total_s, wall_s, components, extra); see _assess_run."""
+    Returns (status, total_s, wall_s, components, extra); see _assess_run.
+
+    `timeout_s`: plan in a forked child that leads its own process group, and
+    kill the whole group (the planner's workers included) once it runs
+    longer; the status is then 'timeout'. Also ends a plan that hangs because
+    one of its workers was killed (e.g. out of memory), which otherwise waits
+    for it until the job's time limit."""
     run_dir = Path(run_dir)
     if run_dir.exists():
         shutil.rmtree(str(run_dir))
     run_dir.mkdir(parents=True)
+    if timeout_s:
+        return _run_assembly_guarded(ass, args, run_dir, split, float(timeout_s))
     _saved_storage = ass.storage_dir
     t0 = time.time()
     try:
@@ -402,6 +410,48 @@ def _run_assembly(ass, args, run_dir, split=False):
         status, total, components, extra = f'error: {_e}', None, None, {}
     finally:
         ass.storage_dir = _saved_storage
+    return status, total, time.time() - t0, components, extra
+
+
+def _run_assembly_guarded(ass, args, run_dir, split, timeout_s):
+    import multiprocessing
+    import signal
+
+    def child():
+        os.setsid()
+        ass.storage_dir = run_dir
+        try:
+            ass.planner.get_assembly_plans(args)
+        except BaseException:
+            traceback.print_exc()
+            os._exit(1)
+        os._exit(0)
+
+    t0 = time.time()
+    proc = multiprocessing.get_context('fork').Process(target=child)
+    proc.start()
+    proc.join(timeout_s)
+    if proc.is_alive():
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.join()
+        print(f'[optuna] {ass.id}: killed after {timeout_s:.0f}s (run timeout)')
+        return (f'timeout: over {timeout_s:.0f}s', None, time.time() - t0, None,
+                {'run_timeout_s': timeout_s})
+    try:
+        # A planner that ended on its own leaves no one else in its group.
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        status, total, components, extra = _assess_run(run_dir, ass, split=split)
+    except Exception as _e:
+        traceback.print_exc()
+        status, total, components, extra = f'error: {_e}', None, None, {}
+    if proc.exitcode and status == 'no_stats':
+        status = f'error: planner exited with {proc.exitcode}'
     return status, total, time.time() - t0, components, extra
 
 
@@ -565,6 +615,16 @@ def _load_record(paths, fingerprint):
     return record
 
 
+def _usable(record, run_timeout_s):
+    """A stored run, unless it ran out of a shorter run timeout than the
+    current one: then it is planned again with the longer limit."""
+    if record is None or not str(record.get('status', '')).startswith('timeout'):
+        return record
+    if run_timeout_s and float(record.get('run_timeout_s') or 0) < float(run_timeout_s):
+        return None
+    return record
+
+
 def _note_assembly(paths, ass):
     """A readable note of which assembly a store directory belongs to."""
     note = paths['dir'] / 'assembly.json'
@@ -575,7 +635,7 @@ def _note_assembly(paths, ass):
 
 def _ensure_runs(ass_list, args, store, weights, label, clear_sdf=False,
                  deadline=None, planner='heuristic', generator='rand', seq_optimizer=None,
-                 wait=True, arg_overrides=None, setting_overrides=None):
+                 wait=True, arg_overrides=None, setting_overrides=None, run_timeout_s=None):
     """See _ensure_runs_. `arg_overrides` / `setting_overrides`: args fields
     and settings values the run set is planned under (e.g. another --seed,
     sequence_selection='first'); they enter the fingerprint like any other."""
@@ -585,7 +645,7 @@ def _ensure_runs(ass_list, args, store, weights, label, clear_sdf=False,
     try:
         with _settings_as(setting_overrides or {}):
             return _ensure_runs_(ass_list, args, store, weights, label, clear_sdf, deadline,
-                                 planner, generator, seq_optimizer, wait)
+                                 planner, generator, seq_optimizer, wait, run_timeout_s)
     finally:
         for k, v in saved_args.items():
             setattr(args, k, v)
@@ -593,7 +653,7 @@ def _ensure_runs(ass_list, args, store, weights, label, clear_sdf=False,
 
 def _ensure_runs_(ass_list, args, store, weights, label, clear_sdf=False,
                   deadline=None, planner='heuristic', generator='rand', seq_optimizer=None,
-                  wait=True):
+                  wait=True, run_timeout_s=None):
     """One stored run per assembly with fixed `weights`, computing the missing
     ones into `store` (see _store_paths) and returning {id: record}. Several
     processes can run this at once (e.g. the workers of a job array): each
@@ -631,7 +691,7 @@ def _ensure_runs_(ass_list, args, store, weights, label, clear_sdf=False,
         for ass in pending:
             aid = str(ass.id)
             paths = _store_paths(store, ass.assembly_dir, fingerprint)
-            record = _load_record(paths, fingerprint)
+            record = _usable(_load_record(paths, fingerprint), run_timeout_s)
             if record is not None:
                 records[aid] = record
                 continue
@@ -646,7 +706,7 @@ def _ensure_runs_(ass_list, args, store, weights, label, clear_sdf=False,
             heartbeat = _LockHeartbeat(lock)
             try:
                 # Another process may have finished it between the check and the lock.
-                record = _load_record(paths, fingerprint)
+                record = _usable(_load_record(paths, fingerprint), run_timeout_s)
                 if record is not None:
                     records[aid] = record
                     continue
@@ -659,7 +719,8 @@ def _ensure_runs_(ass_list, args, store, weights, label, clear_sdf=False,
                 args.planner, args.generator, args.seq_optimizer = planner, generator, seq_optimizer
                 try:
                     status, total, wall, components, extra = _run_assembly(
-                        ass, args, paths['run'], split=(seq_optimizer == 'divide'))
+                        ass, args, paths['run'], split=(seq_optimizer == 'divide'),
+                        timeout_s=run_timeout_s)
                 finally:
                     (args.use_previous_sdf, args.planner, args.generator,
                      args.seq_optimizer) = _saved
@@ -676,7 +737,7 @@ def _ensure_runs_(ass_list, args, store, weights, label, clear_sdf=False,
                 records[aid] = record
                 print(f'[optuna] {label} {aid}: {status}'
                       + (f'  total={total:.2f}s' if status == 'ok' else '')
-                      + (f'  split={extra["split"]}' if extra else '')
+                      + (f'  split={extra["split"]}' if 'split' in extra else '')
                       + f'  ({wall:.0f}s)')
             finally:
                 heartbeat.close()
@@ -1717,7 +1778,7 @@ _SPLIT_COMPARISONS = (('trained+split-2w', 'trained'), ('trained+split-2w', 'ref
 def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
                                label='trained', time_budget_s=None, reference_only=False,
                                split=False, store=None, random_seeds=0,
-                               reference_first=False, wait_for_others=True):
+                               reference_first=False, wait_for_others=True, run_timeout_s=None):
     """Test the weights in `weights_path` on `test_eval.assemblies` (held out
     from training) against two baselines: the heuristic planner with the
     reference weights, and gen:heur-out. Every run is planned and arm-timed
@@ -1760,6 +1821,10 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
     `wait_for_others=False`: return once nothing is left that this process
     can claim, instead of waiting for the runs other processes hold (a large
     job array, followed by one summary pass).
+
+    `run_timeout_s`: wall-clock limit per plan (see _run_assembly); a plan
+    over it is stored as 'timeout' and planned again by a run with a longer
+    limit.
     """
     deadline = None if time_budget_s is None else time.time() + float(time_budget_s)
     cfg = _training_config()
@@ -1779,7 +1844,7 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
                     _ensure_runs(test_eval.assemblies, args, store, reference, name,
                                  clear_sdf=(name == 'reference'), deadline=deadline,
                                  planner=planner, generator=generator, seq_optimizer=seq_opt,
-                                 wait=wait)
+                                 wait=wait, run_timeout_s=run_timeout_s)
         return None
     with open(weights_path) as _f:
         loaded = json.load(_f)
@@ -1823,7 +1888,8 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
             [ass], args, store, reference if which == 'reference' else weights, name,
             clear_sdf=(name == 'reference'), deadline=deadline,
             planner=planner, generator=generator, seq_optimizer=seq_opt,
-            wait=False, arg_overrides=arg_over, setting_overrides=set_over)
+            wait=False, arg_overrides=arg_over, setting_overrides=set_over,
+            run_timeout_s=run_timeout_s)
         runsets[name].update(got)
         return bool(got)
 
