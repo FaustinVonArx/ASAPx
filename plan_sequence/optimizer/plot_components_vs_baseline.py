@@ -19,7 +19,6 @@ import argparse
 import json
 import os
 import random
-import textwrap
 
 import matplotlib
 matplotlib.use('Agg')
@@ -141,12 +140,7 @@ def main():
     for ax in (ax1, ax2):
         ax.grid(axis='x', alpha=0.3)
         ax.spines[['top', 'right']].set_visible(False)
-    note = (f'Each assembly counts equally: its components are divided by {base_label}\'s total time on it, '
-            'then averaged. Reference and trained return the cheapest explored sequence under the '
-            'planner\'s cost; subassemblies = the plan carried out wherever one was found. Holds: parts that must be held for the rest to stay '
-            'stable during a step.')
-    fig.text(0.01, 0.005, '\n'.join(textwrap.wrap(note, 220)), fontsize=7.5, color='#444')
-    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    fig.tight_layout()
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     fig.savefig(a.out + '.png', dpi=200)
     fig.savefig(a.out + '.pdf')
