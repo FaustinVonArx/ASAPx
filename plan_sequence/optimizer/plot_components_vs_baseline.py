@@ -35,7 +35,6 @@ SERIES = (  # (summary run, label, colour)
     ('trained', 'trained', '#31a354'),
     ('trained+split', 'trained + subassemblies, 1 worker', '#9e9ac8'),
     ('trained+split-2w', 'trained + subassemblies, 2 workers', '#54278f'),
-    ('trained+best-2w', 'trained + subassemblies, 2 workers (where faster)', '#e6550d'),
 )
 
 
@@ -74,8 +73,7 @@ def main():
         base = [r['runs'][a.baseline]['total_s'] for r in paired]
         ratios = [x['total_s'] / b for x, b in zip(runs, base)]
         # Components only when every assembly has them and they add up to the
-        # total (a two-worker time is a makespan; a where-faster series mixes
-        # flat sums with makespans).
+        # total (a two-worker time is a makespan).
         comps = None
         if all(x.get('components') for x in runs) and all(
                 abs(sum(float(x['components'].get(c) or 0.0) for c, _l, _col in COMPONENTS)
@@ -145,9 +143,7 @@ def main():
         ax.spines[['top', 'right']].set_visible(False)
     note = (f'Each assembly counts equally: its components are divided by {base_label}\'s total time on it, '
             'then averaged. Reference and trained return the cheapest explored sequence under the '
-            'planner\'s cost; subassemblies = the plan carried out wherever one was found; "where '
-            'faster" = only where the timing model predicts it faster than the flat sequence with as '
-            'many workers, else the flat sequence. Holds: parts that must be held for the rest to stay '
+            'planner\'s cost; subassemblies = the plan carried out wherever one was found. Holds: parts that must be held for the rest to stay '
             'stable during a step.')
     fig.text(0.01, 0.005, '\n'.join(textwrap.wrap(note, 220)), fontsize=7.5, color='#444')
     fig.tight_layout(rect=(0, 0.05, 1, 1))
