@@ -124,6 +124,7 @@ _TRAINING_DEFAULTS = {
     'render_gifs': False,
     'objectives': ('time',),
     'pareto_pick': 'no_worse_than_reference',
+    'pareto_tolerance': 0.0,
     'warm_start_top': 10,
 }
 
@@ -208,6 +209,9 @@ def _training_config():
     if cfg.get('pareto_pick') not in PARETO_PICKS:
         raise ValueError(f'heuristic_training.pareto_pick: {cfg.get("pareto_pick")!r}, '
                          f'not one of {PARETO_PICKS}')
+    cfg['pareto_tolerance'] = float(cfg.get('pareto_tolerance') or 0.0)
+    if cfg['pareto_tolerance'] < 0:
+        raise ValueError(f'heuristic_training.pareto_tolerance: {cfg["pareto_tolerance"]} < 0')
     return cfg
 
 
@@ -1603,7 +1607,8 @@ def train_heuristic_weights(test_eval, args,
             # Best so far after every trial, so a job killed at its time limit
             # still leaves its result behind.
             _write_best(study, weights_path, final=False, objectives=objectives,
-                        reference_values=reference_values, pick=cfg['pareto_pick'])
+                        reference_values=reference_values, pick=cfg['pareto_pick'],
+                        tolerance=cfg['pareto_tolerance'])
 
             if is_reference and outcome == 'complete':
                 drift = max((abs(math.log(r)) for r in per_ratio.values()), default=0.0)
@@ -1646,7 +1651,8 @@ def train_heuristic_weights(test_eval, args,
         if study is not None and study.trials:
             _write_history(study, history_path)
             _write_best(study, weights_path, objectives=objectives,
-                        reference_values=reference_values, pick=cfg['pareto_pick'])
+                        reference_values=reference_values, pick=cfg['pareto_pick'],
+                        tolerance=cfg['pareto_tolerance'])
         env.__exit__(None, None, None)
 
     return study
@@ -1658,76 +1664,123 @@ def pareto_path_for(weights_path):
     return weights_path.with_name(f'{weights_path.stem}_pareto.json')
 
 
-def _pareto_front(trials, objectives):
-    """The trials no other trial dominates (<= on every objective, < on one)."""
-    vals = [[t.user_attrs['entry']['objectives'][o] for o in objectives] for t in trials]
-    return [t for t, v in zip(trials, vals)
+def _pareto_front(entries, objectives):
+    """The history entries no other entry dominates (<= on every objective,
+    < on one)."""
+    vals = [[e['objectives'][o] for o in objectives] for e in entries]
+    return [e for e, v in zip(entries, vals)
             if not any(all(x <= y for x, y in zip(w, v)) and w != v for w in vals)]
 
 
+def _pick_entry(entries, objectives, reference_values=None, pick='no_worse_than_reference',
+                tolerance=0.0):
+    """The trained weights' history entry among `entries` (qualifying trials,
+    each with 'objective' = its time) and the Pareto front, or None with one
+    objective. 'no_worse_than_reference' takes the fastest front entry at most
+    (1 + tolerance) times the reference weights' value (`reference_values`) on
+    every other objective; when none is, the fastest ('fastest' always)."""
+    if len(objectives) <= 1:
+        return min(entries, key=lambda e: e['objective']), None, True
+    front = sorted(_pareto_front(entries, objectives), key=lambda e: e['objective'])
+    candidates, bar_met = front, True
+    if pick == 'no_worse_than_reference' and reference_values:
+        bar = [e for e in front
+               if all(e['objectives'][o] <= reference_values[o] * (1.0 + tolerance) + 1e-12
+                      for o in objectives if o != 'time')]
+        candidates, bar_met = (bar, True) if bar else (front, False)
+    return min(candidates, key=lambda e: e['objective']), front, bar_met
+
+
+def _write_pick(weights_path, best, front, objectives, reference_values, pick, tolerance):
+    _write_json(weights_path, best['weights'])
+    if front is not None:
+        _write_json(pareto_path_for(weights_path), {
+            'objectives': {o: OBJECTIVES[o] for o in objectives},
+            'reference_values': reference_values,
+            'pick': pick,
+            'tolerance': tolerance,
+            'picked_trial': best['trial'],
+            'front': [{'trial': e['trial'], 'objectives': e['objectives'],
+                       'geomean_ratio': math.exp(e['objective']), 'weights': e['weights']}
+                      for e in front],
+        })
+
+
+def _report_pick(weights_path, best, front, bar_met, objectives, reference_values, pick, tolerance):
+    print(f'[optuna] best trial: {best["trial"]}  geomean time ratio vs baseline: '
+          f'x{math.exp(best["objective"]):.4f}')
+    if front is not None:
+        if not bar_met:
+            print(f'[optuna] WARN no Pareto trial is within {tolerance:.0%} of the reference on '
+                  'the other objectives; taking the fastest')
+        print(f'[optuna] its objectives: {best["objectives"]}; reference: {reference_values}; '
+              f'picked by {pick!r} (tolerance {tolerance:.0%}) from a Pareto front of '
+              f'{len(front)} trials, written to {pareto_path_for(weights_path)}')
+    print(f'[optuna] best weights: {best["weights"]}')
+
+
 def _write_best(study, weights_path, final=True, objectives=('time',),
-                reference_values=None, pick='no_worse_than_reference'):
+                reference_values=None, pick='no_worse_than_reference', tolerance=0.0):
     """The trained weights are the best trial that evaluated every assembly
     and failed none; pruned, deadline and failing trials never qualify.
     `final=False` (after each trial) writes quietly.
 
     With several objectives, 'best' is picked from the Pareto front of the
-    qualifying trials by `pick`: 'no_worse_than_reference' is the fastest
-    trial that is at most as bad as the reference weights (`reference_values`)
-    on every other objective (the queued reference trial always is, so this
-    falls back to 'fastest' only when that trial never completed); 'fastest'
-    ignores the other objectives. The front itself goes to
-    pareto_path_for(weights_path), so another point can be chosen by hand."""
+    qualifying trials by `pick` (_pick_entry): 'no_worse_than_reference' is
+    the fastest trial at most (1 + `tolerance`) times as bad as the reference
+    weights (`reference_values`) on every other objective (the queued
+    reference trial always is, so this falls back to 'fastest' only when that
+    trial never completed); 'fastest' ignores the other objectives. The front
+    itself goes to pareto_path_for(weights_path), so another point can be
+    chosen by hand, or re-picked with another tolerance (repick_run)."""
     import optuna
 
-    def time_of(t):
-        return t.values[0] if t.values else None
-
-    qualified = [t for t in study.trials
-                 if t.state == optuna.trial.TrialState.COMPLETE
-                 and t.user_attrs.get('outcome') == 'complete'
-                 and t.user_attrs.get('n_failed') == 0
-                 and t.values is not None and all(math.isfinite(v) for v in t.values)]
-    if not qualified:
+    entries = [dict(t.user_attrs['entry'], trial=t.number, objective=t.values[0])
+               for t in study.trials
+               if t.state == optuna.trial.TrialState.COMPLETE
+               and t.user_attrs.get('outcome') == 'complete'
+               and t.user_attrs.get('n_failed') == 0
+               and t.values is not None and all(math.isfinite(v) for v in t.values)]
+    if not entries:
         if final:
             print('[optuna] WARN no trial completed every assembly; weights file left as-is')
         return
-    multi = len(objectives) > 1
-    if multi:
-        front = sorted(_pareto_front(qualified, objectives), key=time_of)
-        _write_json(pareto_path_for(weights_path), {
-            'objectives': {o: OBJECTIVES[o] for o in objectives},
-            'reference_values': reference_values,
-            'pick': pick,
-            'front': [{'trial': t.number,
-                       'objectives': t.user_attrs['entry']['objectives'],
-                       'geomean_ratio': math.exp(time_of(t)),
-                       'weights': t.user_attrs['entry']['weights']} for t in front],
-        })
-        candidates = front
-        if pick == 'no_worse_than_reference' and reference_values:
-            bar = [t for t in front
-                   if all(t.user_attrs['entry']['objectives'][o] <= reference_values[o] + 1e-12
-                          for o in objectives if o != 'time')]
-            if bar:
-                candidates = bar
-            elif final:
-                print('[optuna] WARN no Pareto trial is as good as the reference on the other '
-                      'objectives; taking the fastest')
-        best = min(candidates, key=time_of)
-    else:
-        best = min(qualified, key=time_of)
-    best_weights = best.user_attrs['entry']['weights']
-    _write_json(weights_path, best_weights)
-    if not final:
-        return
-    print(f'[optuna] best trial: {best.number}  geomean time ratio vs baseline: '
-          f'x{math.exp(time_of(best)):.4f}')
-    if multi:
-        print(f'[optuna] its objectives: {best.user_attrs["entry"]["objectives"]}; '
-              f'reference: {reference_values}; picked by {pick!r} from a Pareto front of '
-              f'{len(front)} trials, written to {pareto_path_for(weights_path)}')
-    print(f'[optuna] best weights: {best_weights}')
+    best, front, bar_met = _pick_entry(entries, objectives, reference_values, pick, tolerance)
+    _write_pick(weights_path, best, front, objectives, reference_values, pick, tolerance)
+    if final:
+        _report_pick(weights_path, best, front, bar_met, objectives, reference_values, pick, tolerance)
+        print(f'[optuna] best weights written to {weights_path}')
+
+
+def repick_run(run_dir, tolerance=None, pick=None, out=None):
+    """Pick a multi-objective run's weights again from its history, e.g. with
+    another tolerance, without the study (no optuna needed): reads
+    <run_dir>/history.json and the reference values in
+    <run_dir>/heuristic_weights_pareto.json, writes `out` (default
+    <run_dir>/heuristic_weights.json) and its _pareto.json. tolerance / pick
+    default to settings.heuristic_training."""
+    cfg = _training_config()
+    tolerance = cfg['pareto_tolerance'] if tolerance is None else tolerance
+    pick = pick or cfg['pareto_pick']
+    run_dir = Path(run_dir)
+    with open(run_dir / 'history.json') as f:
+        history = json.load(f)
+    with open(run_dir / 'heuristic_weights_pareto.json') as f:
+        old = json.load(f)
+    objectives = tuple(old['objectives'])
+    entries = [e for e in history
+               if e.get('outcome') == 'complete' and not e.get('n_failed')
+               and e.get('objectives') and all(math.isfinite(e['objectives'][o]) for o in objectives)]
+    entries = [dict(e, objective=e['objectives']['time']) for e in entries]
+    if not entries:
+        print(f'[optuna] {run_dir}: no complete trial in its history')
+        return None
+    out = Path(out) if out else run_dir / 'heuristic_weights.json'
+    best, front, bar_met = _pick_entry(entries, objectives, old['reference_values'], pick, tolerance)
+    _write_pick(out, best, front, objectives, old['reference_values'], pick, tolerance)
+    _report_pick(out, best, front, bar_met, objectives, old['reference_values'], pick, tolerance)
+    print(f'[optuna] weights written to {out}')
+    return best
     print(f'[optuna] best weights written to {weights_path}')
 
 
