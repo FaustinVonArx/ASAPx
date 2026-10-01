@@ -20,7 +20,7 @@ summary has it:
                                  S and R of the outermost split at once);
                                  'parallel' = every split at once, for older
                                  summaries without the 2-worker time
-  ... (where faster)             with --where-faster: the plan only where the
+  ... (where faster)             with --where-faster [1,2]: the plan only where the
                                  timing model predicts it faster than the flat
                                  sequence with as many workers, else the flat
                                  sequence
@@ -86,9 +86,10 @@ def main():
     ap.add_argument('--baseline', choices=('random', 'heur-out'), default='random',
                     help='what every series is divided by; with heur-out, random decisions '
                          'become one of the series')
-    ap.add_argument('--where-faster', action='store_true',
+    ap.add_argument('--where-faster', nargs='?', const='1,2', default='',
                     help='also draw the subassembly plan carried out only where the timing '
-                         'model predicts it faster than the flat sequence')
+                         'model predicts it faster than the flat sequence, for these worker '
+                         'counts (comma-separated; bare flag = 1,2)')
     a = ap.parse_args()
 
     with open(a.summary) as f:
@@ -116,8 +117,9 @@ def main():
     # The plan carried out wherever one was found: no decision that reads the
     # timing model, which also scores the result. --where-faster adds the
     # choice by predicted time (trained+best-*, newer summaries).
-    best1, best2 = ((from_summary('trained+best-1w'), from_summary('trained+best-2w'))
-                    if a.where_faster else ({}, {}))
+    wf = {w.strip() for w in a.where_faster.split(',') if w.strip()}
+    best1 = from_summary('trained+best-1w') if '1' in wf else {}
+    best2 = from_summary('trained+best-2w') if '2' in wf else {}
     series = {'random decisions': random_t if a.baseline != 'random' else {},
               'heur-out (baseline)': from_summary('heur-out') if a.baseline != 'heur-out' else {},
               'reference, first': from_summary('reference-first'),
