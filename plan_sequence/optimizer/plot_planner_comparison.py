@@ -129,6 +129,8 @@ def main():
               'trained + subassemblies, 1 worker': one,
               'trained + subassemblies, 2 workers': two,
               'trained + subassemblies, parallel': par,
+              'trained + subassemblies (re-planned), 1 worker': from_summary('trained+split-replan'),
+              'trained + subassemblies (re-planned), 2 workers': from_summary('trained+split-replan-2w'),
               'trained + subassemblies, 1 worker (where faster)': best1,
               'trained + subassemblies, 2 workers (where faster)': best2}
     order = [n for n, v in series.items() if v]
@@ -137,6 +139,8 @@ def main():
               'trained + subassemblies, 1 worker': '#9e9ac8',
               'trained + subassemblies, 2 workers': '#54278f',
               'trained + subassemblies, parallel': '#54278f',
+              'trained + subassemblies (re-planned), 1 worker': '#c994c7',
+              'trained + subassemblies (re-planned), 2 workers': '#980043',
               'trained + subassemblies, 1 worker (where faster)': '#fdae6b',
               'trained + subassemblies, 2 workers (where faster)': '#e6550d'}
 
@@ -197,7 +201,9 @@ def main():
         note += (' Subassemblies: the plan is carried out wherever one was found'
                  + ('; "where faster" = only where the timing model predicts it faster than the '
                     'flat sequence with as many workers, else the flat sequence' if best1 or best2 else '')
-                 + ('; "parallel" = every split at once' if par else '') + '.')
+                 + ('; "parallel" = every split at once' if par else '')
+                 + ('; "re-planned" = every block\'s removal order searched on the block alone'
+                    if any('re-planned' in n for n in names) else '') + '.')
     fig.text(0.01, 0.005, note, fontsize=7.5, color='#444', wrap=True)
     fig.tight_layout(rect=(0, 0.04, 1, 1))
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)

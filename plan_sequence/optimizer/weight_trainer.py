@@ -323,6 +323,11 @@ def _assess_run(storage_dir, ass, split=False):
 
     extra = {'split': 'none', 'flat_total_s': float(total), 'flat_components': timing['totals'],
              'n_joins': 0, 'source': stats.get('split_sequence_source')}
+    if stats.get('subassembly_replan') is not None:
+        report = stats['subassembly_replan']
+        extra['replan'] = {'blocks': len(report),
+                           'replanned': sum(r.get('replanned') is not None for r in report),
+                           'changed': sum(bool(r.get('changed')) for r in report)}
     if not stats.get('split_plan'):
         return 'ok', float(total), timing['totals'], extra
     try:
@@ -530,6 +535,10 @@ def _run_fingerprint(args, weights, planner='heuristic', generator='rand', seq_o
     selection = getattr(settings, 'sequence_selection', 'min_cost')
     if planner == 'heuristic' and (selection != 'first' or seq_optimizer == 'divide'):
         fp['sequence_selection'] = selection
+    # Blocks of the subassembly plan re-planned on their own: a different run,
+    # recorded only when on so the runs made before it stay reusable.
+    if seq_optimizer == 'divide' and getattr(settings, 'subassembly_replan_blocks', False):
+        fp['settings']['subassembly_replan_blocks'] = True
     # JSON round trip so a fresh fingerprint compares equal to a stored one
     # (tuples become lists).
     return json.loads(json.dumps(fp, default=str))
@@ -1812,6 +1821,11 @@ _EVAL_COMPARISONS = (('trained', 'reference'), ('trained', 'heur-out'), ('heur-o
                      ('reference', 'random'), ('reference-first', 'random'),
                      ('trained', 'random'), ('heur-out', 'random'),
                      ('reference', 'reference-first'))
+# With split_replan: trained+split with every leaf block of the subassembly
+# plan re-planned on its own (settings.subassembly_replan_blocks), not
+# taken apart in the flat sequence's order.
+_SPLIT_REPLAN_RUN = ('trained+split-replan', 'heuristic', 'rand', 'divide', 'trained',
+                     'trained weights + subassembly plan, every block re-planned on its own')
 # With random_seeds: the reference weights without sequence selection, so
 # random (which cannot select) is also compared with the ranking alone.
 _REFERENCE_FIRST_RUN = ('reference-first', 'heuristic', 'rand', None, 'reference',
@@ -1864,13 +1878,19 @@ _SPLIT_COMPARISONS = (('trained+best-1w', 'random'), ('trained+best-1w', 'traine
                       ('trained+split-par', 'trained+split'),
                       ('trained+split-par', 'trained+divide'),
                       ('trained+split-par', 'trained'), ('trained+split-par', 'reference'),
-                      ('trained+split-par', 'heur-out'))
+                      ('trained+split-par', 'heur-out'),
+                      ('trained+split-replan', 'trained+split'),
+                      ('trained+split-replan-2w', 'trained+split-2w'),
+                      ('trained+split-replan', 'trained'), ('trained+split-replan-2w', 'trained'),
+                      ('trained+split-replan', 'heur-out'), ('trained+split-replan-2w', 'heur-out'),
+                      ('trained+split-replan', 'random'), ('trained+split-replan-2w', 'random'))
 
 
 def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
                                label='trained', time_budget_s=None, reference_only=False,
                                split=False, store=None, random_seeds=0,
-                               reference_first=False, wait_for_others=True, run_timeout_s=None):
+                               reference_first=False, wait_for_others=True, run_timeout_s=None,
+                               split_replan=False):
     """Test the weights in `weights_path` on `test_eval.assemblies` (held out
     from training) against two baselines: the heuristic planner with the
     reference weights, and gen:heur-out. Every run is planned and arm-timed
@@ -1896,6 +1916,11 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
     and compare it with the other three. Its search replays the 'trained'
     run's physics from the cache; the divide optimizer, the plan's
     verification and the per-context checks of its timing are what it adds.
+
+    `split_replan` (implies `split`): also 'trained+split-replan', the same
+    with every leaf block of the plan re-planned on its own
+    (settings.subassembly_replan_blocks), after trained+split, whose search
+    and plan it replays from the cache.
 
     `random_seeds` (k > 0): also plan every assembly k times with random
     decisions ('dfa-random': the same search, the next frontier drawn at
@@ -1948,8 +1973,12 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
     print(f'[eval] {len(test_eval.assemblies)} assemblies; reference {reference}; '
           f'{label} {weights} (from {weights_path})')
 
+    split = split or split_replan
     eval_runs = [r for r in _EVAL_RUNS if split or r[3] is None]
     overrides = {}
+    if split_replan:
+        eval_runs.append(_SPLIT_REPLAN_RUN)
+        overrides['trained+split-replan'] = ({}, {'subassembly_replan_blocks': True})
     seeds = list(range(int(random_seeds or 0)))
     if reference_first:
         eval_runs.append(_REFERENCE_FIRST_RUN)
@@ -1964,14 +1993,15 @@ def evaluate_heuristic_weights(test_eval, args, weights_path, output_root=None,
     # phase normally leaves done; so a shortfall there cannot starve the
     # trained runs. Two passes: first what no other worker holds, then wait.
     priority = {'reference': 0, 'reference-first': 1, 'trained': 2, 'trained+split': 3,
-                'heur-out': 99}
+                'trained+split-replan': 4, 'heur-out': 99}
     ordered = sorted(eval_runs, key=lambda r: priority.get(r[0], 50))
     runsets = {r[0]: {} for r in ordered}
 
     def prerequisite(name):
         if name == 'reference':
             return None
-        return {'trained+split': 'trained'}.get(name, 'reference')
+        return {'trained+split': 'trained',
+                'trained+split-replan': 'trained+split'}.get(name, 'reference')
 
     def claim(run, ass):
         name, planner, generator, seq_opt, which, _what = run
@@ -2115,12 +2145,14 @@ def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, e
                                     'parallel_total_s', 'parallel2_total_s')})
                 used = rec.get('split') == 'used'
                 runs[name]['metrics'] = rec.get('split_metrics') if used else rec.get('metrics')
-                runs['trained+split-2w'] = {
+                runs[f'{name}-2w'] = {
                     'status': (rec.get('status') if not used or rec.get('parallel2_total_s')
                                else 'no_2_worker_timing'),
                     'total_s': rec.get('parallel2_total_s') if used else rec.get('total_s'),
                     'components': None, 'split': rec.get('split'),
                     'metrics': rec.get('split_metrics') if used else rec.get('metrics')}
+                if name != 'trained+split':
+                    continue
                 runs['trained+divide'] = {
                     'status': rec.get('status'), 'total_s': rec.get('flat_total_s'),
                     'components': rec.get('flat_components'), 'metrics': rec.get('metrics')}
@@ -2131,11 +2163,12 @@ def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, e
                     'total_s': (rec.get('parallel_total_s') if rec.get('split') == 'used'
                                 else rec.get('total_s')),
                     'components': None, 'split': rec.get('split')}
-            elif name == 'trained+split':
-                runs['trained+divide'] = {'status': rec.get('status'), 'total_s': None,
-                                          'components': None}
-                runs['trained+split-par'] = dict(runs['trained+divide'])
-                runs['trained+split-2w'] = dict(runs['trained+divide'])
+            elif name in ('trained+split', 'trained+split-replan'):
+                runs[f'{name}-2w'] = {'status': rec.get('status'), 'total_s': None,
+                                      'components': None}
+                if name == 'trained+split':
+                    runs['trained+divide'] = dict(runs[f'{name}-2w'])
+                    runs['trained+split-par'] = dict(runs[f'{name}-2w'])
         # The planner's own choice between the flat sequence and the
         # subassembly plan, by the timing model it already ran on both: the
         # plan only where it is predicted faster, with one worker and with two.
@@ -2176,6 +2209,10 @@ def _summarize_evaluation(ass_list, runsets, reference, weights, weights_path, e
              'the trained+split plan with S and R of every split taken apart in parallel'),
             ('trained+divide', None, None, None, None,
              'trained weights, divide optimizer\'s sequence timed flat (the trained+split run without the split)')]
+    if any(r[0] == 'trained+split-replan' for r in eval_runs):
+        eval_runs = list(eval_runs) + [
+            ('trained+split-replan-2w', None, None, None, None,
+             'the trained+split-replan plan taken apart by two workers')]
     success = {}
     for name, *_ in eval_runs:
         statuses = [r['runs'][name]['status'] for r in rows]

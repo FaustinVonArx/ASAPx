@@ -148,8 +148,62 @@ def _dump_failure_evidence(tree, asset_folder, assembly_dir, base_part, tools, s
     return payload
 
 
+def _block_assembly_dir(assembly_dir, parts, root):
+    """An assembly directory holding only `parts` of `assembly_dir`: their
+    meshes (and saved SDFs) linked, config.json / normalization.json copied.
+    Part poses are those of the full assembly, so physics sees the block
+    exactly as it sits in the assembly, with every other part gone."""
+    import shutil
+    if os.path.isdir(root):
+        shutil.rmtree(root)
+    os.makedirs(root)
+    src_dir = os.path.abspath(assembly_dir)
+    for p in parts:
+        for ext in ('.obj', '.sdf'):
+            src = os.path.join(src_dir, f'{p}{ext}')
+            if os.path.exists(src):
+                os.symlink(src, os.path.join(root, f'{p}{ext}'))
+    for name in ('config.json', 'normalization.json'):
+        if os.path.exists(os.path.join(src_dir, name)):
+            shutil.copy(os.path.join(src_dir, name), os.path.join(root, name))
+    return root
+
+
+def _replan_split_leaves(plan, order, replan_block, min_parts=3):
+    """Re-plan the removal order of every leaf block of `plan` with at least
+    `min_parts` parts on its own (`replan_block(parts, tag)` -> order over the
+    block's parts, or None), instead of the flat sequence's order restricted
+    to the block. Prefixes keep their order: they come off a body that still
+    holds the sub-blocks they free. Returns (new overall order, per-block
+    report); the order is `order` itself where nothing changed."""
+    pos = {p: i for i, p in enumerate(order)}
+    report = []
+
+    def walk(block, path):
+        if block['kind'] == 'split':
+            return (sorted(block['prefix'], key=lambda q: pos.get(q, len(order)))
+                    + walk(block['S'], path + ('S',)) + walk(block['R'], path + ('R',)))
+        old = sorted(block['parts'], key=lambda q: pos.get(q, len(order)))
+        if len(old) < min_parts:
+            return old
+        tag = '.'.join(path) or 'root'
+        try:
+            new = replan_block(list(block['parts']), tag)
+        except Exception as e:  # a failed re-plan keeps the inherited order
+            print(f'[seq_plan] re-planning block {tag} failed: {e}')
+            new = None
+        ok = new is not None and sorted(map(str, new)) == sorted(map(str, old))
+        report.append({'block': tag, 'parts': len(old), 'inherited': old,
+                       'replanned': list(new) if ok else None,
+                       'changed': bool(ok and list(new) != old)})
+        return list(new) if ok else old
+
+    return walk(plan, ()), report
+
+
 def _build_subassembly_plan(stats, tree, opt, div, asset_folder, assembly_dir,
-                            cost_fn=None, threshold=0.1, num_proc=1, debug=0):
+                            cost_fn=None, threshold=0.1, num_proc=1, debug=0,
+                            replan_block=None):
     """Build the recursive prefix -> unified split -> S -> R plan and, when one
     exists, re-pick the disassembly sequence so its ORDER respects it.
 
@@ -243,6 +297,22 @@ def _build_subassembly_plan(stats, tree, opt, div, asset_folder, assembly_dir,
         order = derive_split_sequence(plan, stats['sequence'])
 
     plan = retarget_split_plan(plan, order)
+    # settings.subassembly_replan_blocks: each leaf block's removal order
+    # searched on the block alone (the halves come apart without the other
+    # side present), instead of the flat order restricted to the block.
+    if replan_block is not None:
+        new_order, report = _replan_split_leaves(plan, order, replan_block)
+        stats['subassembly_replan'] = report
+        if new_order != order:
+            if source == 'tree':
+                # No longer a tree path: the renderer goes back to the flat one.
+                stats['sequence'] = stats.pop('flat_sequence')
+                source = 'derived'
+            order = new_order
+            plan = retarget_split_plan(plan, order)
+        print(f'[seq_plan] subassembly blocks re-planned: '
+              f'{sum(r["replanned"] is not None for r in report)}/{len(report)} '
+              f'({sum(r["changed"] for r in report)} changed)')
     steps = flatten_split_plan(plan, order)
 
     # Attach the verified separation axis to each join step. This is plan
@@ -413,10 +483,41 @@ def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc,
             # Recursive subassembly plan. Runs alongside everything above: the
             # flat sequence has already been chosen and divide_split already
             # persisted, so a failure here leaves the run exactly as it was.
+            _replan = None
+            try:
+                import settings as _user_settings
+                _do_replan = bool(getattr(_user_settings, 'subassembly_replan_blocks', False))
+            except ImportError:
+                _do_replan = False
+            if _do_replan:
+                import tempfile
+                _blocks_root = (os.path.join(log_dir, 'subassembly_blocks') if log_dir is not None
+                                else tempfile.mkdtemp(prefix='subassembly_blocks_'))
+
+                def _replan(parts, tag):
+                    # The same planner, weights and budget on the block alone.
+                    block_dir = _block_assembly_dir(
+                        assembly_dir, parts, os.path.join(_blocks_root, tag, 'assembly'))
+                    block_log = os.path.join(_blocks_root, tag, 'log')
+                    os.makedirs(block_log, exist_ok=True)
+                    sub = seq_plan(
+                        asset_folder, block_dir, generator_name, planner_name, num_proc, seed,
+                        budget, max_gripper, max_pose, pose_reuse, early_term, timeout, None,
+                        save_sdf, False, plan_grasp, plan_arm, gripper_type, gripper_scale,
+                        optimizer, debug, False, None, block_log, allow_gap=allow_gap,
+                        n_success_term=n_success_term, connect_path=connect_path,
+                        get_dof=get_dof, tools=tools, skip_stability=skip_stability,
+                        max_frontier=max_frontier, seq_optimizer=None,
+                        sim_cache_dir=sim_cache_dir)
+                    if not sub or not sub.get('success'):
+                        return None
+                    seq = [str(p) for p in sub['sequence']]
+                    return seq + [str(p) for p in parts if str(p) not in seq]
+
             _build_subassembly_plan(
                 stats, tree, opt, div, asset_folder, assembly_dir,
                 cost_fn=_cost_fn, threshold=_threshold, num_proc=num_proc,
-                debug=debug,
+                debug=debug, replan_block=_replan,
             )
 
         if log_dir is not None:
@@ -476,6 +577,7 @@ def seq_plan(asset_folder, assembly_dir, generator_name, planner_name, num_proc,
 
     if clear_sdf:
         clear_saved_sdfs(assembly_dir)
+    return stats
 
 
 if __name__ == '__main__':

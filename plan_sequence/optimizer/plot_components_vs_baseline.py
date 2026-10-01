@@ -34,6 +34,8 @@ SERIES = (  # (summary run, label, colour)
     ('trained', 'trained', '#31a354'),
     ('trained+split', 'trained + subassemblies, 1 worker', '#9e9ac8'),
     ('trained+split-2w', 'trained + subassemblies, 2 workers', '#54278f'),
+    ('trained+split-replan', 'trained + subassemblies (re-planned), 1 worker', '#c994c7'),
+    ('trained+split-replan-2w', 'trained + subassemblies (re-planned), 2 workers', '#980043'),
 )
 
 
