@@ -26,7 +26,8 @@ summary has it:
                                  sequence
 With --store and --weights, also 'trained, first' from the result store
 (records with those weights and no sequence selection). --ids defaults to
-every assembly of the summary. Left: geometric mean with a 95%
+every assembly of the summary. --baseline heur-out divides by heur-out
+instead, random decisions then being one of the series. Left: geometric mean with a 95%
 bootstrap interval and how many assemblies beat random; right: every
 assembly. Writes <out>.png and <out>.pdf.
 """
@@ -82,6 +83,9 @@ def main():
     ap.add_argument('--weights', default=None, help='the trained weights file')
     ap.add_argument('--ids', default=None, help='comma-separated ids (default: all in the summary)')
     ap.add_argument('--out', required=True, help='output path without extension')
+    ap.add_argument('--baseline', choices=('random', 'heur-out'), default='random',
+                    help='what every series is divided by; with heur-out, random decisions '
+                         'become one of the series')
     ap.add_argument('--where-faster', action='store_true',
                     help='also draw the subassembly plan carried out only where the timing '
                          'model predicts it faster than the flat sequence')
@@ -97,6 +101,8 @@ def main():
                 if i in rows and rows[i].get(name, {}).get('status') == 'ok'}
 
     random_t = from_summary('random')
+    base_t = from_summary(a.baseline)
+    base = 'random' if a.baseline == 'random' else 'heur-out'
     stored = {}
     if a.store and a.weights:
         with open(a.weights) as f:
@@ -112,7 +118,8 @@ def main():
     # choice by predicted time (trained+best-*, newer summaries).
     best1, best2 = ((from_summary('trained+best-1w'), from_summary('trained+best-2w'))
                     if a.where_faster else ({}, {}))
-    series = {'heur-out (baseline)': from_summary('heur-out'),
+    series = {'random decisions': random_t if a.baseline != 'random' else {},
+              'heur-out (baseline)': from_summary('heur-out') if a.baseline != 'heur-out' else {},
               'reference, first': from_summary('reference-first'),
               'reference': from_summary('reference'),
               'trained, first': stored.get('trained, first', {}),
@@ -123,7 +130,7 @@ def main():
               'trained + subassemblies, 1 worker (where faster)': best1,
               'trained + subassemblies, 2 workers (where faster)': best2}
     order = [n for n, v in series.items() if v]
-    colors = {'heur-out (baseline)': '#969696', 'reference, first': '#9ecae1', 'reference': '#3182bd',
+    colors = {'random decisions': '#bdbdbd', 'heur-out (baseline)': '#969696', 'reference, first': '#9ecae1', 'reference': '#3182bd',
               'trained, first': '#a1d99b', 'trained': '#31a354',
               'trained + subassemblies, 1 worker': '#9e9ac8',
               'trained + subassemblies, 2 workers': '#54278f',
@@ -133,8 +140,8 @@ def main():
 
     stats = {}
     for name in order:
-        common = [i for i in ids if i in series[name] and i in random_t]
-        logs = [math.log(series[name][i] / random_t[i]) for i in common]
+        common = [i for i in ids if i in series[name] and i in base_t]
+        logs = [math.log(series[name][i] / base_t[i]) for i in common]
         if not logs:
             continue
         lo, hi = _bootstrap(logs)
@@ -153,12 +160,13 @@ def main():
         ax1.text(s['ci'][1] + 0.02, yi, f"x{s['geomean']:.2f}   {s['wins']}/{s['n']} faster",
                  va='center', fontsize=9)
     ax1.axvline(1.0, color='gray', ls='--', lw=1)
-    ax1.text(1.01, -0.55, 'random = 1', color='gray', fontsize=9, va='center')
+    ax1.text(1.01, -0.55, f'{base} = 1', color='gray', fontsize=9, va='center')
     ax1.set_yticks(y)
     ax1.set_yticklabels(names)
     ax1.set_xlim(0, 1.45)
-    ax1.set_xlabel('predicted assembly time / random  (geometric mean, 95% bootstrap CI)')
-    ax1.set_title('Time relative to random decisions')
+    ax1.set_xlabel(f'predicted assembly time / {base}  (geometric mean, 95% bootstrap CI)')
+    ax1.set_title('Time relative to random decisions' if base == 'random'
+                  else 'Time relative to the heur-out baseline')
 
     for yi, name in zip(y, names):
         vals = [math.exp(v) for v in stats[name]['per_assembly'].values()]
@@ -172,8 +180,8 @@ def main():
     ax2.set_xticklabels([f'x{t:g}' for t in ticks])
     ax2.set_yticks(y)
     ax2.set_yticklabels([])
-    ax2.set_xlabel('per assembly, time / random (log scale)')
-    ax2.set_title(f'Every assembly (n={len(random_t)})')
+    ax2.set_xlabel(f'per assembly, time / {base} (log scale)')
+    ax2.set_title(f'Every assembly (n={len(base_t)})')
     for ax in (ax1, ax2):
         ax.grid(axis='x', alpha=0.3)
         ax.spines[['top', 'right']].set_visible(False)
@@ -198,13 +206,13 @@ def main():
     for name in names:
         s = stats[name]
         print(f"{name:<36} x{s['geomean']:.3f}  CI [{s['ci'][0]:.3f}, {s['ci'][1]:.3f}]  "
-              f"faster than random {s['wins']}/{s['n']}")
+              f"faster than {base} {s['wins']}/{s['n']}")
     print(f'wrote {a.out}.png / .pdf / .json')
 
     # By size: the same ratio per band of part counts, one line per series.
     n_parts = {r['id']: r['n_parts'] for r in summary['per_assembly']}
     bands = [(lo, hi) for lo, hi in ((5, 9), (10, 14), (15, 20), (21, 25), (26, 30))
-             if any(lo <= n_parts[i] <= hi for i in random_t)]
+             if any(lo <= n_parts[i] <= hi for i in base_t)]
     if len(bands) < 2:
         return
     fig, ax = plt.subplots(figsize=(8, 4.8))
@@ -227,10 +235,10 @@ def main():
     ax.axhline(1.0, color='gray', ls='--', lw=1)
     counts = []
     for lo, hi in bands:
-        counts.append(sum(lo <= n_parts[i] <= hi for i in random_t))
+        counts.append(sum(lo <= n_parts[i] <= hi for i in base_t))
     ax.set_xticks(range(len(bands)))
     ax.set_xticklabels([f'{lo}-{hi} parts\n(n={c})' for (lo, hi), c in zip(bands, counts)])
-    ax.set_ylabel('time / random (geometric mean, 95% CI)')
+    ax.set_ylabel(f'time / {base} (geometric mean, 95% CI)')
     ax.set_title('By assembly size')
     ax.grid(axis='y', alpha=0.3)
     ax.spines[['top', 'right']].set_visible(False)
