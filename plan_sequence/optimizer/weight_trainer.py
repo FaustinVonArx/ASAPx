@@ -2074,13 +2074,16 @@ def _compare(rows, a, b):
             out['by_size'].append({'parts': f'{lo}-{hi}' if hi else f'{lo}+', 'n': len(band),
                                    'geomean_ratio': _geomean(band)})
     out['metric_mean'] = {}
-    with_metrics = [r for r in paired if all(r['runs'][x].get('metrics') for x in (a, b))]
-    if with_metrics:
-        for m in ('held_parts', 'non_upward'):
+    # Per metric, over the pairs where both sides have it: subassembly runs
+    # timed before the split timing recorded pulls have holds but no pull.
+    for m in ('held_parts', 'non_upward'):
+        with_m = [r for r in paired
+                  if all((r['runs'][x].get('metrics') or {}).get(m) is not None for x in (a, b))]
+        if with_m:
             out['metric_mean'][m] = {
-                side: sum(r['runs'][side]['metrics'][m] for r in with_metrics) / len(with_metrics)
+                side: sum(r['runs'][side]['metrics'][m] for r in with_m) / len(with_m)
                 for side in (a, b)}
-        out['metric_n'] = len(with_metrics)
+            out.setdefault('metric_n', len(with_m))
     out['component_mean_s'] = {}
     # Only where both sides have a breakdown (the parallel total has none: it
     # is not a sum of the components).
