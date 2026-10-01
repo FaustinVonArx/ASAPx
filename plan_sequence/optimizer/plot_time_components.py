@@ -30,8 +30,8 @@ SERIES = (  # (summary run, label, colour)
     ('heur-out', 'heur-out (baseline)', '#969696'),
     ('reference', 'reference', '#3182bd'),
     ('trained', 'trained', '#31a354'),
-    ('trained+best-1w', 'trained + subassemblies, 1 worker', '#9e9ac8'),
-    ('trained+split-2w', 'trained + subassemblies, 2 workers (always split)', '#54278f'),
+    ('trained+split', 'trained + subassemblies, 1 worker', '#9e9ac8'),
+    ('trained+split-2w', 'trained + subassemblies, 2 workers', '#54278f'),
 )
 COMPONENTS = (  # (component, label, colour)
     ('step_disassembly_s', 'part removal motion', '#4c72b0'),
@@ -144,9 +144,8 @@ def main():
         ax.grid(axis='x', alpha=0.3)
         ax.spines[['top', 'right']].set_visible(False)
     note = ('Means over the same assemblies (larger assemblies weigh more in seconds). Reference and trained '
-            'return the cheapest explored sequence under the planner\'s cost; subassemblies, 1 worker = the plan where the timing '
-            'model predicts it faster than the flat sequence, else the flat sequence; 2 workers = the plan '
-            'wherever one was found. Holds: parts that must be held '
+            'return the cheapest explored sequence under the planner\'s cost; subassemblies = the plan carried out wherever one '
+            'was found. Holds: parts that must be held '
             'for the rest to stay stable during a step, summed over the steps. Pull direction: 1 - cos of the '
             'angle between a removal\'s pull and world up (0 straight up, 1 sideways, 2 straight down), '
             'averaged over the steps -- the quantity the z_alignment weight penalises.')

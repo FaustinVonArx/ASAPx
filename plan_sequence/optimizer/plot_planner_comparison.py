@@ -15,16 +15,15 @@ summary has it:
   reference, first               the same, first sequence found (no selection)
   trained                        the same with the trained weights
   trained + subassemblies,       the trained weights with the recursive
-    1 worker                     subassembly plan, carried out where the timing
-                                 model predicts it faster than the flat
-                                 sequence (the planner's default), else the
-                                 flat sequence
-  ..., 2 workers (always split)  S and R of the outermost split at once, the
-                                 plan carried out on every assembly that has one
-  with --show-forced also        1 worker always split and 2 workers where
-                                 faster; summaries without the choice draw the
-                                 always-split series ('parallel' = every split
-                                 at once, older summaries)
+    1 / 2 workers                subassembly plan carried out on every assembly
+                                 that has one, no time-based choice (2 workers:
+                                 S and R of the outermost split at once);
+                                 'parallel' = every split at once, for older
+                                 summaries without the 2-worker time
+  ... (where faster)             with --where-faster: the plan only where the
+                                 timing model predicts it faster than the flat
+                                 sequence with as many workers, else the flat
+                                 sequence
 With --store and --weights, also 'trained, first' from the result store
 (records with those weights and no sequence selection). --ids defaults to
 every assembly of the summary. Left: geometric mean with a 95%
@@ -83,8 +82,9 @@ def main():
     ap.add_argument('--weights', default=None, help='the trained weights file')
     ap.add_argument('--ids', default=None, help='comma-separated ids (default: all in the summary)')
     ap.add_argument('--out', required=True, help='output path without extension')
-    ap.add_argument('--show-forced', action='store_true',
-                    help='also draw 1 worker always split and 2 workers where predicted faster')
+    ap.add_argument('--where-faster', action='store_true',
+                    help='also draw the subassembly plan carried out only where the timing '
+                         'model predicts it faster than the flat sequence')
     a = ap.parse_args()
 
     with open(a.summary) as f:
@@ -107,33 +107,29 @@ def main():
     one = from_summary('trained+split') or stored.get('trained + subassemblies, 1 worker', {})
     par = {} if two else (from_summary('trained+split-par')
                           or stored.get('trained + subassemblies, parallel', {}))
-    # The subassembly plan is carried out where the timing model predicts it
-    # faster than the flat sequence (the planner's default); summaries from
-    # before that choice only have it carried out everywhere.
-    best1, best2 = from_summary('trained+best-1w'), from_summary('trained+best-2w')
-    # Defaults: 1 worker where faster, 2 workers always split (the timing
-    # predicts it faster on most assemblies, and no rule that does not read
-    # the timing beats always splitting there).
-    old = not (best1 or best2)
-    extra = a.show_forced or old
+    # The plan carried out wherever one was found: no decision that reads the
+    # timing model, which also scores the result. --where-faster adds the
+    # choice by predicted time (trained+best-*, newer summaries).
+    best1, best2 = ((from_summary('trained+best-1w'), from_summary('trained+best-2w'))
+                    if a.where_faster else ({}, {}))
     series = {'heur-out (baseline)': from_summary('heur-out'),
               'reference, first': from_summary('reference-first'),
               'reference': from_summary('reference'),
               'trained, first': stored.get('trained, first', {}),
               'trained': from_summary('trained'),
-              'trained + subassemblies, 1 worker': best1,
-              'trained + subassemblies (always split), 1 worker': one if extra else {},
-              'trained + subassemblies, 2 workers (where faster)': best2 if a.show_forced else {},
-              'trained + subassemblies, 2 workers (always split)': two,
-              'trained + subassemblies (always split), parallel': par if old else {}}
+              'trained + subassemblies, 1 worker': one,
+              'trained + subassemblies, 2 workers': two,
+              'trained + subassemblies, parallel': par,
+              'trained + subassemblies, 1 worker (where faster)': best1,
+              'trained + subassemblies, 2 workers (where faster)': best2}
     order = [n for n, v in series.items() if v]
     colors = {'heur-out (baseline)': '#969696', 'reference, first': '#9ecae1', 'reference': '#3182bd',
               'trained, first': '#a1d99b', 'trained': '#31a354',
               'trained + subassemblies, 1 worker': '#9e9ac8',
-              'trained + subassemblies (always split), 1 worker': '#fdae6b',
-              'trained + subassemblies, 2 workers (where faster)': '#bcbddc',
-              'trained + subassemblies, 2 workers (always split)': '#54278f',
-              'trained + subassemblies (always split), parallel': '#e6550d'}
+              'trained + subassemblies, 2 workers': '#54278f',
+              'trained + subassemblies, parallel': '#54278f',
+              'trained + subassemblies, 1 worker (where faster)': '#fdae6b',
+              'trained + subassemblies, 2 workers (where faster)': '#e6550d'}
 
     stats = {}
     for name in order:
@@ -187,13 +183,11 @@ def main():
             f'geometric mean over {n_seeds} seed{"s" if n_seeds != 1 else ""}. '
             'Heuristic planners return the cheapest sequence of the explored tree under their own cost'
             + ('; "first" = the first one found instead.' if any(n.endswith('first') for n in names) else '.'))
-    if best1 or best2:
-        note += (' Subassemblies, 1 worker: the plan is carried out where the timing model predicts '
-                 'it faster than the flat sequence, else the flat sequence; 2 workers: carried out '
-                 'wherever a plan was found.')
-    elif 'trained + subassemblies (always split), 1 worker' in names and not two:
-        note += (' Subassembly runs predate that setting and pick their sequence the same way '
-                 '(lowest cost); "parallel" = every split at once.')
+    if any(n.startswith('trained + subassemblies') for n in names):
+        note += (' Subassemblies: the plan is carried out wherever one was found'
+                 + ('; "where faster" = only where the timing model predicts it faster than the '
+                    'flat sequence with as many workers, else the flat sequence' if best1 or best2 else '')
+                 + ('; "parallel" = every split at once' if par else '') + '.')
     fig.text(0.01, 0.005, note, fontsize=7.5, color='#444', wrap=True)
     fig.tight_layout(rect=(0, 0.04, 1, 1))
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
