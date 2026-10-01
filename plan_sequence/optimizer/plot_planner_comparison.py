@@ -10,14 +10,15 @@ Series, every one as the per-assembly time ratio against random (geometric
 mean over its seeds), so 1 is chance and lower is faster; each drawn when the
 summary has it:
   heur-out (baseline)            the gen:heur-out baseline
-  reference, first / selected    heuristic, reference weights, without / with
-                                 sequence selection (the cheapest explored sequence)
-  trained, selected              the same with the trained weights
+  reference                      heuristic, reference weights (the cheapest
+                                 explored sequence under the DFA cost)
+  reference, first               the same, first sequence found (no selection)
+  trained                        the same with the trained weights
   trained + subassemblies        the trained weights with the recursive
                                  subassembly plan, one and two workers (S and R
                                  of the outermost split at once), carried out
                                  where the timing model predicts it faster than
-                                 'trained, selected' (the planner's default),
+                                 'trained' (the planner's default),
                                  else the flat sequence
   ... (always split)             with --show-forced (or summaries without the
                                  choice): the plan carried out on every
@@ -44,7 +45,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 def _store_series(store, weights, ids):
     """{series: {id: total_s}} of the trained-weight runs in the store."""
-    out = {'trained, first': {}, 'trained, selected': {},
+    out = {'trained, first': {}, 'trained': {},
            'trained + subassemblies, 1 worker': {}, 'trained + subassemblies, parallel': {}}
     for path in glob.glob(os.path.join(store, 'runs', '*', '*.json')):
         if path.endswith(('assembly.json', '.weights.json')):
@@ -64,7 +65,7 @@ def _store_series(store, weights, ids):
         elif fp.get('sequence_selection', 'first') == 'first':
             out['trained, first'][aid] = r['total_s']
         else:
-            out['trained, selected'][aid] = r['total_s']
+            out['trained'][aid] = r['total_s']
     return out
 
 
@@ -113,17 +114,17 @@ def main():
     forced = a.show_forced or not (best1 or best2)
     series = {'heur-out (baseline)': from_summary('heur-out'),
               'reference, first': from_summary('reference-first'),
-              'reference, selected': from_summary('reference'),
+              'reference': from_summary('reference'),
               'trained, first': stored.get('trained, first', {}),
-              'trained, selected': from_summary('trained'),
+              'trained': from_summary('trained'),
               'trained + subassemblies, 1 worker': best1,
               'trained + subassemblies, 2 workers': best2,
               'trained + subassemblies (always split), 1 worker': one if forced else {},
               'trained + subassemblies (always split), 2 workers': two if forced else {},
               'trained + subassemblies (always split), parallel': par if forced else {}}
     order = [n for n, v in series.items() if v]
-    colors = {'heur-out (baseline)': '#969696', 'reference, first': '#9ecae1', 'reference, selected': '#3182bd',
-              'trained, first': '#a1d99b', 'trained, selected': '#31a354',
+    colors = {'heur-out (baseline)': '#969696', 'reference, first': '#9ecae1', 'reference': '#3182bd',
+              'trained, first': '#a1d99b', 'trained': '#31a354',
               'trained + subassemblies, 1 worker': '#9e9ac8',
               'trained + subassemblies, 2 workers': '#54278f',
               'trained + subassemblies (always split), 1 worker': '#fdae6b',
@@ -180,8 +181,8 @@ def main():
     n_seeds = max((len(rows[i]['random'].get('seeds') or []) for i in ids if i in rows), default=0)
     note = (f'Random: DFA search with each next frontier drawn at random, '
             f'geometric mean over {n_seeds} seed{"s" if n_seeds != 1 else ""}. '
-            '"selected" = the cheapest sequence of the explored tree under the planner\'s own cost'
-            + ('; "first" = the first one found.' if any(n.endswith('first') for n in names) else '.'))
+            'Heuristic planners return the cheapest sequence of the explored tree under their own cost'
+            + ('; "first" = the first one found instead.' if any(n.endswith('first') for n in names) else '.'))
     if best1 or best2:
         note += (' Subassemblies: the plan is carried out where the timing model predicts it '
                  'faster than the flat sequence with as many workers, else the flat sequence.')
