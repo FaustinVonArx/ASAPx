@@ -118,7 +118,7 @@ def main():
     ax1.set_yticks(y)
     ax1.set_yticklabels([label for _n, label, _c in series])
     ax1.set_xlabel(f'predicted assembly time / {base_label} on the same assembly (mean, 95% bootstrap CI)')
-    ax1.set_title(f'Time relative to {base_label}, by component (n={n} assemblies every series planned)')
+    ax1.set_title(f'Time relative to {base_label}, by component')
     ax1.set_xlim(0, max(s['ci'][1] for s in stats.values()) * 1.12)
     ax1.legend(handles=handles, fontsize=8, frameon=False, loc='lower right')
 
