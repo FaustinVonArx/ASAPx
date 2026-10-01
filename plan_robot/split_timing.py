@@ -207,6 +207,7 @@ def resolve_split_steps(asset_folder, assembly_dir, plan, split_steps, *, max_po
                 'kind': 'remove', 'label': part, 'part_move': part, 'block': path,
                 'parts_rest': rest, 'parts_removed': removed,
                 'action': np.asarray(best['action']).tolist(),
+                'dof': None if best.get('dof') is None else np.asarray(best['dof']).tolist(),
                 'pose': None if chosen is None else np.asarray(chosen).tolist(),
                 'reorient_from_pose': None if pose is None else np.asarray(pose).tolist(),
                 'parts_fix': list(best['parts_fix']) if best.get('parts_fix') is not None else None,
@@ -314,6 +315,55 @@ def choose_split(flat_overview, split_overview, workers=1, only_if_faster=True):
             'reason': reason}
 
 
+def plan_heuristic_cost(planner_asset_folder, assembly_dir, plan, steps, weights):
+    """The heuristic planner's cost (HeuristicDFASequencePlanner.edge_scorer
+    under `weights`) of the plan's removals as resolved (resolve_split_steps),
+    each scored on the body it comes off; joins are left out, they are no
+    tree edge and have no features. A part of the other side set aside at a
+    join counts as removed for contact_distance, and the first removal of an
+    R block turns from the join's orientation, as in the timing.
+    Returns {'total': all removals one after another, 'parallel_2': the
+    outermost split's S and R removals at once (prefix + max(S, R)),
+    'n_removals', 'per_step': [cost or None for a join]}."""
+    from plan_sequence.planner.heuristic import HeuristicDFASequencePlanner
+
+    edge_cost = HeuristicDFASequencePlanner.edge_scorer(
+        planner_asset_folder, assembly_dir, sorted(plan['parts']), weights)
+    per_step = []
+    for st in steps:
+        if st['kind'] != 'remove':
+            per_step.append(None)
+            continue
+        rest = tuple(st['parts_rest'])
+        sim_info = {'dof': st.get('dof'), 'action': st.get('action'), 'pose': st.get('pose'),
+                    'parts_fix': st.get('parts_fix')}
+        per_step.append(float(edge_cost(rest, sim_info, rest + (st['part_move'],),
+                                        st.get('reorient_from_pose'))))
+    removals = [(st.get('block') or [], c) for st, c in zip(steps, per_step) if c is not None]
+    outer = sum(c for b, c in removals if not b)
+    sides = {h: sum(c for b, c in removals if b[:1] == [h]) for h in ('S', 'R')}
+    return {'total': sum(c for _b, c in removals), 'parallel_2': outer + max(sides.values()),
+            'n_removals': len(removals), 'per_step': per_step}
+
+
+def sequence_heuristic_cost(tree, sequence, edge_cost):
+    """The cost of a flat `sequence` along its tree edges under `edge_cost`
+    (HeuristicDFASequencePlanner.edge_scorer), each edge's pose change from
+    the previous edge's pose: what select_min_cost_sequence minimises. None
+    when the sequence leaves the tree."""
+    by_set = {frozenset(n): n for n in tree.nodes}
+    node = max(tree.nodes, key=len)
+    total, pose = 0.0, None
+    for part in sequence:
+        child = by_set.get(frozenset(node) - {part})
+        if child is None or not tree.has_edge(node, child):
+            return None
+        sim_info = tree.edges[node, child]['sim_info']
+        total += float(edge_cost(child, sim_info, node, pose))
+        pose, node = sim_info.get('pose'), child
+    return total
+
+
 def time_split_plan(planner_asset_folder, arm_asset_folder, assembly_dir, stats, setup,
                     log_dir=None, num_proc=1, sim_cache_dir=None, allow_gap=False,
                     gripper_type='rod', gripper_scale=0.4):
@@ -356,6 +406,20 @@ def time_split_plan(planner_asset_folder, arm_asset_folder, assembly_dir, stats,
         overview['status'] = 'ok'
     overview['n_joins'] = n_joins
     overview['split_sequence_source'] = stats.get('split_sequence_source')
+    # The plan scored by the heuristic planner's own cost, next to the flat
+    # sequence's (the selected sequence's cost): a split decision that does
+    # not use the timing model. Heuristic runs only (they record the cost).
+    flat_cost = (stats.get('sequence_selection') or {}).get('cost')
+    if failure is None and flat_cost is not None:
+        try:
+            from plan_sequence.planner.heuristic import HeuristicDFASequencePlanner
+            weights = HeuristicDFASequencePlanner.__new__(HeuristicDFASequencePlanner)._load_weights()
+            cost = plan_heuristic_cost(planner_asset_folder, assembly_dir, plan, steps, weights)
+            cost['flat'] = float(flat_cost)
+            cost['n_flat_removals'] = len(stats.get('sequence') or [])
+            overview['heuristic_cost'] = cost
+        except Exception as e:  # the cost is extra; never lose the timing over it
+            print(f'[split_timing] heuristic cost of the plan failed: {e}')
     if log_dir is not None:
         out = Path(log_dir) / 'timing_overview_split.json'
         out.parent.mkdir(parents=True, exist_ok=True)
