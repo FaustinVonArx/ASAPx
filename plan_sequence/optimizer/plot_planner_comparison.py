@@ -26,7 +26,8 @@ summary has it:
                                  sequence
 With --store and --weights, also 'trained, first' from the result store
 (records with those weights and no sequence selection). --ids defaults to
-every assembly of the summary. --baseline heur-out divides by heur-out
+every assembly of the summary; --common keeps only the assemblies every drawn
+series planned. --baseline heur-out divides by heur-out
 instead, random decisions then being one of the series. Left: geometric mean with a 95%
 bootstrap interval and how many assemblies beat random; right: every
 assembly. Writes <out>.png and <out>.pdf.
@@ -82,6 +83,9 @@ def main():
     ap.add_argument('--store', default=None, help="with --weights: add 'trained, first'")
     ap.add_argument('--weights', default=None, help='the trained weights file')
     ap.add_argument('--ids', default=None, help='comma-separated ids (default: all in the summary)')
+    ap.add_argument('--common', action='store_true',
+                    help='only the assemblies every drawn series and the baseline planned '
+                         'completely, so every series is compared on the same set')
     ap.add_argument('--out', required=True, help='output path without extension')
     ap.add_argument('--baseline', choices=('random', 'heur-out'), default='random',
                     help='what every series is divided by; with heur-out, random decisions '
@@ -134,6 +138,10 @@ def main():
               'trained + subassemblies, 1 worker (where faster)': best1,
               'trained + subassemblies, 2 workers (where faster)': best2}
     order = [n for n, v in series.items() if v]
+    if a.common:
+        keep = {i for i in base_t if all(i in series[n] for n in order)}
+        series = {n: {i: v for i, v in d.items() if i in keep} for n, d in series.items()}
+        base_t = {i: v for i, v in base_t.items() if i in keep}
     colors = {'random decisions': '#bdbdbd', 'heur-out (baseline)': '#969696', 'reference, first': '#9ecae1', 'reference': '#3182bd',
               'trained, first': '#a1d99b', 'trained': '#31a354',
               'trained + subassemblies, 1 worker': '#9e9ac8',
