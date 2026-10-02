@@ -12,7 +12,9 @@ series planned completely, so each assembly counts equally (as in
 plot_planner_comparison) and the components still add up: the baseline's bar
 is 1, split into its own shares. The whiskers are a 95% bootstrap interval of
 the total. Subassembly plans with two workers are a makespan, not a sum of
-steps, so they are drawn as a total only. Right: the mean number of extra
+steps, so they are drawn as a total only, unless --components-2w gives the
+components of that makespan (cluster/store_tool.py split-2w-components: the
+prefix, the join and the slower half). Right: the mean number of extra
 parts held per step. Writes <out>.png / .pdf / .json.
 """
 import argparse
@@ -45,14 +47,51 @@ def _bootstrap_mean(values, n=2000, seed=0):
     return means[int(0.025 * n)], means[int(0.975 * n) - 1]
 
 
+def _attach_2w_components(rows, csv_path, weights):
+    """Fill the components of 'trained+split-2w' in place: the two-worker
+    breakdown from `csv_path` where the plan was carried out (rows of these
+    weights, blocks not re-planned), the run's flat components where it was
+    not (its two-worker time is then the flat time). Left out (drawn as a
+    total) unless every assembly gets one."""
+    import csv
+    import hashlib
+
+    key = hashlib.sha1(json.dumps(weights, sort_keys=True).encode()).hexdigest()[:8]
+    table = {}
+    with open(csv_path) as f:
+        for r in csv.DictReader(f):
+            if r['weights_key'] == key and r['replan'] == 'False' and not r['error']:
+                table[r['id']] = {c: float(r[c]) for c, _l, _col in COMPONENTS}
+    missing = []
+    for r in rows:
+        two = r['runs'].get('trained+split-2w')
+        if not two or two.get('status') != 'ok':
+            continue
+        if two.get('split') == 'used':
+            two['components'] = table.get(r['id'])
+        else:
+            two['components'] = (r['runs'].get('trained+divide') or {}).get('components')
+        if two['components'] is None:
+            missing.append(r['id'])
+    if missing:
+        print(f'WARN two-worker components missing for {len(missing)} assemblies '
+              f'({", ".join(missing[:10])}{" ..." if len(missing) > 10 else ""})')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--summary', required=True)
     ap.add_argument('--out', required=True, help='output path without extension')
     ap.add_argument('--baseline', default='heur-out', help='summary run every series is divided by')
+    ap.add_argument('--components-2w', default=None,
+                    help='CSV of cluster/store_tool.py split-2w-components: break the two-worker '
+                         'subassembly time down into its components')
     a = ap.parse_args()
     with open(a.summary) as f:
-        rows = json.load(f)['per_assembly']
+        summary = json.load(f)
+    rows = summary['per_assembly']
+    if a.components_2w:
+        _attach_2w_components(rows, a.components_2w, summary.get('weights'))
     series = [s for s in SERIES if any(s[0] in r['runs'] for r in rows)]
     labels = {name: label for name, label, _c in series}
     if a.baseline not in labels:
